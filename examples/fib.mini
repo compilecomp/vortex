@@ -1,0 +1,25 @@
+# fib.mini — the same program through the reference frontend.
+#
+# Mini is an EXAMPLE of a language port (docs/porting.md section 4), not a
+# product language. This file proves the full path:
+#   Mini source -> UGB module -> verifier -> T0 execution.
+#
+# Run:  vx run examples/fib.mini --entry main
+
+fn fib(n) {
+    let a = 0;
+    let b = 1;
+    while (n != 0) {
+        let t = a + b;
+        a = b;
+        b = t;
+        n = n - 1;
+    }
+    return a;
+}
+
+fn main() {
+    let r = fib(25);
+    print(r);
+    return r;
+}

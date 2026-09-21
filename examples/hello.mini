@@ -1,0 +1,9 @@
+# hello.mini — smallest reference-frontend demo.
+#
+# Run:  vx run examples/hello.mini --entry main
+
+fn main() {
+    print(42);
+    print(true);
+    return 0;
+}

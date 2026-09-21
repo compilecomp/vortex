@@ -1,0 +1,33 @@
+# fib.ugb — hand-written UGB for the T0 interpreter.
+#
+# fib(n) computes the nth Fibonacci number iteratively:
+#   a = 0; b = 1
+#   while n != 0: (a, b) = (b, a+b); n = n - 1
+#   return a
+#
+# Demonstrates: typed arithmetic, comparisons, conditional branches,
+# backward edges (safepoint + tiering hooks), and direct calls.
+# Run:  vx run examples/fib.ugb --entry main
+
+.method fib(regs=7, args=1)
+    Const.I32 v1, 0          # a = 0
+    Const.I32 v2, 1          # b = 1
+    Const.I32 v3, 1          # constant 1
+loop:
+    Const.I32 v4, 0
+    Eq.I64 v5, v0, v4        # v5 = (n == 0)
+    JumpTrue v5, done
+    Add.I64 v6, v1, v2       # t = a + b
+    Move v1, v2              # a = b
+    Move v2, v6              # b = t
+    Sub.I64 v0, v0, v3       # n = n - 1
+    Jump loop
+done:
+    Return v1
+.end
+
+.method main(regs=3, args=0)
+    Const.I32 v0, 25         # fib(25)
+    Call.Direct v1, v0, 1, fib
+    Return v1
+.end

@@ -1,0 +1,40 @@
+{
+    "version": 6,
+    "cmakeMinimumRequired": { "major": 3, "minor": 28, "patch": 0 },
+    "configurePresets": [
+        {
+            "name": "release",
+            "displayName": "Release (C++26)",
+            "generator": "Unix Makefiles",
+            "binaryDir": "${sourceDir}/build/release",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            }
+        },
+        {
+            "name": "debug",
+            "displayName": "Debug (C++26, sanitizers-ready)",
+            "generator": "Unix Makefiles",
+            "binaryDir": "${sourceDir}/build/debug",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug"
+            }
+        }
+    ],
+    "buildPresets": [
+        { "name": "release", "configurePreset": "release" },
+        { "name": "debug", "configurePreset": "debug" }
+    ],
+    "testPresets": [
+        {
+            "name": "release",
+            "configurePreset": "release",
+            "output": { "outputOnFailure": true }
+        },
+        {
+            "name": "debug",
+            "configurePreset": "debug",
+            "output": { "outputOnFailure": true }
+        }
+    ]
+}

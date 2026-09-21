@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: ${{ matrix.compiler }} / C++26 / ${{ matrix.build_type }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [g++-14]
+        build_type: [Release, Debug]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install compiler & toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-14 cmake ninja-build
+          echo "CXX=g++-14" >> "$GITHUB_ENV"
+          echo "CC=gcc-14" >> "$GITHUB_ENV"
+
+      - name: Configure
+        run: cmake --preset ${{ matrix.build_type == 'Release' && 'release' || 'debug' }} -G Ninja
+
+      - name: Build
+        run: cmake --build --preset ${{ matrix.build_type == 'Release' && 'release' || 'debug' }} -j
+
+      - name: Run tests
+        run: ctest --preset ${{ matrix.build_type == 'Release' && 'release' || 'debug' }}
+
+      - name: Smoke: run guest programs on T0
+        run: |
+          ./build/*/bin/vx run examples/fib.ugb --entry main
+          ./build/*/bin/vx run examples/fib.mini --entry main
+          ./build/*/bin/vx version
