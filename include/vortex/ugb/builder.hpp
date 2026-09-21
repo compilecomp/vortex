@@ -34,6 +34,7 @@ public:
     size_t const_i32(uint16_t dst, int32_t value);        // immediate
     size_t const_f64(uint16_t dst, double value);
     size_t const_null(uint16_t dst);
+    size_t const_undefined(uint16_t dst);
     size_t const_true(uint16_t dst);
     size_t const_false(uint16_t dst);
     size_t jump(std::string_view label);

@@ -16,11 +16,11 @@ support::Result<uint32_t> MaxJit::compile(const ugb::UGBModule& module,
 FixedPointState MaxJit::fingerprint(const ir::Graph& graph) {
     FixedPointState state;
     uint64_t hash = 0xcbf29ce484222325ull;  // FNV-1a basis
-    for (const ir::Node* n : graph.nodes()) {
-        if (n->dead) continue;
-        hash ^= static_cast<uint64_t>(n->kind);
+    for (const ir::Node& n : graph.nodes()) {
+        if (n.dead) continue;
+        hash ^= static_cast<uint64_t>(n.kind);
         hash *= 0x100000001b3ull;
-        hash ^= n->input_count();
+        hash ^= n.input_count();
         hash *= 0x100000001b3ull;
         ++state.node_count;
     }

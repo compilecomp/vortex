@@ -282,6 +282,57 @@ for storage, and a wide internal encoding for interpreter speed. Vortex implemen
 the fixed-width form in `include/vortex/ugb/module.hpp` (`encode_module`,
 `decode_module`, `InstructionStream`, `append_instruction`).
 
+### 8.1 Implemented distribution format (v2)
+
+The implemented wire format (format minor version **2**) records every artifact
+versioning field the laws require (Rule 10) and the per-method capability lists
+(Rule 3). Little-endian throughout:
+
+```text
+module:
+  magic                 "UGB\0"
+  version_major         u16    (0)
+  version_minor         u16    (2)
+  language_id           u32
+  language_name         u32 length + bytes
+  runtime_abi_version   u32    (1)          -- Rule 10
+  metadata_schema_ver   u32    (1)          -- Rule 10
+  extension_count       u32                 -- Rule 6
+  extensions            count × { name: u32+bytes, version: u32 }
+  capability_mask       u32                 -- Rule 3/10 (union of method needs)
+  constants             u32 count × { kind u8 + payload }
+                        (payload: Int64 = u64 two's complement;
+                         Float64 = IEEE-754 bit pattern u64;
+                         String = u32 length + bytes;
+                         MethodRef = reserved u32)
+  classes               u32 count × name
+  fields                u32 count × { name, owner_class_token u32 }
+  method_tokens         u32 count × name    (token = index + 1; 0 = none)
+  builtin_tokens        u32 count × name
+  methods               u32 count × {
+      name, id u32, register_count u16, argument_count u16,
+      cap_count u8 + capability ids u8[],          -- Rule 3
+      code_length u32 + code bytes
+  }
+```
+
+**Version law.** The decoder rejects incompatible major versions and minors
+newer than the runtime, with a positional diagnostic (telemetry, Rule 9).
+Minor-1 payloads decode with documented defaults: empty extension table,
+empty capability set, `runtime_abi_version = metadata_schema_version = 0`.
+
+**Stable site IDs (Rule 8).** Every dynamic or speculative site (profile
+slot, inline-cache slot, future deopt record) is identified by
+`make_site_id(method_id, instruction_index)` — stable across runs for a
+given (module, bytecode version). `UGBMethod::site_id(index)` is the
+method-local form; the zero value `kNoSite` means "no site".
+
+**Capability negotiation (Rule 3).** `engine_advertised_capabilities()`
+returns the set the executing engine supports; `Interpreter::run` rejects —
+safely, with a diagnostic — any method whose requirements are unknown or
+unsupported. `docs/compliance_matrix.md` maps the checks; regression tests
+live in `tests/test_compliance.cpp`.
+
 ---
 
 ## 9. Verification

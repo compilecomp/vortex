@@ -127,6 +127,51 @@ Each system has a dedicated chapter under `docs/infrastructure/`.
 7. **The GC is incremental, concurrent, and generational**, with SATB barriers, Brooks
    forwarding, TLABs, and card marking integrated into every tier including deopt.
 
+## Compiler laws & compliance
+
+The repository is governed by the **UGB/VORTEX Compiler Laws & Architecture
+Specification** (137 rules). Compliance is not narrative — it is mapped,
+enforced and tested:
+
+- `docs/compliance_matrix.md` — every rule mapped to its enforcement
+  mechanism and status (Rule 134).
+- `tools/lint/compliance.sh` + the CI `compliance` job — mechanical checks
+  for the structural laws: no native exceptions (R65), no node-based
+  containers on hot paths (R50), no raw-pointer IR edges (R48), no RTTI
+  (R68), no shared_ptr/function in hot IR (R69).
+- `docs/exception-register.md` — every deviation is registered with an
+  expiry (Rule 132). Silent bypasses are violations.
+- `docs/adr/` — architecture decision records for the dispatch design, the
+  error-propagation policy, IR index edges, capability negotiation and the
+  numeric semantics contract (Rule 135).
+- `docs/guest-semantics.md` — the registered semantic oracle for the
+  reference language, including the exact numeric behavior (Rule 106/110):
+  overflow traps, IEEE-exact float ops, saturating float-to-int conversion.
+
+## CEM-26 performance standard
+
+Hot code additionally follows **CEM-26 Rev 1.1** (Cycle-Exact Maintainable
+C++26). Performance is treated as a semantic property: every hot function
+carries a `PERF_CONTRACT` (budget/cycles, memory traffic, branches, cache
+behavior) plus a `PERF_OBSERVATION` record; hot/warm/cold classification is
+explicit; every hot struct asserts its layout; exceptions from the standard
+are `PERF_PERMIT`-granted and registered.
+
+- `docs/cem26.md` — scope, cost-block conventions, layout audits, the live
+  PERF_PERMIT register and the validation plan.
+- `include/vortex/support/cem.hpp` + `include/vortex/ugb/encoding.hpp` —
+  the semantic-domain constant registries (magic-number ban, section 2).
+- `tools/lint/compliance.sh` — mechanical CEM-26 subset: no seq_cst in hot
+  trees (s14), no mutexes (s7/14), `@hot` files must carry cost blocks
+  (s3/4), permits must be registered (s17).
+
+Build with compliance checks:
+
+```sh
+cmake --build build/release --target compliance_lint   # structural laws + CEM-26
+ctest --test-dir build/release                          # 73-test suite
+```
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

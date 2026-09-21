@@ -5,9 +5,88 @@
 namespace vortex::ugb {
 
 // ---------------------------------------------------------------------------
+// Capability negotiation (Rule 3) and extension namespacing (Rule 6).
+// ---------------------------------------------------------------------------
+
+const char* capability_name(Capability c) noexcept {
+    switch (c) {
+    case Capability::TypedArithmetic: return "typed_arithmetic";
+    case Capability::Float64: return "float64";
+    case Capability::Arrays: return "arrays";
+    case Capability::Classes: return "classes";
+    case Capability::VirtualCalls: return "virtual_calls";
+    case Capability::BuiltinCalls: return "builtin_calls";
+    case Capability::GuardedAccess: return "guarded_access";
+    case Capability::FFI: return "ffi";
+    case Capability::Extensions: return "extensions";
+    case Capability::Debug: return "debug";
+    default: return "unknown";
+    }
+}
+
+bool is_valid_capability(uint8_t raw) noexcept {
+    return raw < static_cast<uint8_t>(Capability::_COUNT);
+}
+
+CapabilitySet engine_advertised_capabilities() noexcept {
+    // T0 executes the full core ISA; FFI and extension instructions require
+    // registered runtime hooks that the M0 engine does not provide (Rule 3:
+    // advertise exactly what can be executed).
+    CapabilitySet caps;
+    caps.add(Capability::TypedArithmetic);
+    caps.add(Capability::Float64);
+    caps.add(Capability::Arrays);
+    caps.add(Capability::Classes);
+    caps.add(Capability::VirtualCalls);
+    caps.add(Capability::BuiltinCalls);
+    caps.add(Capability::GuardedAccess);
+    caps.add(Capability::Debug);
+    return caps;
+}
+
+bool is_valid_extension_name(std::string_view name) noexcept {
+    // Grammar: "extension.<language>.<feature>" — two non-empty dots after
+    // the literal prefix, no whitespace.
+    constexpr std::string_view kPrefix = "extension.";
+    if (name.size() <= kPrefix.size() || name.substr(0, kPrefix.size()) != kPrefix) {
+        return false;
+    }
+    const std::string_view rest = name.substr(kPrefix.size());
+    const size_t first = rest.find('.');
+    if (first == std::string_view::npos || first == 0 || first + 1 >= rest.size()) {
+        return false;
+    }
+    const std::string_view feature = rest.substr(first + 1);
+    if (feature.find('.') != std::string_view::npos || feature.empty()) {
+        return false;
+    }
+    for (char c : name) {
+        if (c == ' ' || c == '\t' || c == '\n') return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // IcSlot — atomic IC transitions (docs/tier-t0.md section 3).
 // ---------------------------------------------------------------------------
 
+// @hot — executed on every field-access instruction in the mono state (the
+// dominant state in typed-hot code); poly scans are capacity-bounded.
+// PERF_CONTRACT:
+// BUDGET: <= 4 cycles mono (1 load of the slot line is already paid by the
+//         handler; state test + one u32 compare); poly <= 2 + 2*entry cycles
+//         (unrolled 4-iteration scan, all entries on the slot's line)
+// READS: 4 bytes (klass word of the matched entry), same line as the state
+// WRITES: 0
+// BRANCHES: 1 state switch + 1 compare (mono) / 4 compares (poly, fully
+//           unrolled by the compiler)
+// CACHE: one IcSlot line (48 bytes), no pointer chasing
+//
+// PERF_OBSERVATION:
+// TARGET: Zen 5 / ARM Neoverse V2
+// VALIDATED: g++ 14.2, -O2 -fno-rtti
+// ACTUAL: PENDING microbench (M0) — see docs/cem26.md section 4
+// LAST_VALIDATED: 2026-09-22
 const IcEntry* IcSlot::lookup(uint32_t klass_id) const noexcept {
     switch (state) {
     case IcState::Monomorphic:
@@ -24,6 +103,12 @@ const IcEntry* IcSlot::lookup(uint32_t klass_id) const noexcept {
     }
 }
 
+// @warm — state transitions fire on IC misses only (new class per site); the
+// steady-state hit path never reaches this function.
+// PERF_CONTRACT (transition cost, once per (site, new class)):
+// BUDGET: <= 10 cycles mono->poly (two entry stores + state store); the
+//         poly->mega demotion is one store
+// WRITES: up to 8 bytes (entry) + 1 (state) on the slot's line
 void IcSlot::record_hit(uint32_t klass_id, uint32_t target) noexcept {
     switch (state) {
     case IcState::Uninitialized:
@@ -38,7 +123,7 @@ void IcSlot::record_hit(uint32_t klass_id, uint32_t target) noexcept {
         poly[poly_count++] = IcEntry{klass_id, target};
         break;
     case IcState::Polymorphic:
-        if (poly_count < 4) {
+        if (poly_count < kIcPolyCapacity) {
             for (uint8_t i = 0; i < poly_count; ++i) {
                 if (poly[i].klass_or_shape_id == klass_id) return;
             }
@@ -139,10 +224,11 @@ TaggedValue UGBModule::materialize_constant(uint32_t index) const {
     case Constant::Kind::Int64:
         return TaggedValue::smi(c.i64);
     case Constant::Kind::Float64:
-        return TaggedValue::smi(static_cast<int64_t>(c.f64));  // M0: truncated
     case Constant::Kind::String:
-        return TaggedValue::undefined();  // boxed strings arrive with the GC heap
     case Constant::Kind::MethodRef:
+        // Boxed constants must be materialized through the heap by the engine
+        // (the T0 interpreter handles CONST_F64 directly). Returning a
+        // truncated integer here would be silent misexecution (Rule 110).
         return TaggedValue::undefined();
     }
     return TaggedValue::undefined();
@@ -154,13 +240,20 @@ TaggedValue UGBModule::materialize_constant(uint32_t index) const {
 // Instruction encoding:
 //   opcode: u16 | flags: u8 | dst: u16 | src_count: u8 | srcs: u16[] | meta: u32?
 //
-// Module encoding (little-endian):
+// Module encoding (little-endian), format v2:
 //   magic "UGB\0" | version_major u16 | version_minor u16 | language_id u32
 //   language_name (u16 len + bytes)
+//   runtime_abi_version u32 | metadata_schema_version u32
+//   extensions: u32 count, each: name (u16 len + bytes) + version u32
+//   capability_mask u32
 //   constants: u32 count, each: kind u8 + payload
 //   classes / fields / methods / builtins: u32 count, each: name (+owner u32)
 //   method_table: u32 count, each: name, id u32, register_count u16,
-//                 arg_count u16, code u32 length + bytes
+//                 arg_count u16, caps u8 count + ids u8[],
+//                 code u32 length + bytes
+//
+// v1 payloads (minor < 2) carry none of the v2 header fields; the decoder
+// applies documented defaults (empty extension table, empty capability set).
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -188,7 +281,10 @@ void put_f64(std::vector<uint8_t>& out, double v) {
 }
 
 void put_string(std::vector<uint8_t>& out, const std::string& s) {
-    put_u16(out, static_cast<uint16_t>(s.size()));
+    // u32 length: a u16 length would silently truncate oversized names and
+    // desynchronize the whole stream (Rule 9: malformed artifacts cannot be
+    // produced by the encoder).
+    put_u32(out, static_cast<uint32_t>(s.size()));
     out.insert(out.end(), s.begin(), s.end());
 }
 
@@ -233,7 +329,7 @@ struct Reader {
         return v;
     }
     std::string string() {
-        const uint16_t len = u16();
+        const uint32_t len = u32();
         if (!ok || !take(len)) return {};
         return std::string(reinterpret_cast<const char*>(data + pos - len), len);
     }
@@ -291,6 +387,16 @@ std::vector<uint8_t> encode_module(const UGBModule& m) {
     put_u32(out, m.language_id);
     put_string(out, m.language_name);
 
+    // v2 header (Rule 10): ABI/schema versions, extensions, capability set.
+    put_u32(out, m.runtime_abi_version);
+    put_u32(out, m.metadata_schema_version);
+    put_u32(out, static_cast<uint32_t>(m.extensions.size()));
+    for (const ExtensionRef& e : m.extensions) {
+        put_string(out, e.name);
+        put_u32(out, e.version);
+    }
+    put_u32(out, m.capability_mask);
+
     // constants
     put_u32(out, static_cast<uint32_t>(m.constants.size()));
     for (const Constant& c : m.constants) {
@@ -323,6 +429,9 @@ std::vector<uint8_t> encode_module(const UGBModule& m) {
         put_u32(out, mt.id);
         put_u16(out, mt.register_count);
         put_u16(out, mt.arg_count);
+        // Rule 3: per-method capability requirements.
+        out.push_back(static_cast<uint8_t>(mt.required_capabilities.size()));
+        for (uint8_t c : mt.required_capabilities) out.push_back(c);
         put_u32(out, static_cast<uint32_t>(mt.code.size()));
         out.insert(out.end(), mt.code.begin(), mt.code.end());
     }
@@ -348,10 +457,49 @@ bool decode_module(const uint8_t* data, size_t size, UGBModule& out,
         return false;
     }
 
+    // Version law (Rule 10): incompatible artifacts are rejected with
+    // telemetry, never loaded best-effort.
+    if (out.version_major != kUgbVersionMajor) {
+        error = {"incompatible UGB major version", r.pos};
+        return false;
+    }
+    if (out.version_minor > kUgbVersionMinor) {
+        error = {"UGB minor version newer than this runtime", r.pos};
+        return false;
+    }
+
+    // v2 header fields. v1 payloads keep documented defaults.
+    if (out.version_minor >= 2) {
+        out.runtime_abi_version = r.u32();
+        out.metadata_schema_version = r.u32();
+        const uint32_t ext_count = r.u32();
+        for (uint32_t i = 0; i < ext_count && r.ok; ++i) {
+            ExtensionRef e;
+            e.name = r.string();
+            e.version = r.u32();
+            out.extensions.push_back(std::move(e));
+        }
+        out.capability_mask = r.u32();
+    } else {
+        out.runtime_abi_version = 0;
+        out.metadata_schema_version = 0;
+    }
+    if (!r.ok) {
+        error = {"truncated module header", r.pos};
+        return false;
+    }
+
     const uint32_t const_count = r.u32();
     for (uint32_t i = 0; i < const_count && r.ok; ++i) {
         Constant c;
-        c.kind = static_cast<Constant::Kind>(r.u8());
+        const uint8_t raw_kind = r.u8();
+        // Rule 9: an unknown kind would otherwise consume no payload and
+        // desynchronize the remainder of the decode — reject explicitly.
+        if (raw_kind > static_cast<uint8_t>(Constant::Kind::MethodRef)) {
+            error = {"unknown constant kind", r.pos};
+            return false;
+        }
+        c.kind = static_cast<Constant::Kind>(raw_kind);
         switch (c.kind) {
         case Constant::Kind::Int64: c.i64 = static_cast<int64_t>(r.u64()); break;
         case Constant::Kind::Float64: c.f64 = r.f64(); break;
@@ -389,6 +537,10 @@ bool decode_module(const uint8_t* data, size_t size, UGBModule& out,
         mt.id = r.u32();
         mt.register_count = r.u16();
         mt.arg_count = r.u16();
+        const uint8_t cap_count = r.u8();
+        for (uint8_t c = 0; c < cap_count && r.ok; ++c) {
+            mt.required_capabilities.push_back(r.u8());
+        }
         const uint32_t code_len = r.u32();
         if (!r.ok || !r.take(code_len)) break;
         mt.code.assign(data + r.pos - code_len, data + r.pos);

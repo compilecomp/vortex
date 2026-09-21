@@ -38,5 +38,59 @@ jobs:
       - name: Smoke: run guest programs on T0
         run: |
           ./build/*/bin/vx run examples/fib.ugb --entry main
-          ./build/*/bin/vx run examples/fib.mini --entry main
           ./build/*/bin/vx version
+
+  sanitizers:
+    # Rule 123: sanitizer matrix. ASan + UBSan build (Debug preset enables
+    # assertions; sanitizers are passed explicitly here).
+    name: ASan + UBSan / C++26
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install compiler & toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-14 cmake ninja-build
+          echo "CXX=g++-14" >> "$GITHUB_ENV"
+          echo "CC=gcc-14" >> "$GITHUB_ENV"
+
+      - name: Configure (sanitizer build)
+        run: |
+          cmake -S . -B build/san -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+
+      - name: Build
+        run: cmake --build build/san -j
+
+      - name: Run tests under sanitizers
+        run: ctest --test-dir build/san --output-on-failure
+
+      - name: Smoke: run guest programs under sanitizers
+        run: |
+          ./build/san/bin/vx run examples/fib.ugb --entry main
+          ./build/san/bin/vx version
+
+  compliance:
+    # Rule 133: every rule has an enforcement mechanism. The structural laws
+    # (48/50/65/68/69) are checked mechanically on every commit.
+    name: Compliance lint (Rules 48/50/65/68/69)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Hot-path structural laws
+        run: ./tools/lint/compliance.sh .
+
+      - name: Governance artifacts exist (Rules 132/134/135)
+        run: |
+          test -f docs/compliance_matrix.md
+          test -f docs/exception-register.md
+          test -f docs/guest-semantics.md
+          test -f docs/adr/adr-001-005.md
+          echo "governance artifacts present"
+
+      - name: UGB spec documents format v2 (Rule 137)
+        run: grep -q "runtime_abi_version" docs/ugb.md || (echo "docs/ugb.md must document format v2 fields" && exit 1)

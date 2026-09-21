@@ -39,20 +39,20 @@ VORTEX_TEST(arena_allocates_and_resets) {
 VORTEX_TEST(son_graph_dead_node_elimination) {
     support::Arena arena;
     ir::Graph g(arena);
-    ir::Node* start = g.add(ir::NodeKind::Start);
-    ir::Node* c1 = g.add(ir::NodeKind::Const, {}, start);
-    ir::Node* c2 = g.add(ir::NodeKind::Const, {}, start);
-    ir::Node* dead_add = g.add(ir::NodeKind::Add, {c1, c2});  // unused
-    ir::Node* ret = g.add(ir::NodeKind::Return, {c1});
+    const ir::NodeId start = g.add(ir::NodeKind::Start);
+    const ir::NodeId c1 = g.add(ir::NodeKind::Const, {}, start);
+    const ir::NodeId c2 = g.add(ir::NodeKind::Const, {}, start);
+    const ir::NodeId dead_add = g.add(ir::NodeKind::Add, {c1, c2});  // unused
+    const ir::NodeId ret = g.add(ir::NodeKind::Return, {c1});
     (void)dead_add;
     (void)ret;
 
     const uint32_t killed = g.eliminate_dead_nodes();
     // dead_add AND the now-unreferenced c2 are unreachable from Return.
     VORTEX_EXPECT_EQ(killed, uint32_t{2});
-    VORTEX_EXPECT(dead_add->dead);
-    VORTEX_EXPECT(c2->dead);
-    VORTEX_EXPECT(!c1->dead);
+    VORTEX_EXPECT(g.node(dead_add).dead);
+    VORTEX_EXPECT(g.node(c2).dead);
+    VORTEX_EXPECT(!g.node(c1).dead);
     VORTEX_EXPECT_EQ(g.live_count(), size_t{3});
 }
 

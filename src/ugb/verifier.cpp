@@ -144,6 +144,33 @@ Result<void> verify_method(const UGBModule& module, const UGBMethod& method) {
                 return support::fail(support::ErrorCode::VerifyError,
                                      ctx(method, offset, "method token out of range"));
             }
+            // Rule 7 / R9: call arity must match the callee's declared
+            // argument count. Without this, a short argument window would
+            // hand the callee uninitialized (pooled-frame garbage) registers
+            // — silent misexecution of a verifiable artifact.
+            if (ins.opcode != Op::CALL_BUILTIN &&
+                ins.meta >= 1 && ins.meta <= module.methods.size()) {
+                const std::string& callee_name =
+                    module.methods[ins.meta - 1].name;
+                const int32_t callee_idx = module.find_method(callee_name);
+                if (callee_idx < 0) {
+                    return support::fail(
+                        support::ErrorCode::VerifyError,
+                        ctx(method, offset,
+                            "call token does not resolve to a method"));
+                }
+                const uint16_t callee_args =
+                    module.method_table[static_cast<size_t>(callee_idx)]
+                        .arg_count;
+                if (argc != callee_args) {
+                    return support::fail(
+                        support::ErrorCode::VerifyError,
+                        ctx(method, offset,
+                            "call passes " + std::to_string(argc) +
+                                " args but callee '" + callee_name +
+                                "' expects " + std::to_string(callee_args)));
+                }
+            }
         } else {
             for (uint16_t r : ins.srcs) {
                 if (r >= method.register_count) {
@@ -238,6 +265,34 @@ Result<void> verify_method(const UGBModule& module, const UGBMethod& method) {
 }
 
 Result<void> verify_module(const UGBModule& module) {
+    // Rule 7: valid capability requirements and metadata tokens are part of
+    // verification. Rule 6: extension namespaces must be namespaced+versioned.
+    // Rule 3: unknown capability ids make a method safely rejectable here,
+    // before any engine decides whether it supports the capability.
+    for (const UGBMethod& m : module.method_table) {
+        for (uint8_t raw : m.required_capabilities) {
+            if (!is_valid_capability(raw)) {
+                return support::fail(
+                    support::ErrorCode::VerifyError,
+                    "verify: method '" + m.name + "' requires unknown "
+                    "capability id " + std::to_string(raw));
+            }
+        }
+    }
+    for (const ExtensionRef& e : module.extensions) {
+        if (!is_valid_extension_name(e.name)) {
+            return support::fail(
+                support::ErrorCode::VerifyError,
+                "verify: extension '" + e.name +
+                    "' violates the namespace grammar "
+                    "'extension.<language>.<feature>' (Rule 6)");
+        }
+        if (e.version == 0) {
+            return support::fail(support::ErrorCode::VerifyError,
+                                 "verify: extension '" + e.name +
+                                     "' must declare version >= 1 (Rule 6)");
+        }
+    }
     for (const UGBMethod& m : module.method_table) {
         auto res = verify_method(module, m);
         if (!res) return res;

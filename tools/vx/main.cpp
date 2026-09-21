@@ -40,8 +40,10 @@ std::string extension_of(const std::string& path) {
 }
 
 /// Loads a module from .ugb text (assembles) or binary (decodes, detected by
-/// the "UGB\0" magic written by `vx asm`).
-bool load_module(const std::string& path, const std::string& source,
+/// the "UGB\0" magic written by `vx asm`). `path` is reserved for origin
+/// diagnostics in load failures; the current branches report via `source`.
+bool load_module([[maybe_unused]] const std::string& path,
+                 const std::string& source,
                  vortex::ugb::UGBModule& module, std::string& error) {
     if (source.size() >= 4 && source[0] == 'U' && source[1] == 'G' &&
         source[2] == 'B' && source[3] == 0) {

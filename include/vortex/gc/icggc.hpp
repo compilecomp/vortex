@@ -21,9 +21,15 @@ using support::Result;
 /// Card table for cross-generational reference tracking
 /// (docs/gc-icggc.md section 3, docs/tier-t0.md section 8):
 ///   card_table[obj >> CARD_SHIFT] = DIRTY
+/// CEM-26 section 2: card geometry is a semantic domain — the shift, the
+/// card size and the states are named once here.
 constexpr uint64_t kCardShift = 9;  // 512-byte cards (M0 heap granularity)
+constexpr uint64_t kCardBytes = uint64_t{1} << kCardShift;
 constexpr uint8_t kCardDirty = 1;
 constexpr uint8_t kCardClean = 0;
+static_assert(kCardBytes == 512,
+              "card size is the write-barrier granularity; changing it is a "
+              "GC-protocol event (docs/gc-icggc.md section 3)");
 
 class CardTable {
 public:
@@ -35,6 +41,19 @@ public:
     /// Card indexing is heap-relative: (obj - heap_base) >> kCardShift.
     /// (The docs' `card_table[obj >> CARD_SHIFT]` form assumes a reserved
     /// heap range; with an allocated heap we subtract the base.)
+    // @hot — one mark per reference-valued field/array store.
+    // PERF_CONTRACT:
+    // BUDGET: <= 4 cycles (addr fold + guard + relaxed byte store)
+    // READS: 0 (bounds derived from base_/size_, register arithmetic)
+    // WRITES: 1 byte (the card; repeated stores to one object hit the same
+    //         line — idempotent DIRTY, no read-modify-write)
+    // BRANCHES: 2 (below-base guard, capacity guard — both predicted
+    //           not-taken in a live heap)
+    // CACHE: one card-table line per 512-byte span of stores
+    // PERF_NOTE: plain (non-atomic) byte store is correct under the M0
+    //           single-mutator contract; the M2 handshake publishes card
+    //           state, no atomicity is required at the byte (docs/
+    //           infrastructure/04-threading-suspension.md).
     void mark_dirty(const void* obj) noexcept {
         const uint64_t addr = reinterpret_cast<uint64_t>(obj);
         if (addr < base_) return;
@@ -71,6 +90,16 @@ public:
         : base_(base), top_(base), end_(base + bytes) {}
 
     /// Bump allocation with header initialization. Returns nullptr when full.
+    /// @hot — every NEW_OBJECT/NEW_ARRAY/box allocation takes this path.
+    /// PERF_CONTRACT:
+    // BUDGET: <= 3 cycles steady-state (add + cmp; placement-new of the
+    ///        trivial header folds into the same store window)
+    // READS: 0
+    // WRITES: `bytes` into fresh TLAB memory (streaming stores; header store
+    ///        included)
+    // BRANCHES: 1 (top+bytes vs end — predictable not-taken until refill)
+    // CACHE: write-allocated lines in the TLAB remainder; refill is the
+    ///        amortized cost (Heap::refill_tlab, warm)
     template <typename T>
     T* try_allocate(size_t bytes) noexcept {
         if (top_ + bytes > end_) return nullptr;
@@ -107,7 +136,11 @@ struct HeapStats {
 /// tagged_value.hpp).
 class Heap {
 public:
-    explicit Heap(size_t young_bytes = 4 * 1024 * 1024);
+    /// Default young-generation budget (CEM-26 section 2: named knob; the
+    /// pacer and tests read the effective size from the instance).
+    static constexpr size_t kDefaultYoungBytes = 4 * 1024 * 1024;
+
+    explicit Heap(size_t young_bytes = kDefaultYoungBytes);
     ~Heap();
 
     Heap(const Heap&) = delete;

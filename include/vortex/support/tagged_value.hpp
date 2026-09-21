@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <type_traits>
 
 namespace vortex {
 
@@ -35,16 +36,28 @@ public:
     static constexpr TaggedValue boolean(bool b) noexcept {
         return TaggedValue(b ? kTrueBits : kFalseBits);
     }
+    /// @hot — materializes a heap-pointer tagged value from a 16-byte-aligned
+    /// object address (heap invariant, gc::Heap).
+    // PERF_CONTRACT:
+    // BUDGET: 1 cycle (and+or, folded into the consuming store)
+    // READS: 0  WRITES: 0  BRANCHES: 0
+    // CACHE: n/a — pure register bit manipulation
     static TaggedValue heap_pointer(const void* p) noexcept {
         const uint64_t a = reinterpret_cast<uint64_t>(p);
-        // 16-byte alignment is a heap invariant (see gc::Heap).
-        return TaggedValue((a & ~uint64_t{0xF}) | 0x1);
+        return TaggedValue((a & ~kHeapTagMask) | kHeapTagBits);
     }
 
     // ---- predicates -------------------------------------------------------
-    constexpr bool is_smi() const noexcept { return (bits_ & 1) == 0; }
+    // CEM-26 cost model (section 6, source level): every predicate below is
+    // one AND-immediate + flags test — a single cycle on all supported
+    // targets, no memory access beyond the value itself. They are the
+    // per-instruction backbone of the T0 handlers and must stay branch-free
+    // and allocation-free.
+    constexpr bool is_smi() const noexcept {
+        return (bits_ & kSmiTagBit) == 0;
+    }
     constexpr bool is_heap_object() const noexcept {
-        return (bits_ & 0xF) == 0b0001;
+        return (bits_ & kHeapTagMask) == kHeapTagBits;
     }
     constexpr bool is_null() const noexcept { return bits_ == kNullBits; }
     constexpr bool is_undefined() const noexcept { return bits_ == kUndefinedBits; }
@@ -67,7 +80,7 @@ public:
         return (static_cast<int64_t>(1) << 62) - 1;
     }
     HeapObject* as_heap_object() const noexcept {
-        return reinterpret_cast<HeapObject*>(bits_ & ~uint64_t{0xF});
+        return reinterpret_cast<HeapObject*>(bits_ & ~kHeapTagMask);
     }
     constexpr bool as_boolean_unchecked() const noexcept { return bits_ == kTrueBits; }
 
@@ -97,6 +110,11 @@ public:
 private:
     explicit constexpr TaggedValue(uint64_t bits) noexcept : bits_(bits) {}
 
+    // Tag encoding (LSB first — see the file header):
+    static constexpr uint64_t kSmiTagBit = 0x1;    // bit0 == 0 -> Smi
+    static constexpr uint64_t kHeapTagMask = 0xF;  // low nibble discriminates
+    static constexpr uint64_t kHeapTagBits = 0b0001;
+
     static constexpr uint64_t kNullBits = 0x3;
     static constexpr uint64_t kUndefinedBits = 0x7;
     static constexpr uint64_t kFalseBits = 0xB;
@@ -106,5 +124,11 @@ private:
 };
 
 static_assert(sizeof(TaggedValue) == 8, "TaggedValue must stay a single word");
+static_assert(alignof(TaggedValue) == 8,
+              "TaggedValue is the register-file word; word alignment keeps "
+              "register-file loads single-cycle");
+static_assert(std::is_trivially_copyable_v<TaggedValue>,
+              "TaggedValue must stay trivially copyable (CEM-26 section 8: "
+              "hot data types)");
 
 }  // namespace vortex

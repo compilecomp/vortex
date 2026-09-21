@@ -82,6 +82,7 @@ public:
 
     const TieringThresholds& thresholds() const noexcept { return thresholds_; }
     void set_observer(TieringObserver* observer) noexcept { observer_ = observer; }
+    TieringObserver* observer() const noexcept { return observer_; }
 
 private:
     TieringThresholds thresholds_;

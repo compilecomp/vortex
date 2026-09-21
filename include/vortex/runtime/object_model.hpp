@@ -166,25 +166,49 @@ private:
 /// Field/array slot store. Card marking for reference values is performed by
 /// the caller against the heap's card table (docs/tier-t0.md section 8):
 ///   card_table.mark_dirty(owner)
+/// @hot — the per-store primitive under SET_FIELD / ARRAY_SET.
+// PERF_CONTRACT:
+// BUDGET: 1 store instruction (fully inlined into the calling handler)
+// READS: 0  WRITES: 8 bytes (the tagged slot)
+// BRANCHES: 0
+// CACHE: the owning object's line (already resident from the header load)
 inline void store_field(TaggedValue* slot, TaggedValue value) noexcept {
     *slot = value;
 }
 
 /// Boxed doubles live on the heap under the engine's `double` klass
 /// (gc::Heap::double_klass). Layout: ObjectHeader + 8-byte payload.
+/// @hot — the type test guards every float-typed operand; read/write are the
+/// payload access of every float op.
+// PERF_CONTRACT (all three):
+// BUDGET: is_boxed_double <= 2 cycles (2 compares); read/write 1 load/store
+// READS: 16 bytes (header klass word + payload), same object line
+// WRITES: 8 (write path only)
+// BRANCHES: 2 (null guards, predicted not-taken in float-typed loops)
+// CACHE: one object line; boxed doubles are 24 bytes, header+payload
+//        co-resident by construction
 inline bool is_boxed_double(const HeapObject* o, const Klass* double_klass) noexcept {
     return o != nullptr && double_klass != nullptr &&
            o->header.klass == double_klass;
 }
 
+/// Boxed-double payload size (CEM-26 section 2: named, ties the layout to
+/// the IEEE binary64 value it stores).
+inline constexpr size_t kBoxedDoublePayloadBytes = sizeof(double);
+static_assert(kBoxedDoublePayloadBytes == 8,
+              "boxed doubles store IEEE binary64 payloads");
+
 inline double read_boxed_double(const HeapObject* o) noexcept {
     double v = 0.0;
-    std::memcpy(&v, reinterpret_cast<const uint8_t*>(o) + sizeof(ObjectHeader), 8);
+    std::memcpy(&v,
+                reinterpret_cast<const uint8_t*>(o) + sizeof(ObjectHeader),
+                kBoxedDoublePayloadBytes);
     return v;
 }
 
 inline void write_boxed_double(HeapObject* o, double value) noexcept {
-    std::memcpy(reinterpret_cast<uint8_t*>(o) + sizeof(ObjectHeader), &value, 8);
+    std::memcpy(reinterpret_cast<uint8_t*>(o) + sizeof(ObjectHeader), &value,
+                kBoxedDoublePayloadBytes);
 }
 
 }  // namespace vortex

@@ -16,6 +16,8 @@ namespace {
 // All values flow through canonical opcodes — no speculation is emitted by the
 // frontend; the engine's profile-driven rewriter specializes hot sites
 // (docs/ugb.md section 4.1, docs/tier-t0.md section 6).
+//
+// Rule 68: AST dispatch uses the explicit ExprKind/StmtKind tags — no RTTI.
 class FunctionEmitter {
 public:
     FunctionEmitter(ugb::UGBModule& module, const Function& fn)
@@ -62,77 +64,93 @@ private:
     void reset_temps() { temp_counter_ = 0; }
 
     Result<uint16_t> emit_expr(const Expr& e) {
-        if (auto* lit = dynamic_cast<const IntLiteral*>(&e)) {
+        switch (e.kind) {
+        case ExprKind::IntLiteral: {
+            const auto& lit = static_cast<const IntLiteral&>(e);
             const uint16_t r = temp_reg();
-            if (lit->value >= -2147483648LL && lit->value <= 2147483647LL) {
-                builder_->const_i32(r, static_cast<int32_t>(lit->value));
+            if (lit.value >= -2147483648LL && lit.value <= 2147483647LL) {
+                builder_->const_i32(r, static_cast<int32_t>(lit.value));
             } else {
-                builder_->const_i64(r, lit->value);
+                builder_->const_i64(r, lit.value);
             }
             return r;
         }
-        if (auto* lit = dynamic_cast<const BoolLiteral*>(&e)) {
+        case ExprKind::BoolLiteral: {
+            const auto& lit = static_cast<const BoolLiteral&>(e);
             const uint16_t r = temp_reg();
-            if (lit->value) {
+            if (lit.value) {
                 builder_->const_true(r);
             } else {
                 builder_->const_false(r);
             }
             return r;
         }
-        if (dynamic_cast<const NullLiteral*>(&e) != nullptr) {
+        case ExprKind::NullLiteral: {
             const uint16_t r = temp_reg();
             builder_->const_null(r);
             return r;
         }
-        if (auto* id = dynamic_cast<const Ident*>(&e)) {
-            const uint16_t slot = local_index(id->name);
+        case ExprKind::Ident: {
+            const auto& id = static_cast<const Ident&>(e);
+            const uint16_t slot = local_index(id.name);
             if (slot == 0xFFFF) {
                 return support::fail(support::ErrorCode::SyntaxError,
-                                     "undefined variable '" + id->name + "'",
-                                     id->line);
+                                     "undefined variable '" + id.name + "'",
+                                     id.line);
             }
             return slot;
         }
-        if (auto* un = dynamic_cast<const Unary*>(&e)) {
-            auto operand = emit_expr(*un->operand);
+        case ExprKind::Unary: {
+            const auto& un = static_cast<const Unary&>(e);
+            auto operand = emit_expr(*un.operand);
             if (!operand) return operand;
             const uint16_t r = temp_reg();
-            if (un->op == '-') {
+            if (un.op == '-') {
+                // -x == 0 - x (was x - 0: a silent no-op — regression-tested).
                 const uint16_t zero = temp_reg();
                 builder_->const_i32(zero, 0);
-                builder_->emit(ugb::Op::SUB_ANY, r, {*operand, zero});
+                builder_->emit(ugb::Op::SUB_ANY, r, {zero, *operand});
             } else {  // '!'
-                const uint16_t t = temp_reg();
-                builder_->const_false(t);
-                builder_->emit(ugb::Op::EQ_REF, r, {*operand, t});
+                // !x lowered structurally so it matches the branch
+                // truthiness used by if/while (was EQ_REF x, false, which
+                // contradicted truthy() for smi 0 / null / undefined).
+                const std::string l_false = make_label("not_false");
+                const std::string l_end = make_label("not_end");
+                builder_->jump_true(*operand, l_false);
+                builder_->const_true(r);
+                builder_->jump(l_end);
+                builder_->bind_label(l_false);
+                builder_->const_false(r);
+                builder_->bind_label(l_end);
             }
             return r;
         }
-        if (auto* bin = dynamic_cast<const Binary*>(&e)) {
-            if (bin->op == "&&" || bin->op == "||") {
-                return emit_logical(*bin, bin->op == "&&");
+        case ExprKind::Binary: {
+            const auto& bin = static_cast<const Binary&>(e);
+            if (bin.op == "&&" || bin.op == "||") {
+                return emit_logical(bin, bin.op == "&&");
             }
-            auto lhs = emit_expr(*bin->lhs);
+            auto lhs = emit_expr(*bin.lhs);
             if (!lhs) return lhs;
-            auto rhs = emit_expr(*bin->rhs);
+            auto rhs = emit_expr(*bin.rhs);
             if (!rhs) return rhs;
             const uint16_t r = temp_reg();
-            const ugb::Op op = binop_opcode(bin->op);
+            const ugb::Op op = binop_opcode(bin.op);
             if (op == ugb::Op::ILLEGAL) {
                 return support::fail(support::ErrorCode::SyntaxError,
-                                     "unsupported operator '" + bin->op + "'",
-                                     bin->line);
+                                     "unsupported operator '" + bin.op + "'",
+                                     bin.line);
             }
             builder_->emit(op, r, {*lhs, *rhs});
             return r;
         }
-        if (auto* call = dynamic_cast<const Call*>(&e)) {
-            if (call->callee == "print") {
+        case ExprKind::Call: {
+            const auto& call = static_cast<const Call&>(e);
+            if (call.callee == "print") {
                 // print(...) -> Call.Builtin print (docs/porting.md Step 3)
                 const uint16_t base = temp_reg();
                 uint16_t cur = base;
-                for (const auto& a : call->args) {
+                for (const auto& a : call.args) {
                     auto v = emit_expr(*a);
                     if (!v) return v;
                     if (*v != cur) {
@@ -142,13 +160,13 @@ private:
                 }
                 const uint16_t dst = temp_reg();
                 builder_->call_builtin(dst, base,
-                                       static_cast<uint16_t>(call->args.size()),
+                                       static_cast<uint16_t>(call.args.size()),
                                        "print");
                 return dst;
             }
             const uint16_t base = temp_reg();
             uint16_t cur = base;
-            for (const auto& a : call->args) {
+            for (const auto& a : call.args) {
                 auto v = emit_expr(*a);
                 if (!v) return v;
                 if (*v != cur) {
@@ -158,9 +176,10 @@ private:
             }
             const uint16_t dst = temp_reg();
             builder_->call_direct(dst, base,
-                                  static_cast<uint16_t>(call->args.size()),
-                                  call->callee);
+                                  static_cast<uint16_t>(call.args.size()),
+                                  call.callee);
             return dst;
+        }
         }
         return support::fail(support::ErrorCode::SyntaxError,
                              "unsupported expression kind", e.line);
@@ -212,61 +231,66 @@ private:
 
     Result<void> emit_stmt(const Stmt& s) {
         reset_temps();
-        if (auto* let = dynamic_cast<const LetStmt*>(&s)) {
-            auto v = emit_expr(*let->value);
+        switch (s.kind) {
+        case StmtKind::Let: {
+            const auto& let = static_cast<const LetStmt&>(s);
+            auto v = emit_expr(*let.value);
             if (!v) return std::unexpected(v.error());
-            if (local_index(let->name) == 0xFFFF) {
+            if (local_index(let.name) == 0xFFFF) {
                 if (next_local_ >= kTempBase()) {
                     return support::fail(support::ErrorCode::SyntaxError,
                                          "too many locals in function '" +
                                              fn_.name + "' (max 64)",
-                                         let->line);
+                                         let.line);
                 }
-                locals_[let->name] = next_local_++;
+                locals_[let.name] = next_local_++;
             }
-            builder_->emit(ugb::Op::MOVE, locals_[let->name], {*v});
+            builder_->emit(ugb::Op::MOVE, locals_[let.name], {*v});
             return support::ok();
         }
-        if (auto* assign = dynamic_cast<const AssignStmt*>(&s)) {
-            const uint16_t slot = local_index(assign->name);
+        case StmtKind::Assign: {
+            const auto& assign = static_cast<const AssignStmt&>(s);
+            const uint16_t slot = local_index(assign.name);
             if (slot == 0xFFFF) {
                 return support::fail(support::ErrorCode::SyntaxError,
                                      "assignment to undeclared '" +
-                                         assign->name + "'",
-                                     assign->line);
+                                         assign.name + "'",
+                                     assign.line);
             }
-            auto v = emit_expr(*assign->value);
+            auto v = emit_expr(*assign.value);
             if (!v) return std::unexpected(v.error());
             builder_->emit(ugb::Op::MOVE, slot, {*v});
             return support::ok();
         }
-        if (auto* ifs = dynamic_cast<const IfStmt*>(&s)) {
-            auto cond = emit_expr(*ifs->cond);
+        case StmtKind::If: {
+            const auto& ifs = static_cast<const IfStmt&>(s);
+            auto cond = emit_expr(*ifs.cond);
             if (!cond) return std::unexpected(cond.error());
             const std::string l_else = make_label("if_else");
             const std::string l_end = make_label("if_end");
             builder_->jump_false(*cond, l_else);
-            for (const auto& st : ifs->then_body) {
+            for (const auto& st : ifs.then_body) {
                 auto r = emit_stmt(*st);
                 if (!r) return r;
             }
             builder_->jump(l_end);
             builder_->bind_label(l_else);
-            for (const auto& st : ifs->else_body) {
+            for (const auto& st : ifs.else_body) {
                 auto r = emit_stmt(*st);
                 if (!r) return r;
             }
             builder_->bind_label(l_end);
             return support::ok();
         }
-        if (auto* wh = dynamic_cast<const WhileStmt*>(&s)) {
+        case StmtKind::While: {
+            const auto& wh = static_cast<const WhileStmt&>(s);
             const std::string l_cond = make_label("while_cond");
             const std::string l_end = make_label("while_end");
             builder_->bind_label(l_cond);
-            auto cond = emit_expr(*wh->cond);
+            auto cond = emit_expr(*wh.cond);
             if (!cond) return std::unexpected(cond.error());
             builder_->jump_false(*cond, l_end);
-            for (const auto& st : wh->body) {
+            for (const auto& st : wh.body) {
                 auto r = emit_stmt(*st);
                 if (!r) return r;
             }
@@ -274,9 +298,10 @@ private:
             builder_->bind_label(l_end);
             return support::ok();
         }
-        if (auto* ret = dynamic_cast<const ReturnStmt*>(&s)) {
-            if (ret->value) {
-                auto v = emit_expr(*ret->value);
+        case StmtKind::Return: {
+            const auto& ret = static_cast<const ReturnStmt&>(s);
+            if (ret.value) {
+                auto v = emit_expr(*ret.value);
                 if (!v) return std::unexpected(v.error());
                 builder_->ret(*v);
             } else {
@@ -286,10 +311,12 @@ private:
             }
             return support::ok();
         }
-        if (auto* expr = dynamic_cast<const ExprStmt*>(&s)) {
-            auto v = emit_expr(*expr->expr);
+        case StmtKind::ExprStmt: {
+            const auto& expr = static_cast<const ExprStmt&>(s);
+            auto v = emit_expr(*expr.expr);
             if (!v) return std::unexpected(v.error());
             return support::ok();
+        }
         }
         return support::fail(support::ErrorCode::SyntaxError,
                              "unsupported statement kind", s.line);
@@ -314,21 +341,33 @@ Result<ugb::UGBModule> compile_mini(std::string_view source) {
     auto tokens = lex(source);
     if (!tokens) return std::unexpected(tokens.error());
 
-    Program program;
-    try {
-        program = parse(*tokens);
-    } catch (const ParseError& e) {
-        return support::fail(support::ErrorCode::SyntaxError, e.what(), e.line);
-    }
+    auto parsed = parse(*tokens);
+    if (!parsed) return std::unexpected(parsed.error());
+    Program program = std::move(*parsed);
 
     ugb::UGBModule module;
     module.language_name = "mini";
     module.intern_builtin("print");
 
-    for (const auto& fn : program.functions) {
+    // Rule 3: the frontend declares what its lowered methods require; the
+    // engine negotiates at load time (Interpreter::run -> check_capabilities).
+    const uint8_t mini_caps[] = {
+        static_cast<uint8_t>(ugb::Capability::TypedArithmetic),
+        static_cast<uint8_t>(ugb::Capability::BuiltinCalls),
+    };
+    module.capability_mask = ugb::CapabilitySet()
+                                 .add(ugb::Capability::TypedArithmetic)
+                                 .add(ugb::Capability::BuiltinCalls)
+                                 .raw();
+
+    for (auto& fn : program.functions) {
         FunctionEmitter emitter(module, fn);
         auto res = emitter.run();
         if (!res) return std::unexpected(res.error());
+    }
+    for (auto& mt : module.method_table) {
+        mt.required_capabilities.assign(std::begin(mini_caps),
+                                        std::end(mini_caps));
     }
     return module;
 }

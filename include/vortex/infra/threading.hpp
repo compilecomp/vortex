@@ -46,7 +46,11 @@ class HandshakeManager {
 public:
     support::Result<void> request(SuspensionKind kind, uint64_t thread_id);
     support::Result<void> acknowledge(uint64_t thread_id);
-    bool pending(uint64_t thread_id) const noexcept { return pending_; }
+    // Contract stub (M2 threading infra): thread_id is part of the public
+    // handshake API and is consumed when the real manager lands.
+    bool pending([[maybe_unused]] uint64_t thread_id) const noexcept {
+        return pending_;
+    }
 
 private:
     bool pending_ = false;

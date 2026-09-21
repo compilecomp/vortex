@@ -25,6 +25,18 @@ enum class Reg : uint8_t {
 constexpr uint8_t reg_id(Reg r) noexcept { return static_cast<uint8_t>(r); }
 constexpr bool needs_rex(Reg r) noexcept { return reg_id(r) >= 8; }
 
+/// XMM vector/scalar registers (SSE2 scalar-double ops used by the F64
+/// stencils; see tests/test_codegen_infra.cpp golden pins).
+enum class Xmm : uint8_t {
+    XMM0 = 0, XMM1 = 1, XMM2 = 2, XMM3 = 3,
+    XMM4 = 4, XMM5 = 5, XMM6 = 6, XMM7 = 7,
+    XMM8 = 8, XMM9 = 9, XMM10 = 10, XMM11 = 11,
+    XMM12 = 12, XMM13 = 13, XMM14 = 14, XMM15 = 15,
+};
+
+constexpr uint8_t xmm_id(Xmm r) noexcept { return static_cast<uint8_t>(r); }
+constexpr bool needs_rex_xmm(Xmm r) noexcept { return xmm_id(r) >= 8; }
+
 /// Memory operand: [base + scale*index + displacement].
 struct Mem {
     Reg base = Reg::RBP;
@@ -41,9 +53,28 @@ public:
 
     // ---- moves ---------------------------------------------------------------
     void mov_reg_imm64(Reg dst, uint64_t imm);          // REX.W B8+rd io
+    void mov_reg_imm32sx(Reg dst, int32_t imm);         // REX.W C7 /0 id (sign-ext)
     void mov_reg_reg(Reg dst, Reg src);                 // REX.W 89 /r
     void mov_mem_reg(const Mem& dst, Reg src);          // REX.W 89 /r
     void mov_reg_mem(Reg dst, const Mem& src);          // REX.W 8B /r
+    void mov_reg32_mem(Reg dst, const Mem& src);        // 8B /r   (32-bit load)
+    void mov_mem_imm32(const Mem& dst, int32_t imm);    // C7 /0 id (32-bit store)
+    void mov_mem_imm32sx(const Mem& dst, int32_t imm);  // REX.W C7 /0 (64-bit, sign-ext)
+
+    // ---- scalar double (SSE2) -------------------------------------------------
+    void movsd_xmm_mem(Xmm dst, const Mem& src);        // F2 0F 10 /r
+    void movsd_mem_xmm(const Mem& dst, Xmm src);        // F2 0F 11 /r
+    void movsd_xmm_xmm(Xmm dst, Xmm src);               // F2 0F 11 /r (reg,reg)
+    void movq_xmm_gpr(Xmm dst, Reg src);                // 66 REX.W 0F 6E /r
+    void movq_gpr_xmm(Reg dst, Xmm src);                // 66 REX.W 0F 7E /r
+    void pxor_xmm_xmm(Xmm dst, Xmm src);                // 66 0F EF /r
+    void addsd(Xmm dst, Xmm src);                       // F2 0F 58 /r
+    void subsd(Xmm dst, Xmm src);                       // F2 0F 5C /r
+    void mulsd(Xmm dst, Xmm src);                       // F2 0F 59 /r
+    void divsd(Xmm dst, Xmm src);                       // F2 0F 5E /r
+    void ucomisd(Xmm dst, Xmm src);                     // 66 0F 2E /r
+    void cvtsi2sd(Xmm dst, Reg src);                    // F2 REX.W 0F 2A /r
+    void cvttsd2si(Reg dst, Xmm src);                   // F2 REX.W 0F 2C /r
 
     // ---- arithmetic (64-bit) ---------------------------------------------------
     void add_reg_reg(Reg dst, Reg src);                 // REX.W 01 /r
@@ -55,6 +86,16 @@ public:
     void xor_reg_reg(Reg dst, Reg src);                 // REX.W 31 /r
     void cmp_reg_imm32(Reg dst, int32_t imm);           // REX.W 81 /7 id
     void cmp_reg_reg(Reg dst, Reg src);                 // REX.W 39 /r
+    void cmp_mem_reg(const Mem& m, Reg src);            // REX.W 39 /r (r/m, reg)
+    void cmp_reg_mem(Reg dst, const Mem& m);            // REX.W 3B /r (reg, r/m)
+    void call_mem(const Mem& target);                   // FF /2
+    void test_reg_imm8(Reg dst, uint8_t imm);           // REX.W F6 /0 ib
+    void test_reg_imm32(Reg dst, int32_t imm);          // REX.W F7 /0 id
+    void or_reg_imm8(Reg dst, int8_t imm);              // REX.W 83 /1 ib
+    void and_reg_imm8(Reg dst, int8_t imm);             // REX.W 83 /4 ib
+    void shl_reg_cl(Reg dst);                           // REX.W D3 /4
+    void shr_reg_cl(Reg dst);                           // REX.W D3 /5
+    void sar_reg_cl(Reg dst);                           // REX.W D3 /7
     void imul_reg_reg(Reg dst, Reg src);                // REX.W 0F AF /r
     void inc_reg(Reg r);                                // REX.W FF /0
     void dec_reg(Reg r);                                // REX.W FF /1
@@ -92,8 +133,16 @@ public:
 
 private:
     void rex_w(Reg reg, Reg rm_or_index);               // emit REX prefix byte
+    /// REX with explicit bits: W=bit3, R=bit2, X=bit1, B=bit0.
+    void rex_raw(uint8_t bits);
     void modrm(uint8_t mod, Reg reg, Reg rm);
     void emit_mem_operand(Reg reg, const Mem& m);       // modrm + sib + disp
+    /// SSE2 operand encoding: prefix bytes, optional REX (R from `reg_is_xmm_high`,
+    /// B from `rm_is_xmm_high`), opcode, modrm. GPR register fields reuse reg/reg.
+    void sse_op(const uint8_t* prefix, size_t prefix_len, bool rex_w_set,
+                uint8_t opcode, Xmm reg, Xmm rm);
+    /// REX byte for a memory-form operation: R bit from `reg`, B from mem base.
+    uint8_t mem_rex(bool rex_w_set, uint8_t reg_field, const Mem& m) const;
     void imm32(int32_t v);
 
     CodeBuffer& out_;

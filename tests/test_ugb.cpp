@@ -140,11 +140,15 @@ VORTEX_TEST(verifier_rejects_call_window_oob) {
     auto res = verify_module(module);
     VORTEX_EXPECT(!res.has_value());
 
-    // A well-formed call passes: arg window R[1..2] with regs=8.
+    // A well-formed call passes: arg window R[1..2] with regs=8, and the
+    // token resolves to a callee whose declared arity matches (Rule 7).
     UGBModule ok_module;
-    ok_module.intern_method("f");
+    MethodBuilder ok_victim(ok_module, "victim", 4, 2);
+    ok_victim.ret(0);
+    VORTEX_EXPECT(ok_victim.finish().has_value());
+    const uint32_t victim_token = ok_module.intern_method("victim");
     MethodBuilder ok_b(ok_module, "ok", 8, 0);
-    ok_b.emit(Op::CALL_DIRECT, 0, {1, 2}, true, 1);
+    ok_b.emit(Op::CALL_DIRECT, 0, {1, 2}, true, victim_token);
     ok_b.ret(0);
     VORTEX_EXPECT(ok_b.finish().has_value());
     auto ok_res = verify_module(ok_module);

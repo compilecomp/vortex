@@ -11,6 +11,10 @@ void Assembler::rex_w(Reg reg, Reg rm_or_index) {
     out_.emit8(rex);
 }
 
+void Assembler::rex_raw(uint8_t bits) {
+    if (bits != 0x40) out_.emit8(bits);  // bare REX is a no-op prefix
+}
+
 void Assembler::modrm(uint8_t mod, Reg reg, Reg rm) {
     out_.emit8(static_cast<uint8_t>((mod << 6) | (reg_id(reg) << 3) | reg_id(rm)));
 }
@@ -21,7 +25,11 @@ void Assembler::emit_mem_operand(Reg reg, const Mem& m) {
     // SIB is required when index != no-index marker or base is RSP/RBP-mod-0.
     const bool no_index = reg_id(m.index) == 4 && m.scale == 0;
     const bool base_needs_sib = reg_id(m.base) == 4;   // RSP base
-    const bool special_base = reg_id(m.base) == 5;     // RBP base: mod 0 needs disp
+    // RBP (5) and R13 (13) both encode mod-0 rm as RIP-relative on real x86-64;
+    // both must force a displacement (the M1 stencil corpus relies on this for
+    // rbp-based vreg addressing).
+    const bool special_base =
+        reg_id(m.base) == 5 || reg_id(m.base) == 13;
 
     uint8_t mod;
     if (m.disp == 0 && !special_base) {
@@ -67,10 +75,164 @@ void Assembler::mov_reg_imm64(Reg dst, uint64_t imm) {
     out_.emit64(imm);
 }
 
+void Assembler::mov_reg_imm32sx(Reg dst, int32_t imm) {
+    // REX.W C7 /0 id: mov r/m64, imm32 (sign-extended).
+    rex_w(dst, dst);
+    out_.emit8(0xC7);
+    modrm(0x3, Reg::RAX, dst);  // /0 = MOV
+    imm32(imm);
+}
+
+void Assembler::sse_op(const uint8_t* prefix, size_t prefix_len, bool rex_w_set,
+                       uint8_t opcode, Xmm reg, Xmm rm) {
+    for (size_t i = 0; i < prefix_len; ++i) out_.emit8(prefix[i]);
+    uint8_t rex = static_cast<uint8_t>(rex_w_set ? 0x48 : 0x40);
+    if (needs_rex_xmm(reg)) rex |= 0x4;
+    if (needs_rex_xmm(rm)) rex |= 0x1;
+    rex_raw(rex);
+    out_.emit8(0x0F);
+    out_.emit8(opcode);
+    modrm(0x3, static_cast<Reg>(xmm_id(reg) & 0x7),
+          static_cast<Reg>(xmm_id(rm) & 0x7));
+}
+
+void Assembler::movsd_xmm_mem(Xmm dst, const Mem& src) {
+    const uint8_t pfx[1] = {0xF2};
+    for (uint8_t b : pfx) out_.emit8(b);
+    uint8_t rex = 0x40;
+    if (needs_rex_xmm(dst)) rex |= 0x4;
+    if (needs_rex(src.base)) rex |= 0x1;
+    rex_raw(rex);
+    out_.emit8(0x0F);
+    out_.emit8(0x10);
+    emit_mem_operand(static_cast<Reg>(xmm_id(dst) & 0x7), src);
+}
+
+void Assembler::movsd_mem_xmm(const Mem& dst, Xmm src) {
+    out_.emit8(0xF2);
+    uint8_t rex = 0x40;
+    if (needs_rex_xmm(src)) rex |= 0x4;
+    if (needs_rex(dst.base)) rex |= 0x1;
+    rex_raw(rex);
+    out_.emit8(0x0F);
+    out_.emit8(0x11);
+    emit_mem_operand(static_cast<Reg>(xmm_id(src) & 0x7), dst);
+}
+
+void Assembler::movsd_xmm_xmm(Xmm dst, Xmm src) {
+    const uint8_t pfx[1] = {0xF2};
+    sse_op(pfx, 1, false, 0x11, dst, src);  // movsd r/m, xmm (reg,reg form)
+}
+
+void Assembler::movq_xmm_gpr(Xmm dst, Reg src) {
+    const uint8_t pfx[1] = {0x66};
+    for (uint8_t b : pfx) out_.emit8(b);
+    uint8_t rex = 0x48;  // W set: 64-bit GPR source
+    if (needs_rex_xmm(dst)) rex |= 0x4;
+    if (needs_rex(src)) rex |= 0x1;
+    out_.emit8(rex);
+    out_.emit8(0x0F);
+    out_.emit8(0x6E);
+    modrm(0x3, static_cast<Reg>(xmm_id(dst) & 0x7), src);
+}
+
+void Assembler::movq_gpr_xmm(Reg dst, Xmm src) {
+    out_.emit8(0x66);
+    uint8_t rex = 0x48;
+    if (needs_rex(dst)) rex |= 0x4;
+    if (needs_rex_xmm(src)) rex |= 0x1;
+    out_.emit8(rex);
+    out_.emit8(0x0F);
+    out_.emit8(0x7E);
+    modrm(0x3, dst, static_cast<Reg>(xmm_id(src) & 0x7));
+}
+
+void Assembler::pxor_xmm_xmm(Xmm dst, Xmm src) {
+    const uint8_t pfx[1] = {0x66};
+    sse_op(pfx, 1, false, 0xEF, dst, src);
+}
+
+void Assembler::addsd(Xmm dst, Xmm src) {
+    const uint8_t pfx[1] = {0xF2};
+    sse_op(pfx, 1, false, 0x58, dst, src);
+}
+
+void Assembler::subsd(Xmm dst, Xmm src) {
+    const uint8_t pfx[1] = {0xF2};
+    sse_op(pfx, 1, false, 0x5C, dst, src);
+}
+
+void Assembler::mulsd(Xmm dst, Xmm src) {
+    const uint8_t pfx[1] = {0xF2};
+    sse_op(pfx, 1, false, 0x59, dst, src);
+}
+
+void Assembler::divsd(Xmm dst, Xmm src) {
+    const uint8_t pfx[1] = {0xF2};
+    sse_op(pfx, 1, false, 0x5E, dst, src);
+}
+
+void Assembler::ucomisd(Xmm dst, Xmm src) {
+    const uint8_t pfx[1] = {0x66};
+    sse_op(pfx, 1, false, 0x2E, dst, src);
+}
+
+void Assembler::cvtsi2sd(Xmm dst, Reg src) {
+    out_.emit8(0xF2);
+    uint8_t rex = 0x48;  // W set: 64-bit GPR source
+    if (needs_rex_xmm(dst)) rex |= 0x4;
+    if (needs_rex(src)) rex |= 0x1;
+    out_.emit8(rex);
+    out_.emit8(0x0F);
+    out_.emit8(0x2A);
+    modrm(0x3, static_cast<Reg>(xmm_id(dst) & 0x7), src);
+}
+
+void Assembler::cvttsd2si(Reg dst, Xmm src) {
+    out_.emit8(0xF2);
+    uint8_t rex = 0x48;
+    if (needs_rex(dst)) rex |= 0x4;
+    if (needs_rex_xmm(src)) rex |= 0x1;
+    out_.emit8(rex);
+    out_.emit8(0x0F);
+    out_.emit8(0x2C);
+    modrm(0x3, dst, static_cast<Reg>(xmm_id(src) & 0x7));
+}
+
 void Assembler::mov_reg_reg(Reg dst, Reg src) {
     rex_w(src, dst);        // reg field = src, rm field = dst
     out_.emit8(0x89);
     modrm(0x3, src, dst);
+}
+
+uint8_t Assembler::mem_rex(bool rex_w_set, uint8_t reg_field,
+                           const Mem& m) const {
+    uint8_t rex = static_cast<uint8_t>(rex_w_set ? 0x48 : 0x40);
+    if (reg_field >= 8) rex |= 0x4;
+    if (needs_rex(m.base)) rex |= 0x1;
+    return rex;
+}
+
+void Assembler::mov_reg32_mem(Reg dst, const Mem& src) {
+    rex_raw(mem_rex(false, reg_id(dst), src));
+    out_.emit8(0x8B);
+    emit_mem_operand(dst, src);
+}
+
+void Assembler::mov_mem_imm32(const Mem& dst, int32_t imm) {
+    // C7 /0 id: 32-bit store (64-bit store variant is mov_mem_imm32sx).
+    rex_raw(mem_rex(false, 0, dst));
+    out_.emit8(0xC7);
+    emit_mem_operand(Reg::RAX, dst);  // /0 = MOV
+    imm32(imm);
+}
+
+void Assembler::mov_mem_imm32sx(const Mem& dst, int32_t imm) {
+    // REX.W C7 /0 id: 64-bit store of a sign-extended imm32.
+    rex_raw(mem_rex(true, 0, dst));
+    out_.emit8(0xC7);
+    emit_mem_operand(Reg::RAX, dst);  // /0 = MOV
+    imm32(imm);
 }
 
 void Assembler::mov_mem_reg(const Mem& dst, Reg src) {
@@ -150,6 +312,70 @@ void Assembler::cmp_reg_reg(Reg dst, Reg src) {
     rex_w(src, dst);
     out_.emit8(0x39);
     modrm(0x3, src, dst);
+}
+
+void Assembler::cmp_mem_reg(const Mem& m, Reg src) {
+    rex_w(src, m.base);
+    out_.emit8(0x39);
+    emit_mem_operand(src, m);
+}
+
+void Assembler::cmp_reg_mem(Reg dst, const Mem& m) {
+    rex_w(dst, m.base);
+    out_.emit8(0x3B);
+    emit_mem_operand(dst, m);
+}
+
+void Assembler::call_mem(const Mem& target) {
+    rex_raw(mem_rex(false, 2, target));  // FF /2 = CALL r/m64
+    out_.emit8(0xFF);
+    emit_mem_operand(Reg::RDX, target);  // /2 = CALL
+}
+
+void Assembler::test_reg_imm8(Reg dst, uint8_t imm) {
+    rex_w(dst, dst);
+    out_.emit8(0xF6);
+    modrm(0x3, Reg::RAX, dst);  // /0 = TEST
+    out_.emit8(imm);
+}
+
+void Assembler::test_reg_imm32(Reg dst, int32_t imm) {
+    rex_w(dst, dst);
+    out_.emit8(0xF7);
+    modrm(0x3, Reg::RAX, dst);  // /0 = TEST
+    imm32(imm);
+}
+
+void Assembler::or_reg_imm8(Reg dst, int8_t imm) {
+    rex_w(dst, dst);
+    out_.emit8(0x83);
+    modrm(0x3, Reg::RCX, dst);  // /1 = OR
+    out_.emit8(static_cast<uint8_t>(imm));
+}
+
+void Assembler::and_reg_imm8(Reg dst, int8_t imm) {
+    rex_w(dst, dst);
+    out_.emit8(0x83);
+    modrm(0x3, Reg::RSP, dst);  // /4 = AND
+    out_.emit8(static_cast<uint8_t>(imm));
+}
+
+void Assembler::shl_reg_cl(Reg dst) {
+    rex_w(dst, dst);
+    out_.emit8(0xD3);
+    modrm(0x3, Reg::RAX, dst);  // /4 = SHL
+}
+
+void Assembler::shr_reg_cl(Reg dst) {
+    rex_w(dst, dst);
+    out_.emit8(0xD3);
+    modrm(0x3, Reg::RCX, dst);  // /5 = SHR
+}
+
+void Assembler::sar_reg_cl(Reg dst) {
+    rex_w(dst, dst);
+    out_.emit8(0xD3);
+    modrm(0x3, Reg::RBP, dst);  // /7 = SAR
 }
 
 void Assembler::imul_reg_reg(Reg dst, Reg src) {

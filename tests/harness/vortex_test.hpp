@@ -34,6 +34,9 @@ inline int run_all(const char* binary_name) {
     std::printf("[====] %s: %zu tests\n", binary_name, registry().size());
     int failed_tests = 0;
     for (const auto& t : registry()) {
+        // Print + flush BEFORE running so a crashed test names itself.
+        std::printf("[ RUN] %s\n", t.name);
+        std::fflush(stdout);
         const int before = failure_count();
         t.fn();
         const bool ok = failure_count() == before;
