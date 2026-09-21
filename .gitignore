@@ -1,0 +1,29 @@
+# Build directories
+build/
+build-*/
+out/
+cmake-build-*/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+.clangd/
+
+# Editors / IDE
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Test artifacts
+tests/golden/*.actual
+Testing/
+*.log
+
+# profiling / tooling output
+*.jitdump
+perf.data*
