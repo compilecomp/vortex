@@ -60,6 +60,8 @@ public:
     void mov_reg32_mem(Reg dst, const Mem& src);        // 8B /r   (32-bit load)
     void mov_mem_imm32(const Mem& dst, int32_t imm);    // C7 /0 id (32-bit store)
     void mov_mem_imm32sx(const Mem& dst, int32_t imm);  // REX.W C7 /0 (64-bit, sign-ext)
+    void mov_mem_imm8(const Mem& dst, int8_t imm);      // C6 /0 ib (8-bit store:
+                                                        // card-table barriers)
 
     // ---- scalar double (SSE2) -------------------------------------------------
     void movsd_xmm_mem(Xmm dst, const Mem& src);        // F2 0F 10 /r
@@ -78,6 +80,7 @@ public:
 
     // ---- arithmetic (64-bit) ---------------------------------------------------
     void add_reg_reg(Reg dst, Reg src);                 // REX.W 01 /r
+    void or_reg_reg(Reg dst, Reg src);                  // REX.W 09 /r
     void add_reg_imm32(Reg dst, int32_t imm);           // REX.W 81 /0 id
     void sub_reg_reg(Reg dst, Reg src);                 // REX.W 29 /r
     void sub_reg_imm32(Reg dst, int32_t imm);

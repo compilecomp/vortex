@@ -32,6 +32,9 @@ struct Stencil {
     bool speculative = false;     // typed form with fallback path
     std::vector<uint8_t> bytes;   // template machine code
     std::vector<PatchSite> patch_sites;
+    // Template-internal offset of the IC-guard slow body (always-slow jmp
+    // target). 0 = no slow path (constant/control-flow templates).
+    uint32_t slow_path_offset = 0;
     uint32_t gc_map_offset = 0;
     uint32_t deopt_record_offset = 0;
 };

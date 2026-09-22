@@ -176,6 +176,16 @@ enum class Op : uint16_t {
     // ---- 15. GC barrier hints ------------------------------------------------------
     WRITE_BARRIER_STORE,
 
+    // ---- 15a. interop messages (docs/interop-protocol.md section 5) ---------------
+    // Hot interop messages hold dedicated opcodes so the tiers can
+    // devirtualize and inline them; the generic send is the fallback.
+    // Loader law: the module's capability mask must carry the matching
+    // CAP_INTEROP_* bit (runtime/interop.hpp) or the load is rejected.
+    POLY_EXECUTE,  // dst(result), arg_base, argc; meta = language/member ctx
+    POLY_READ,     // dst, recv, member_idx
+    POLY_WRITE,    // recv, member_idx, value
+    POLY_SEND,     // dst, msg_id, recv, arg_base (cold/generic fallback)
+
     // ---- 16. debug -------------------------------------------------------------------
     DEBUG_SRCPOS,  // meta = line number
     DEBUG_TRAP,
@@ -204,6 +214,10 @@ bool is_speculative(Op op) noexcept;
 /// Canonical form for a speculative opcode (Add.I32 -> Add.Any); identity for
 /// canonical opcodes.
 Op canonical_form(Op op) noexcept;
+
+constexpr bool is_interop_call(Op op) noexcept {
+    return op == Op::POLY_EXECUTE || op == Op::POLY_SEND;
+}
 
 constexpr bool is_branch(Op op) noexcept {
     return op == Op::JUMP || op == Op::JUMP_TRUE || op == Op::JUMP_FALSE ||

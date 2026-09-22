@@ -86,6 +86,9 @@ private:
 ///   load TLAB top; add size; compare with end; bump and initialize header.
 class Tlab {
 public:
+    // Heap-pointer invariant granularity (TaggedValue::heap_pointer).
+    static constexpr size_t kAlignment = 16;
+
     explicit Tlab(uint8_t* base, size_t bytes) noexcept
         : base_(base), top_(base), end_(base + bytes) {}
 
@@ -102,6 +105,10 @@ public:
     ///        amortized cost (Heap::refill_tlab, warm)
     template <typename T>
     T* try_allocate(size_t bytes) noexcept {
+        // The tagged-pointer scheme requires 16-byte-aligned object bases
+        // (TaggedValue::heap_pointer masks the low nibble): every bump is
+        // rounded up so the NEXT allocation stays aligned too.
+        bytes = (bytes + kAlignment - 1) & ~(kAlignment - 1);
         if (top_ + bytes > end_) return nullptr;
         void* p = top_;
         top_ += bytes;
@@ -116,6 +123,8 @@ public:
         top_ = base;
         end_ = base + bytes;
     }
+    // J1 sync: adopt an externally bumped top (same base/end window).
+    void sync_top(uint8_t* top) noexcept { top_ = top; }
 
 private:
     uint8_t* base_ = nullptr;
@@ -158,6 +167,16 @@ public:
     CardTable& card_table() noexcept { return card_table_; }
     const HeapStats& stats() const noexcept { return stats_; }
     Klass* double_klass() noexcept { return double_klass_; }
+
+    // ---- J1 native-allocation sync points (docs/roadmap.md M1) --------------
+    // J1-compiled code bumps the TLAB directly through its context copy.
+    // Under the single-mutator contract the C++ helpers re-sync the snapshot
+    // before any Heap::allocate_* call and read it back after, so the two
+    // views of the bump pointer never diverge (helper_alloc_slow, M1).
+    uint8_t* tlab_top() noexcept { return tlab_.top(); }
+    uint8_t* tlab_end() noexcept { return tlab_.end(); }
+    void sync_tlab_top(uint8_t* top) noexcept { tlab_.sync_top(top); }
+    const void* heap_base() const noexcept { return young_.get(); }
 
     /// Contract stub: concurrent old-generation collection
     /// (docs/roadmap.md, M5). Young collection is a stub too in M0 — the heap

@@ -16,7 +16,11 @@ void Assembler::rex_raw(uint8_t bits) {
 }
 
 void Assembler::modrm(uint8_t mod, Reg reg, Reg rm) {
-    out_.emit8(static_cast<uint8_t>((mod << 6) | (reg_id(reg) << 3) | reg_id(rm)));
+    // The reg/rm fields are 3 bits; bit 3 of R8-R15 travels in REX.R/REX.B
+    // (set by the rex_* helpers). Without the mask, reg_id(R8..R15) leaks
+    // bit 3 into the MOD field and silently corrupts the encoding.
+    out_.emit8(static_cast<uint8_t>((mod << 6) | ((reg_id(reg) & 7) << 3) |
+                                    (reg_id(rm) & 7)));
 }
 
 void Assembler::imm32(int32_t v) { out_.emit32(static_cast<uint32_t>(v)); }
@@ -137,14 +141,16 @@ void Assembler::movq_xmm_gpr(Xmm dst, Reg src) {
 }
 
 void Assembler::movq_gpr_xmm(Reg dst, Xmm src) {
+    // 66 0F 7E /r: MOVQ r/m64, xmm — the REG field carries the XMM source
+    // (REX.R), the RM field the GPR destination (REX.B).
     out_.emit8(0x66);
     uint8_t rex = 0x48;
-    if (needs_rex(dst)) rex |= 0x4;
-    if (needs_rex_xmm(src)) rex |= 0x1;
+    if (needs_rex_xmm(src)) rex |= 0x4;
+    if (needs_rex(dst)) rex |= 0x1;
     out_.emit8(rex);
     out_.emit8(0x0F);
     out_.emit8(0x7E);
-    modrm(0x3, dst, static_cast<Reg>(xmm_id(src) & 0x7));
+    modrm(0x3, static_cast<Reg>(xmm_id(src) & 0x7), dst);
 }
 
 void Assembler::pxor_xmm_xmm(Xmm dst, Xmm src) {
@@ -226,6 +232,14 @@ void Assembler::mov_mem_imm32(const Mem& dst, int32_t imm) {
     emit_mem_operand(Reg::RAX, dst);  // /0 = MOV
     imm32(imm);
 }
+void Assembler::mov_mem_imm8(const Mem& dst, int8_t imm) {
+    // C6 /0 ib: 8-bit store (card-table DIRTY marks — the byte granularity
+    // of the ICGGC write barrier must not clobber neighbor cards).
+    rex_raw(mem_rex(false, 0, dst));
+    out_.emit8(0xC6);
+    emit_mem_operand(Reg::RAX, dst);  // /0 = MOV
+    out_.emit8(static_cast<uint8_t>(imm));
+}
 
 void Assembler::mov_mem_imm32sx(const Mem& dst, int32_t imm) {
     // REX.W C7 /0 id: 64-bit store of a sign-extended imm32.
@@ -258,6 +272,11 @@ void Assembler::lea_reg_mem(Reg dst, const Mem& src) {
 void Assembler::add_reg_reg(Reg dst, Reg src) {
     rex_w(src, dst);
     out_.emit8(0x01);
+    modrm(0x3, src, dst);
+}
+void Assembler::or_reg_reg(Reg dst, Reg src) {
+    rex_w(src, dst);
+    out_.emit8(0x09);
     modrm(0x3, src, dst);
 }
 

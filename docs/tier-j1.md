@@ -161,5 +161,10 @@ memory:   code bytes + minimal metadata
 analysis: none or extremely local
 ```
 
-Status in this milestone: API complete (`include/vortex/j1/`), stencil table and
-x86-64 stencil corpus scheduled on the roadmap (see `docs/roadmap.md`).
+Status in this milestone: **complete** — the x86-64 corpus (68 templates) is
+assembled once at build time (`src/j1/stencil_corpus.cpp`), instantiated by
+memcpy + patch against the ABI in `include/vortex/j1/context.hpp`, and the
+parity DoD holds: J1-compiled methods produce T0-identical observable results
+(tests/test_j1.cpp). Superstencil promotion and IC guard strengthening are
+exercised by tests; profile-driven guard strengthening at instantiation lands
+with the M2 plumbing.

@@ -1740,6 +1740,18 @@ int32_t Interpreter::resolve_method(ugb::UGBModule& module, uint32_t token) cons
 }
 
 // @cold — see resolve_method.
+Result<TaggedValue> Interpreter::invoke_builtin_token(
+    ugb::UGBModule& module, uint32_t token,
+    std::span<const TaggedValue> args) {
+    const int32_t slot = resolve_builtin(module, token);
+    if (slot < 0) {
+        return support::fail(support::ErrorCode::RuntimeError,
+                             "Call.Builtin: unresolved builtin token");
+    }
+    const Builtin& b = builtins_[static_cast<size_t>(slot)];
+    return b.fn(args, b.user);
+}
+
 int32_t Interpreter::resolve_builtin(ugb::UGBModule& module, uint32_t token) const {
     ugb::ModuleRuntimeData& rt = module.runtime;
     if (!rt.ready || token >= rt.builtin_slot.size()) return kNoSlot;

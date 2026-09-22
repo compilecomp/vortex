@@ -127,6 +127,36 @@ justified; the reviewer may revoke any permit at any time.
   included in the `execute` master budget.
 - **OWNER:** @vortex/rt
 
+### PERF-005 — mprotect pair per patch session (`PatchArena`, src/infra/patch_arena.cpp; `LdptManager::patch_session`, src/runtime/ldpt.cpp)
+- **REASON:** the W^X law (infra/security.hpp) makes every code write a
+  two-flip RX→RW→RX session. LDPT patch sessions batch all writes of one
+  escalation (hole + OOL stub, ≤ 272 bytes) behind one flip pair under the
+  M:N safe-point protocol (docs/ldpt.md section 2).
+- **COST:** ≤ 20 µs per session (2 syscalls + handshake + memcpy),
+  amortized to zero against the patched steady state — reached once per
+  (site, type) pair.
+- **OWNER:** @vortex/rt — expiry: M8 code-cache compaction (arena batches)
+
+### PERF-006 — allocation on the compile/bind path (`make_j1_bindings`,
+`BaselineJit::compile`, src/j1/baseline_jit.cpp)
+- **REASON:** J1 compilation is @warm per-method work (tier-up event); the
+  constant-pool materialization and metadata buffers allocate there.
+  Steady-state guest execution allocates only through the corpus's inline
+  TLAB bump paths (no C++ allocation).
+- **COST:** O(constants + classes) allocations per method compile, inside
+  the J1 latency budget asserted by tests (10 ms CI-safe bound).
+- **OWNER:** @vortex/rt
+
+### PERF-007 — LDPT resolver cold path (`resolve_miss`, src/runtime/ldpt.cpp)
+- **REASON:** the resolver runs once per (site, type) pair: codegen of the
+  marshalling stub + one patch session + dispatch. It is the machinery that
+  removes the per-call IC/indirect cost from every subsequent execution
+  (docs/ldpt.md section 5 contract table).
+- **COST:** ~2-5 µs first miss per type; amortized to zero in steady state.
+  OOM during escalation terminates deliberately (allocator failure inside a
+  patch protocol is not recoverable in-place).
+- **OWNER:** @vortex/rt
+
 ## 6. Mechanical enforcement
 
 `tools/lint/compliance.sh` (CI job `compliance`) enforces the mechanically

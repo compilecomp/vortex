@@ -44,10 +44,12 @@ using J1OsrFn = int64_t (*)(J1Context* ctx, const TaggedValue* vreg_state,
 
 // ---- helper prototypes (implemented in src/j1/baseline_jit.cpp) -------------
 
-/// Slow allocation path (TLAB miss). kind: 0 = object(klass_token = a),
-/// 1 = array(length = a). Returns the raw (untagged) pointer or 0 on OOM.
-using J1AllocSlowFn = uint64_t (*)(J1Context*, uint32_t kind, uint32_t a,
-                                   uint32_t b);
+/// Slow allocation path (TLAB miss). kind: 0 = object(klass_token = a,
+/// field_count = b), 1 = array(length = a), 2 = boxed double (payload bits
+/// in a — 64-bit, the template's movq writes the whole register). Returns
+/// the raw (untagged) pointer or 0 on OOM.
+using J1AllocSlowFn = uint64_t (*)(J1Context*, uint32_t kind, uint64_t a,
+                                   uint64_t b);
 
 /// Card-table write barrier: marks the card owning `owner` dirty.
 using J1WriteBarrierFn = void (*)(J1Context*, void* owner);
@@ -197,7 +199,10 @@ inline int32_t frame_size(uint32_t register_count) noexcept {
     return ((bytes + 15) & ~15) + kVregFramePad;
 }
 inline int32_t vreg_disp(uint32_t register_count, uint32_t vreg) noexcept {
-    return frame_size(register_count) - static_cast<int32_t>(8u * vreg);
+    // Locals live BELOW rbp (push rbp; mov rbp,rsp; sub rsp, frame): the
+    // displacement is negative, vreg 0 lowest. The magnitude stays outside
+    // the disp8 window (frame >= 144) so every site keeps its disp32 form.
+    return -frame_size(register_count) + static_cast<int32_t>(8u * vreg);
 }
 
 }  // namespace vortex::j1

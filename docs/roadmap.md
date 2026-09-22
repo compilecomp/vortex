@@ -32,17 +32,27 @@ Every milestone below lists its definition-of-done as verifiable test criteria.
 - [x] `vx` driver: `run`, `dis`, `stats` commands
 - [x] Test harness + unit/integration tests + CI workflow
 
-## M1 — J1 stencil baseline JIT
+## M1 — J1 stencil baseline JIT (complete)
 
 - [x] x86-64 assembler core with relocations (needed by stencils)
-- [ ] Stencil corpus for the core opcode set (typed + generic forms)
-- [ ] Superstencil promotion from hot bigrams
-- [ ] IC embedding + atomic updates, guard patch-point NOP sleds
-- [ ] Baseline deopt records + OSR entry stubs
-- [ ] DoD: guest programs compiled by J1 produce identical observable results to
-      T0; golden machine-code tests; compile latency per method under budget
+- [x] Stencil corpus for the core opcode set (typed + generic forms) — 68
+      templates assembled once at corpus build; instantiated by memcpy + patch
+- [x] Superstencil promotion from hot bigrams (`promote_superstencils`)
+- [x] IC embedding + guard patch-point NOP sleds (`patch_ic_guard`; profile-driven
+      guard strengthening at instantiation arrives with the M2 plumbing — the
+      always-slow default is correct for every receiver)
+- [x] Baseline deopt records + OSR entry stubs (per backward-branch target;
+      `J1OsrFn` materializes all vregs from a T0 register-file snapshot)
+- [x] DoD: guest programs compiled by J1 produce identical observable results to
+      T0 (fib/arithmetic/fields/objects parity tests); golden machine-code pins;
+      compile latency per method under budget (10 ms CI-safe bound)
 
 ## M2 — J2 fast optimizing JIT
+
+- [ ] LDPT code-range reservation: place patch arenas within ±2 GB of published
+      code so the skeleton primary path becomes a direct `call rel32`
+      (docs/ldpt.md section 1); profile-driven IC guard strengthening at J1
+      instantiation
 
 - [ ] Light SoN graph construction from UGB + profiles
 - [ ] Pass pipeline (21 passes) with budget enforcement and graceful degradation
@@ -52,6 +62,13 @@ Every milestone below lists its definition-of-done as verifiable test criteria.
       deopt to T0 correct under profile violation
 
 ## M3 — J3 adaptive full optimizing JIT
+
+- [ ] Interop message protocol dispatch: POLY_EXECUTE/POLY_READ/POLY_WRITE/
+      POLY_SEND lowering, vtable registration, capability-gated load
+      (docs/interop-protocol.md)
+- [ ] Cross-Language Escape Analysis: merged-graph EA after cross-language
+      inlining, scalar replacement, escape-summary publication/consumption,
+      guard emission G1–G5 (docs/xlea.md)
 
 - [ ] Full SoN + CIOG construction
 - [ ] Full 60-pass budgeted pipeline (three waves: scalar core, inlining/CIOG,

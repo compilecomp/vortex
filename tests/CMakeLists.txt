@@ -9,6 +9,8 @@ add_executable(vortex_tests
     test_compliance.cpp
     test_codegen_infra.cpp
     test_ir_deopt_infra.cpp
+    test_j1.cpp
+    test_ldpt.cpp
 )
 target_include_directories(vortex_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/harness)
 target_link_libraries(vortex_tests PRIVATE vortex_core)

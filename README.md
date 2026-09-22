@@ -157,6 +157,13 @@ behavior) plus a `PERF_OBSERVATION` record; hot/warm/cold classification is
 explicit; every hot struct asserts its layout; exceptions from the standard
 are `PERF_PERMIT`-granted and registered.
 
+- `docs/ldpt.md` — Lazy-Devirtualized Patch Trampolines: skeleton
+  trampolines, the M:N safe-point patch protocol, mono/poly/mega
+  escalation over W^X patch arenas
+- `docs/interop-protocol.md` — the capability-gated interop message
+  surface (POLY_* opcodes, per-language vtables, tier progression)
+- `docs/xlea.md` — Cross-Language Escape Analysis: merged-graph EA,
+  speculative scalar replacement, escape summaries, guard rules G1-G5
 - `docs/cem26.md` — scope, cost-block conventions, layout audits, the live
   PERF_PERMIT register and the validation plan.
 - `include/vortex/support/cem.hpp` + `include/vortex/ugb/encoding.hpp` —

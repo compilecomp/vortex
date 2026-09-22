@@ -128,6 +128,13 @@ public:
         return {transitions_.data(), transitions_size_};
     }
 
+    /// J1 helper hook (docs/roadmap.md M1): resolves and invokes a builtin
+    /// by its module token — the C++ side of J1's CALL_BUILTIN token path.
+    /// Uses the same (token -> registry slot) cache T0's handler uses.
+    Result<TaggedValue> invoke_builtin_token(ugb::UGBModule& module,
+                                             uint32_t token,
+                                             std::span<const TaggedValue> args);
+
     /// Safepoint integration hook (Rule 81): invoked by SAFEPOINT_POLL.
     /// The handshake manager installs the real poll in M2+; the default is a
     /// no-op so the poll site itself is already correct.
