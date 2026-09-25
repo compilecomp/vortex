@@ -26,12 +26,15 @@ deoptimization (**RBPD**), an incremental concurrent generational garbage collec
 (dependency invalidation, W^X security, snapshots/AOT, M:N threading, FFI,
 observability, CPU dispatch, I-cache/code-cache management, power awareness).
 
-> **Status: M0 — spec-first.** The complete design specification, the full C++26 API
-> surface, the UGB toolchain (text assembler, encoder/decoder, disassembler), the
-> reference frontend (a minimal example of a language port), the working T0
-> interpreter, the test harness, and CI are in place. Tier
-> code generators (J1–J4), the concurrent GC engine, and the heavyweight infra
-> backends are contract-stubbed and scheduled on the
+> **Status: M2 — J2 fast optimizing JIT.** In place: the full design
+> specification, the C++26 API surface, the UGB toolchain (text assembler,
+> encoder/decoder, disassembler), the reference frontend, the working T0
+> interpreter, the test harness, and CI. **M1** shipped the J1 stencil corpus
+> baseline JIT + LDPT patch trampolines over a reserved code range.
+> **M2** ships the J2 optimizing tier — light Sea-of-Nodes graph, pass
+> pipeline with budget degradation, linear scan, state-exact deopt, OSR, and
+> direct-call inlining with a cliff-removal DoD. The concurrent GC engine,
+> J3/J4, and the heavyweight infra backends remain scheduled on the
 > [roadmap](docs/roadmap.md).
 
 ---

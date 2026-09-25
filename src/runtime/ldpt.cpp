@@ -5,6 +5,7 @@
 #include <utility>
 
 #include "vortex/codegen/x64/assembler.hpp"
+#include "vortex/infra/code_range.hpp"
 #include "vortex/runtime/object_model.hpp"
 
 namespace vortex::runtime::ldpt {
@@ -25,30 +26,28 @@ using codegen::x64::Reg;
 // ---- stub layout constants (byte-exact; pinned by the assembly below) -------
 
 // Skeleton prologue: mov rax, imm64 (10) | cmp rax,[rsi] (3) | jne rel32 (6)
-// | mov rdi,rsi (3) | mov rax, imm64 target (10) | call rax (2) | ret (1)
-// | pad to 48.
-// NOTE (docs/ldpt.md section 1): the primary call is a target-constant
-// indirect (mov rax, imm64; call rax) because the patch arena is mmap'd
-// and may lie outside rel32 reach of the guest code range. The BTB predicts
-// the constant target perfectly after first execution. Direct rel32
-// patching returns with the M2 code-range reservation (arena placed within
-// +-2GB of published code).
+// | mov rdi,rsi (3) | call rel32 (5) | ret (1) | pad to 48.
+// NOTE (docs/ldpt.md section 1, M2): the primary call is a DIRECT rel32.
+// The shared code-range reservation (infra/code_range.hpp) places the arena
+// within +-2 GB of every published method, so the steady path is a plain
+// direct call — no target-constant indirect, no BTB dependence. A target
+// outside the range is a configuration error and fails loudly (the resolver
+// path still dispatches it correctly, so the site degrades, never corrupts).
 constexpr size_t kSkelJneOff = 13;
-constexpr size_t kSkelTargetImmOff = 22 + 2;  // imm64 payload of the mov
-constexpr size_t kSkelCallRegOff = 32;        // call rax (FF D0)
-constexpr size_t kSkelRetOff = 34;
+constexpr size_t kSkelCallOff = 22;           // call rel32 (E8)
+constexpr size_t kSkelRetOff = 27;
 constexpr size_t kSkelHoleMovOff = kTrampolinePrologueBytes;      // +7 bytes
 constexpr size_t kSkelHoleJmpOff = kTrampolinePrologueBytes + 7;  // +5 bytes
 
 // Mono OOL stub: mov rax, imm64 (10) | cmp rax,[rsi] (3) | jne rel32 (6)
-// | mov rdi,rsi (3) | mov rax, imm64 (10) | jmp rax (2) = 34 bytes.
-constexpr size_t kMonoStubBytes = 34;
+// | mov rdi,rsi (3) | jmp rel32 (5) = 27 bytes.
+constexpr size_t kMonoStubBytes = 27;
 constexpr size_t kMonoMissJccOff = 15;
 
 // Poly compare chain: kPolyEntryBytes per known type — mov imm64 (10) +
-// cmp [rsi] (3) + jne rel32 (6) + mov rdi,rsi (3) + mov imm64 (10) + jmp rax
-// (2) = 34; shared tail = mov rdi, imm32sx (7) + jmp rel32 (5) = 12.
-constexpr size_t kPolyEntryBytes = 34;
+// cmp [rsi] (3) + jne rel32 (6) + mov rdi,rsi (3) + jmp rel32 (5) = 27;
+// shared tail = mov rdi, imm32sx (7) + jmp rel32 (5) = 12.
+constexpr size_t kPolyEntryBytes = 27;
 constexpr size_t kPolyTailBytes = 12;
 constexpr size_t kPolyStubMax =
     kPolyEntryBytes * ugb::kIcPolyCapacity + kPolyTailBytes;
@@ -85,13 +84,28 @@ struct StubAsm {
         std::memcpy(buf.code().data() + ph, &rel32, 4);
     }
 
+    /// Absolute address of the placeholder's rel32 payload (next insn).
+    uint64_t site_of(size_t ph) const {
+        return arena_abs + base_offset + ph + 4;
+    }
+
     /// Patches a rel32 call placeholder to an absolute native address.
-    void fix_call_abs(size_t ph, uint64_t target_abs) {
-        const int64_t rel =
-            static_cast<int64_t>(target_abs) -
-            static_cast<int64_t>(arena_abs + base_offset + ph + 4);
-        const int32_t rel32 = static_cast<int32_t>(rel);
+    /// Fails loudly when the target is outside rel32 reach — the M2
+    /// code-range reservation makes this impossible for published code, and
+    /// the failure keeps foreign targets from silently regressing the
+    /// primary path into a constant-indirect workaround.
+    support::Result<void> fix_branch_abs(size_t ph, uint64_t target_abs) {
+        const int64_t delta = static_cast<int64_t>(target_abs) -
+                              static_cast<int64_t>(site_of(ph));
+        if (delta < -0x80000000ll || delta > 0x7FFFFFFFll) {
+            return support::fail(support::ErrorCode::InvalidArgument,
+                                 "LDPT target outside rel32 reach: place "
+                                 "the arena and the target in the shared "
+                                 "code range (docs/ldpt.md section 1)");
+        }
+        const int32_t rel32 = static_cast<int32_t>(delta);
         std::memcpy(buf.code().data() + ph, &rel32, 4);
+        return support::ok();
     }
 };
 
@@ -167,7 +181,8 @@ LdptManager::LdptManager(LdptConfig config,
                          infra::HandshakeManager* handshake,
                          infra::DependencyGraph* deps)
     : handshake_(handshake), deps_(deps), config_(config) {
-    auto arena = infra::PatchArena::allocate(config_.arena_bytes);
+    auto arena = infra::PatchArena::allocate(config_.arena_bytes,
+                                             config_.code_range);
     if (arena) {
         arena_ = std::move(*arena);
         emit_resolver_thunk();
@@ -193,7 +208,7 @@ void LdptManager::emit_resolver_thunk() {
     (void)arena_.write(s.buf.code(), thunk_offset_);
 }
 
-std::vector<uint8_t> LdptManager::assemble_skeleton(
+support::Result<std::vector<uint8_t>> LdptManager::assemble_skeleton(
     const TrampolineSite& site) const {
     StubAsm s(site.trampoline_offset,
               reinterpret_cast<uint64_t>(arena_.at(0)));
@@ -201,8 +216,13 @@ std::vector<uint8_t> LdptManager::assemble_skeleton(
     s.asm_.cmp_reg_mem(Reg::RAX, Mem{Reg::RSI, Reg::RSP, 0, 0});
     const size_t jcc = s.asm_.placeholder_jcc(CC_NE);
     s.asm_.mov_reg_reg(Reg::RDI, Reg::RSI);
-    s.asm_.mov_reg_imm64(Reg::RAX, site.primary_target);
-    s.asm_.call_reg(Reg::RAX);
+    // Direct rel32 call to the primary target (docs/ldpt.md section 1):
+    // the code-range reservation guarantees reachability; a foreign target
+    // fails here instead of degrading the primary path to an indirect.
+    const size_t call = s.asm_.placeholder_call();
+    if (auto r = s.fix_branch_abs(call, site.primary_target); !r) {
+        return std::unexpected(std::move(r).error());
+    }
     s.asm_.ret();
     s.asm_.nop(kTrampolinePrologueBytes - kSkelRetOff - 1);
     // Hole: mov rdi, imm32sx handle (7) + jmp rel32 thunk (5) + nop pad.
@@ -241,7 +261,8 @@ Result<TrampolineSite*> LdptManager::emit_skeleton(
     site.handle = static_cast<uint32_t>(sites_.size());
 
     auto bytes = assemble_skeleton(site);
-    if (auto w = arena_.write(bytes, site.trampoline_offset); !w) {
+    if (!bytes) return std::unexpected(std::move(bytes).error());
+    if (auto w = arena_.write(*bytes, site.trampoline_offset); !w) {
         return std::unexpected(std::move(w).error());
     }
     // docs/ldpt.md 4A: the site assumes its targets stay put; unload or
@@ -317,8 +338,10 @@ Result<size_t> LdptManager::assemble_ool_stub(const TrampolineSite& site,
         const size_t jcc = s.asm_.placeholder_jcc(CC_NE);
         s.fix_to_arena(jcc, thunk_offset_);  // miss -> resolver thunk
         s.asm_.mov_reg_reg(Reg::RDI, Reg::RSI);
-        s.asm_.mov_reg_imm64(Reg::RAX, site.primary_target);
-        s.asm_.jmp_reg(Reg::RAX);
+        const size_t jmp = s.asm_.placeholder_jmp();
+        if (auto r = s.fix_branch_abs(jmp, site.primary_target); !r) {
+            return std::unexpected(std::move(r).error());
+        }
         size = kMonoStubBytes;
     } else if (site.state == TrampolineState::Poly) {
         for (uint8_t i = 0; i < site.poly_count; ++i) {
@@ -331,8 +354,10 @@ Result<size_t> LdptManager::assemble_ool_stub(const TrampolineSite& site,
             // match-dispatch and dispatch the PREVIOUS entry's target.
             s.fix_to_arena(jcc, site.ool_offset + (i + 1) * kPolyEntryBytes);
             s.asm_.mov_reg_reg(Reg::RDI, Reg::RSI);
-            s.asm_.mov_reg_imm64(Reg::RAX, site.poly[i].target);
-            s.asm_.jmp_reg(Reg::RAX);
+            const size_t jmp = s.asm_.placeholder_jmp();
+            if (auto r = s.fix_branch_abs(jmp, site.poly[i].target); !r) {
+                return std::unexpected(std::move(r).error());
+            }
         }
         s.asm_.mov_reg_imm32sx(Reg::RDI, static_cast<int32_t>(site.handle));
         const size_t tail = s.asm_.placeholder_jmp();
@@ -497,7 +522,12 @@ uint64_t LdptManager::resolve_miss(LdptManager* manager, uint32_t handle,
                                   site.instruction_index, receiver, &resolved);
     if (!resolved || target == 0) return 0;
     auto esc = manager->escalate(site, klass, target);
-    if (!esc) return 0;
+    if (!esc) {
+        // Native patching unavailable (foreign target, patch protocol
+        // failure): dispatch through C++ so the RESULT is always correct;
+        // the site stays on resolver dispatch (QoS degradation only).
+        return reinterpret_cast<TargetFn>(target)(receiver);
+    }
     return reinterpret_cast<TargetFn>(target)(receiver);
 }
 

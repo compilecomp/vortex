@@ -7,13 +7,30 @@
 #include <cstring>
 #include <random>
 
+#include "vortex/infra/code_range.hpp"
+
 namespace vortex::infra {
 
 // ---------------------------------------------------------------------------
 // WritableCodeMemory
 // ---------------------------------------------------------------------------
 
-support::Result<WritableCodeMemory> WritableCodeMemory::allocate(size_t bytes) {
+// @cold — one allocation per published method.
+// PERF_CONTRACT:
+// BUDGET: one mmap (standalone) or one mprotect (range-carved) syscall
+// READS: 0  WRITES: 0 (fresh RW mapping)
+// BRANCHES: 1 (allocation failure)
+// CACHE: n/a — kernel operation
+support::Result<WritableCodeMemory> WritableCodeMemory::allocate(
+    size_t bytes, CodeRange* range) {
+    if (range != nullptr) {
+        // Shared reservation: carve + flip RW (the span arrives RW already).
+        auto region = range->allocate(bytes);
+        if (!region) return std::unexpected(std::move(region).error());
+        WritableCodeMemory m(region->data(), region->size());
+        m.owner_range_ = range;
+        return m;
+    }
     const size_t page = 4096;
     const size_t aligned = (bytes + page - 1) & ~(page - 1);
     void* p = ::mmap(nullptr, aligned, PROT_READ | PROT_WRITE,
@@ -27,26 +44,35 @@ support::Result<WritableCodeMemory> WritableCodeMemory::allocate(size_t bytes) {
 }
 
 WritableCodeMemory::WritableCodeMemory(WritableCodeMemory&& other) noexcept
-    : base_(other.base_), bytes_(other.bytes_), published_(other.published_) {
+    : base_(other.base_), bytes_(other.bytes_), published_(other.published_),
+      owner_range_(other.owner_range_) {
     other.base_ = nullptr;
     other.bytes_ = 0;
+    other.owner_range_ = nullptr;
 }
 
 WritableCodeMemory& WritableCodeMemory::operator=(
     WritableCodeMemory&& other) noexcept {
     if (this != &other) {
-        if (base_ != nullptr) ::munmap(base_, bytes_);
+        if (base_ != nullptr && owner_range_ == nullptr) ::munmap(base_, bytes_);
         base_ = other.base_;
         bytes_ = other.bytes_;
         published_ = other.published_;
+        owner_range_ = other.owner_range_;
         other.base_ = nullptr;
         other.bytes_ = 0;
+        other.owner_range_ = nullptr;
     }
     return *this;
 }
 
 WritableCodeMemory::~WritableCodeMemory() {
-    if (base_ != nullptr) ::munmap(base_, bytes_);
+    if (base_ == nullptr) return;
+    if (owner_range_ != nullptr) {
+        owner_range_->deallocate(std::span<uint8_t>(base_, bytes_));
+        return;
+    }
+    ::munmap(base_, bytes_);
 }
 
 void WritableCodeMemory::write(std::span<const uint8_t> code, size_t at) {

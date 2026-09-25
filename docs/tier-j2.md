@@ -103,5 +103,14 @@ J2: fast, local, cheap optimization
 
 This gives many methods better native code without paying the J3 compile cost.
 
-Status in this milestone: API complete (`include/vortex/j2/`), pass pipeline
-contract-stubbed (see `docs/roadmap.md`).
+Status in this milestone (M2): **complete** — the light SoN builder
+(`src/j2/graph_builder.cpp`), the pass pipeline with Rule-54 contracts,
+kill-switch bitmask and node-cap budget stop (`src/j2/passes.cpp`), linear
+scan with safepoint-aware callee-saved preference and home slots
+(`src/j2/regalloc.cpp`), and the x86-64 emitter (`src/j2/fast_jit.cpp`) are
+implemented and tested (tests/test_j2.cpp): differential parity T0/J2 across
+the supported opcode surface, state-exact deopt under profile violation,
+two-frame inlined deopt, OSR parity, budget degradation, kill switches, and
+the cliff-removal benchmarks. Emission follows `plan_emission`'s
+definition-before-use schedule shared with the allocator (see the M2 note in
+docs/roadmap.md); linear-scan-only allocation and the caps in section 1 hold.

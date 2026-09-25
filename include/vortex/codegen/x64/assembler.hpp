@@ -81,6 +81,7 @@ public:
     // ---- arithmetic (64-bit) ---------------------------------------------------
     void add_reg_reg(Reg dst, Reg src);                 // REX.W 01 /r
     void or_reg_reg(Reg dst, Reg src);                  // REX.W 09 /r
+    void and_reg_reg(Reg dst, Reg src);                 // REX.W 21 /r
     void add_reg_imm32(Reg dst, int32_t imm);           // REX.W 81 /0 id
     void sub_reg_reg(Reg dst, Reg src);                 // REX.W 29 /r
     void sub_reg_imm32(Reg dst, int32_t imm);
@@ -120,6 +121,15 @@ public:
     void push_reg(Reg r);                               // 50+rd
     void pop_reg(Reg r);                                // 58+rd
     void lea_reg_mem(Reg dst, const Mem& src);          // REX.W 8D /r
+    /// LEA with a scaled index and no base: dst = index*scale + disp
+    /// (mod=00 rm=101 + SIB). Flag preserving — usable between a compare
+    /// and its JCC.
+    void lea_reg_scaled_disp(Reg dst, Reg index, uint8_t scale_log2,
+                             int32_t disp);
+    /// SETcc on the low byte of a register (0F 90+cc /r, mod=11). Flag
+    /// preserving: the following JCC still sees the compare's flags. Only
+    /// codes 0-3 (al/cl/dl/bl) are accepted without extension bytes.
+    void setcc(uint8_t cc, Reg r8);
 
     // ---- padding -------------------------------------------------------------------
     void nop(size_t bytes);                             // multi-byte NOPs
@@ -139,6 +149,8 @@ private:
     /// REX with explicit bits: W=bit3, R=bit2, X=bit1, B=bit0.
     void rex_raw(uint8_t bits);
     void modrm(uint8_t mod, Reg reg, Reg rm);
+    /// Extension-field variant for group opcodes (shifts, 81 /N families).
+    void modrm_ext(uint8_t mod, uint8_t ext, Reg rm);
     void emit_mem_operand(Reg reg, const Mem& m);       // modrm + sib + disp
     /// SSE2 operand encoding: prefix bytes, optional REX (R from `reg_is_xmm_high`,
     /// B from `rm_is_xmm_high`), opcode, modrm. GPR register fields reuse reg/reg.

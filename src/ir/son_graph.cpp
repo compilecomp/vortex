@@ -22,6 +22,30 @@ NodeId Graph::add(NodeKind kind, std::initializer_list<NodeId> data_inputs,
     return nodes_.back().id;
 }
 
+NodeId Graph::add_vec(NodeKind kind, std::vector<NodeId> data_inputs,
+                      NodeId control, NodeId effect_in) {
+    Node n;
+    n.kind = kind;
+    n.id = static_cast<NodeId>(nodes_.size());
+    for (NodeId in : data_inputs) {
+        n.data_inputs.push_back(in);
+    }
+    n.control = control;
+    n.effect_in = effect_in;
+    if (effect_in != kNoNode && effect_in < nodes_.size()) {
+        nodes_[effect_in].effect_outs.push_back(n.id);
+    }
+    nodes_.push_back(std::move(n));
+    return nodes_.back().id;
+}
+
+NodeId Graph::add_aux(NodeKind kind, std::initializer_list<NodeId> data_inputs,
+                      uint32_t aux, NodeId control, NodeId effect_in) {
+    const NodeId id = add(kind, data_inputs, control, effect_in);
+    nodes_[id].aux = aux;
+    return id;
+}
+
 NodeId Graph::add_const(int64_t value, NodeId control) {
     const NodeId id = add(NodeKind::Const, {}, control);
     nodes_[id].const_value = value;

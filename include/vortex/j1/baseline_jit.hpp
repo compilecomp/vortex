@@ -32,6 +32,14 @@ struct BaselineJob {
     /// The heap's boxed-double klass (guards every F64 stencil; nullptr
     /// leaves the guard at the never-matching 0 sentinel = always slow).
     const void* double_klass = nullptr;
+    /// Per-instruction IC profiles (docs/tier-t0.md section 3), index-aligned
+    /// with the method's decode order. When a field-access site is
+    /// Monomorphic, the instantiation strengthens the always-slow guard into
+    /// a klass-checked fast path (docs/tier-j1.md section 7, roadmap M2).
+    /// Null entries (or a null pointer) keep the M1 always-slow default —
+    /// correct for every receiver.
+    const ugb::IcSlot* ic_slots = nullptr;
+    size_t ic_slot_count = 0;
 };
 
 /// Compiled baseline artifact: code + compact metadata
@@ -83,8 +91,12 @@ support::Result<void> make_j1_bindings(gc::Heap& heap, ugb::UGBModule& module,
                                        J1Bindings& out);
 
 /// W^X publication: RW copy + flip. The returned executable owns its code
-/// memory; entry is callable immediately after.
-support::Result<BaselineExecutable> publish_baseline(const BaselineCode& code);
+/// memory; entry is callable immediately after. When `range` is given the
+/// mapping is carved from the shared code-range reservation so J1/J2 code
+/// and LDPT arenas stay within rel32 reach of one another
+/// (docs/ldpt.md section 1).
+support::Result<BaselineExecutable> publish_baseline(
+    const BaselineCode& code, infra::CodeRange* range = nullptr);
 
 /// Maps a J1ErrorId to the T0-worded diagnostic (the parity contract:
 /// identical observable error surface). Exposed for drivers and tests.

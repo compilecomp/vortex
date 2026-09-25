@@ -282,9 +282,9 @@ for storage, and a wide internal encoding for interpreter speed. Vortex implemen
 the fixed-width form in `include/vortex/ugb/module.hpp` (`encode_module`,
 `decode_module`, `InstructionStream`, `append_instruction`).
 
-### 8.1 Implemented distribution format (v2)
+### 8.1 Implemented distribution format (v3)
 
-The implemented wire format (format minor version **2**) records every artifact
+The implemented wire format (format minor version **3**) records every artifact
 versioning field the laws require (Rule 10) and the per-method capability lists
 (Rule 3). Little-endian throughout:
 
@@ -292,7 +292,7 @@ versioning field the laws require (Rule 10) and the per-method capability lists
 module:
   magic                 "UGB\0"
   version_major         u16    (0)
-  version_minor         u16    (2)
+  version_minor         u16    (3)
   language_id           u32
   language_name         u32 length + bytes
   runtime_abi_version   u32    (1)          -- Rule 10
@@ -306,7 +306,8 @@ module:
                          String = u32 length + bytes;
                          MethodRef = reserved u32)
   classes               u32 count × name
-  fields                u32 count × { name, owner_class_token u32 }
+  fields                u32 count × { name, owner_class_token u32,
+                                      declared u8 }              -- v3
   method_tokens         u32 count × name    (token = index + 1; 0 = none)
   builtin_tokens        u32 count × name
   methods               u32 count × {
@@ -320,6 +321,17 @@ module:
 newer than the runtime, with a positional diagnostic (telemetry, Rule 9).
 Minor-1 payloads decode with documented defaults: empty extension table,
 empty capability set, `runtime_abi_version = metadata_schema_version = 0`.
+Minor-2 payloads decode with `declared = true` for every field entry (the v2
+layout contract).
+
+**Declared fields (v3).** A field token enters the table either through the
+`.field` directive (`declared = 1`) or through a bare instruction reference
+(`declared = 0`). Only declared fields shape their owner klass's layout, so
+an access to a referenced-only name resolves `find_field` -> miss -> the
+canonical unresolved-field error (ADR-005 helper contract) instead of an
+out-of-bounds slot. Token indices are load-bearing in instruction operands:
+reference-only entries stay in the table, the flag is what excludes them
+from layouts.
 
 **Stable site IDs (Rule 8).** Every dynamic or speculative site (profile
 slot, inline-cache slot, future deopt record) is identified by

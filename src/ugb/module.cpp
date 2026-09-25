@@ -258,6 +258,8 @@ TaggedValue UGBModule::materialize_constant(uint32_t index) const {
 
 namespace {
 
+void put_u8(std::vector<uint8_t>& out, uint8_t v) { out.push_back(v); }
+
 void put_u16(std::vector<uint8_t>& out, uint16_t v) {
     out.push_back(static_cast<uint8_t>(v & 0xFF));
     out.push_back(static_cast<uint8_t>(v >> 8));
@@ -418,6 +420,13 @@ std::vector<uint8_t> encode_module(const UGBModule& m) {
     for (const auto& f : m.fields) {
         put_string(out, f.name);
         put_u32(out, f.klass_token);
+        if (m.version_minor >= 3) {
+            // v3: the declared flag rides with each field entry (docs/ugb.md
+            // section 5). Token indices are load-bearing in instruction
+            // operands, so reference-only entries stay in the table — the
+            // flag is what keeps them out of klass layouts.
+            put_u8(out, f.declared ? 1 : 0);
+        }
     }
     put_names(m.methods);
     put_names(m.builtins);
@@ -525,6 +534,12 @@ bool decode_module(const uint8_t* data, size_t size, UGBModule& out,
         FieldTokenInfo f;
         f.name = r.string();
         f.klass_token = r.u32();
+        if (out.version_minor >= 3) {
+            f.declared = r.u8() != 0;
+        } else {
+            // v1/v2 layout contract: every entry shaped the klass.
+            f.declared = true;
+        }
         out.fields.push_back(std::move(f));
     }
     read_names(out.methods);

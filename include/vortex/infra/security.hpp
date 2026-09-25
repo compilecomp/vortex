@@ -17,14 +17,21 @@
 
 namespace vortex::infra {
 
+class CodeRange;
+
 // ---------------------------------------------------------------------------
 // W^X memory manager. POSIX implementation: RW pages during emission, then a
 // memory barrier + mprotect(PROT_READ|PROT_EXEC) flip for publication.
 // ---------------------------------------------------------------------------
 class WritableCodeMemory {
 public:
-    /// Allocates `bytes` of RW code memory (16-byte aligned).
-    static support::Result<WritableCodeMemory> allocate(size_t bytes);
+    /// Allocates `bytes` of RW code memory (16-byte aligned). When `range`
+    /// is given, the mapping is carved from that shared reservation so the
+    /// published code stays within rel32 reach of every other arena in the
+    /// same range (docs/ldpt.md section 1); otherwise a standalone mmap is
+    /// used.
+    static support::Result<WritableCodeMemory> allocate(
+        size_t bytes, CodeRange* range = nullptr);
 
     WritableCodeMemory() noexcept = default;
     WritableCodeMemory(WritableCodeMemory&& other) noexcept;
@@ -51,6 +58,10 @@ private:
     uint8_t* base_ = nullptr;
     size_t bytes_ = 0;
     bool published_ = false;
+    // Non-null when the mapping was carved from a shared CodeRange: the
+    // destructor returns the span to the range (PROT_NONE) instead of
+    // munmap, which would punch holes through the reservation.
+    CodeRange* owner_range_ = nullptr;
 };
 
 // ---------------------------------------------------------------------------

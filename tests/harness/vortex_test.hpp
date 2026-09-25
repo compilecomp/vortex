@@ -3,6 +3,7 @@
 #pragma once
 
 #include <cstdio>
+#include <cstring>
 #include <functional>
 #include <string>
 #include <vector>
@@ -30,10 +31,14 @@ struct Registrar {
     }
 };
 
-inline int run_all(const char* binary_name) {
+inline int run_all(const char* binary_name,
+                   const char* filter = nullptr) {
     std::printf("[====] %s: %zu tests\n", binary_name, registry().size());
     int failed_tests = 0;
     for (const auto& t : registry()) {
+        if (filter != nullptr && std::strstr(t.name, filter) == nullptr) {
+            continue;
+        }
         // Print + flush BEFORE running so a crashed test names itself.
         std::printf("[ RUN] %s\n", t.name);
         std::fflush(stdout);

@@ -13,13 +13,18 @@
 //   [10] cmp  rax, [rsi]                   ; receiver header.klass
 //   [13] jne  rel32 -> .hole               ; always-taken placeholder
 //   [19] mov  rdi, rsi                     ; receiver -> target ABI
-//   [22] call rel32 primary_target         ; placeholder, patched at emit
+//   [22] call rel32 primary_target         ; DIRECT call, patched at emit;
+//                                          ; the M2 code-range reservation
+//                                          ; (infra/code_range.hpp) keeps
+//                                          ; every published target within
+//                                          ; +-2 GB of the arena
 //   [27] ret                               ; primary path returns to caller
-//   [32] .hole (16 bytes, kPatchHoleBytes):
-//          mov rdi, imm64 site_handle      ; resolver ABI: rdi = handle
+//   [32] nop pad to 48
+//   [48] .hole (16 bytes, kPatchHoleBytes):
+//          mov rdi, imm32sx site_handle    ; resolver ABI: rdi = handle
 //          jmp rel32 -> resolver thunk     ; tail-jmp: one return address
 //          <padding nops>
-//   [48] out-of-line reservation (kOolReservationBytes): escalation stubs
+//   [64] out-of-line reservation (kOolReservationBytes): escalation stubs
 //
 // Calling convention (docs/ldpt.md section 1): the guest call site passes
 // the RAW receiver pointer in rsi; rdi is scratch (the hole loads the site
@@ -64,7 +69,7 @@ namespace vortex::runtime::ldpt {
 inline constexpr size_t kPatchHoleBytes = 16;
 /// Fixed prologue bytes before the hole (see the file header layout).
 inline constexpr size_t kTrampolinePrologueBytes = 48;
-/// Out-of-line reservation per site: a poly-4 compare chain (4*28 + 15 tail)
+/// Out-of-line reservation per site: a poly-4 compare chain (4*27 + 12 tail)
 /// and the mega thunk both must fit without re-carving (arena layout is
 /// frozen at publish).
 inline constexpr size_t kOolReservationBytes = 256;
@@ -146,6 +151,14 @@ struct MegaDispatch {
 /// LDPT configuration knobs (CEM-26 section 2: named, documented).
 struct LdptConfig {
     size_t arena_bytes = 64 * 1024;
+    /// Shared code-range reservation. When set, the arena is carved from it
+    /// and every direct rel32 target emitted into the trampolines must lie
+    /// in the same range (docs/ldpt.md section 1). Out-of-range targets
+    /// fail loudly at emission/escalation — the resolver path still
+    /// dispatches them (it is C++, not machine code), so a site with a
+    /// foreign target degrades to resolver dispatch instead of silently
+    /// growing a target-constant indirect.
+    infra::CodeRange* code_range = nullptr;
 };
 
 /// The LDPT manager: owns the patch arena, the site table, the resolver
@@ -256,7 +269,8 @@ private:
         const TrampolineSite& site, uint8_t* out, size_t cap,
         size_t* out_size) const;
     void emit_resolver_thunk();
-    std::vector<uint8_t> assemble_skeleton(const TrampolineSite& site) const;
+    support::Result<std::vector<uint8_t>> assemble_skeleton(
+        const TrampolineSite& site) const;
     TrampolineSite* find_site_mutable(uint64_t site_id) noexcept;
 
     infra::PatchArena arena_;

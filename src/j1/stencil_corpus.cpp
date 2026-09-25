@@ -144,6 +144,12 @@ constexpr uint8_t PA_FieldToken = 12;   // imm32 = field token (slow helpers)
 constexpr uint8_t PA_CallArgc = 13;     // imm32 = argc literal (src1 field)
 constexpr uint8_t PA_FieldCount = 5;    // imm32 = klass field count
 
+/// Dummy displacement for templates whose memory operand's disp32 is a
+/// patch site (PA_FieldByteOff). Must exceed the disp8 range so the
+/// assembler emits the mod=10 disp32 form the 4-byte patch overwrites;
+/// the site bytes are replaced at instantiation and the dummy never runs.
+constexpr int32_t kFieldDispPatchDummy = 0x10000;
+
 // ---- template builder ---------------------------------------------------------
 
 struct TemplateBuilder {
@@ -993,23 +999,30 @@ Stencil t_get_field(uint16_t op) {
     const size_t slow_rel = b.here() + 1;
     b.asm_.jmp_rel32(0);
     b.mark(PatchKind::IcSlot, 1, slow_rel);
-    // Hit path: direct slot load (offset = 16 + 8*slot, patchable).
+    // Hit path: direct slot load (offset = 16 + 8*slot, patchable). The
+    // displacement is a PATCH SITE (PA_FieldByteOff writes 4 bytes at +3),
+    // so the template must reserve a full disp32: a disp8 encoding here
+    // would let the patch overrun 2 bytes into the following instruction.
+    // kFieldDispPatchDummy exceeds the disp8 range to force mod=10.
     const size_t field_off = b.here() + 3;
-    b.asm_.mov_reg_mem(kC, Mem{kA, Reg::RSP, 0, kObjectHeaderBytes});
+    b.asm_.mov_reg_mem(kC, Mem{kA, Reg::RSP, 0, kFieldDispPatchDummy});
     b.mark(PatchKind::ConstantIndex, PA_FieldByteOff, field_off);
     b.store_vreg(kC, VR_Dst);
     b.tail(BT_Next);
     // Slow body (helper) — the target of the always-slow jmp and the tag
     // failure. Recorded AFTER the hit path so its offset is the body.
+    // The helper writes the field value straight into the dst vreg through
+    // the `out` pointer (ADR-005: the return code is the only failure
+    // channel — a stored Smi 0 is data, not an error).
     const size_t slow_off = b.here();
     b.bind(tag);
     b.asm_.mov_reg_reg(Reg::RDI, kCtx);
     b.asm_.mov_reg_reg(Reg::RSI, kD);
     b.imm32sx_site(Reg::RDX, PatchKind::ConstantIndex, PA_FieldToken);
+    b.lea_vreg(Reg::RCX, VR_Dst);  // 4th SysV argument slot = rcx (out)
     b.asm_.call_mem(Mem{kCtx, Reg::RSP, 0, kCtxGetFieldSlow});
     b.asm_.test_reg_imm32(kA, -1);
     const size_t err = b.asm_.placeholder_jcc(CC_E);
-    b.store_vreg(kA, VR_Dst);
     b.tail(BT_Next);
     b.bind(err);
     b.error_exit(static_cast<uint32_t>(E::kErrGetField));
@@ -1034,8 +1047,10 @@ Stencil t_set_field(uint16_t op) {
     const size_t slow_rel = b.here() + 1;
     b.asm_.jmp_rel32(0);
     b.mark(PatchKind::IcSlot, 1, slow_rel);
+    // Same disp32 patch-site discipline as GET_FIELD above: the dummy
+    // displacement forces the mod=10 encoding the 4-byte patch expects.
     const size_t field_off = b.here() + 3;
-    b.asm_.mov_mem_reg(Mem{kA, Reg::RSP, 0, kObjectHeaderBytes}, kE);
+    b.asm_.mov_mem_reg(Mem{kA, Reg::RSP, 0, kFieldDispPatchDummy}, kE);
     b.mark(PatchKind::ConstantIndex, PA_FieldByteOff, field_off);
     // ---- card-marking barrier (ICGGC, kCardShift = 9) ----
     b.asm_.mov_reg_reg(kC, kE);

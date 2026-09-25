@@ -8,7 +8,9 @@
 
 #include <cstring>
 
+#include "vortex/infra/code_range.hpp"
 #include "vortex/infra/dependency.hpp"
+#include "vortex/infra/security.hpp"
 #include "vortex/infra/threading.hpp"
 #include "vortex/runtime/ldpt.hpp"
 
@@ -68,6 +70,58 @@ uint64_t ptr_bits(const void* p) noexcept {
     return reinterpret_cast<uint64_t>(p);
 }
 
+// Native trampoline targets must live in the shared code range
+// (docs/ldpt.md section 1): a target outside rel32 reach of the arena fails
+// loudly instead of degrading the primary path into a constant-indirect
+// workaround. Each thunk is `mov rax, imm64 host_fn; jmp rax` — the same
+// receiver ABI, guaranteed within +-2 GB of every range-carved arena.
+struct TargetThunks {
+    infra::WritableCodeMemory mem;
+    uint64_t a = 0, b = 0, c = 0, d = 0, e = 0, f = 0, g = 0;
+};
+
+const TargetThunks& target_thunks() {
+    static const TargetThunks t = [] {
+        constexpr size_t kThunkBytes = 12;  // 48 B8 imm64 (10) + FF E0 (2)
+        constexpr size_t kThunkCount = 7;
+        TargetThunks out;
+        auto mem = infra::WritableCodeMemory::allocate(
+            kThunkBytes * kThunkCount, infra::global_code_range());
+        if (!mem) return out;
+        out.mem = std::move(*mem);
+        void* host_fns[kThunkCount] = {reinterpret_cast<void*>(&target_a),
+                                       reinterpret_cast<void*>(&target_b),
+                                       reinterpret_cast<void*>(&target_c),
+                                       reinterpret_cast<void*>(&target_d),
+                                       reinterpret_cast<void*>(&target_e),
+                                       reinterpret_cast<void*>(&target_f),
+                                       reinterpret_cast<void*>(&target_g)};
+        uint64_t* slots[kThunkCount] = {&out.a, &out.b, &out.c, &out.d,
+                                        &out.e, &out.f, &out.g};
+        for (size_t i = 0; i < kThunkCount; ++i) {
+            uint8_t code[kThunkBytes] = {0x48, 0xB8};
+            std::memcpy(code + 2, &host_fns[i], 8);
+            code[10] = 0xFF;
+            code[11] = 0xE0;
+            out.mem.write(code, i * kThunkBytes);
+            *slots[i] = reinterpret_cast<uint64_t>(out.mem.data()) +
+                        i * kThunkBytes;
+        }
+        (void)out.mem.publish();
+        return out;
+    }();
+    return t;
+}
+
+// Range-carved manager: arena and targets share the reservation, so every
+// direct rel32 the trampolines emit is guaranteed encodable.
+LdptManager range_manager(infra::HandshakeManager* handshake = nullptr,
+                          infra::DependencyGraph* deps = nullptr) {
+    LdptConfig cfg;
+    cfg.code_range = infra::global_code_range();
+    return LdptManager(cfg, handshake, deps);
+}
+
 template <typename T>
 uint64_t fn_bits(T fn) noexcept {
     return reinterpret_cast<uint64_t>(fn);
@@ -112,9 +166,9 @@ VORTEX_TEST(ldpt_arena_wx_lifecycle) {
 }
 
 VORTEX_TEST(ldpt_skeleton_primary_hit) {
-    LdptManager mgr;
-    auto site = mgr.emit_skeleton(1, 0, ptr_bits(klass_a()),
-                                  fn_bits(&target_a));
+    LdptManager mgr = range_manager();
+    const auto& tt = target_thunks();
+    auto site = mgr.emit_skeleton(1, 0, ptr_bits(klass_a()), tt.a);
     VORTEX_EXPECT(site.has_value());
     if (!site) return;
     VORTEX_EXPECT(mgr.publish().has_value());
@@ -128,14 +182,14 @@ VORTEX_TEST(ldpt_skeleton_primary_hit) {
 
 VORTEX_TEST(ldpt_first_miss_patches_mono) {
     infra::HandshakeManager handshake;
-    LdptManager mgr({}, &handshake, nullptr);
+    LdptManager mgr = range_manager(&handshake);
+    const auto& tt = target_thunks();
     ResolverState rs;
     rs.klass_ptrs[1] = ptr_bits(klass_b());
-    rs.per_klass[1] = fn_bits(&target_b);
+    rs.per_klass[1] = tt.b;
     mgr.set_target_resolver(&resolve_by_klass, &rs);
 
-    auto site = mgr.emit_skeleton(1, 0, ptr_bits(klass_a()),
-                                  fn_bits(&target_a));
+    auto site = mgr.emit_skeleton(1, 0, ptr_bits(klass_a()), tt.a);
     VORTEX_EXPECT(site.has_value());
     if (!site) return;
     VORTEX_EXPECT(mgr.publish().has_value());
@@ -163,19 +217,18 @@ VORTEX_TEST(ldpt_first_miss_patches_mono) {
 }
 
 VORTEX_TEST(ldpt_poly_escalation) {
-    LdptManager mgr;
+    LdptManager mgr = range_manager();
+    const auto& tt = target_thunks();
     ResolverState rs;
     void* klasses[5] = {klass_b(), klass_c(), klass_d(), klass_e()};
-    uint64_t targets[5] = {fn_bits(&target_b), fn_bits(&target_c),
-                           fn_bits(&target_d), fn_bits(&target_e)};
+    uint64_t targets[5] = {tt.b, tt.c, tt.d, tt.e};
     for (int i = 0; i < 4; ++i) {
         rs.klass_ptrs[i + 1] = ptr_bits(klasses[i]);
         rs.per_klass[i + 1] = targets[i];
     }
     mgr.set_target_resolver(&resolve_by_klass, &rs);
 
-    auto site = mgr.emit_skeleton(1, 0, ptr_bits(klass_a()),
-                                  fn_bits(&target_a));
+    auto site = mgr.emit_skeleton(1, 0, ptr_bits(klass_a()), tt.a);
     VORTEX_EXPECT(site.has_value());
     if (!site) return;
     VORTEX_EXPECT(mgr.publish().has_value());
@@ -201,20 +254,18 @@ VORTEX_TEST(ldpt_poly_escalation) {
 }
 
 VORTEX_TEST(ldpt_mega_swizzle_needs_no_session) {
-    LdptManager mgr;
+    LdptManager mgr = range_manager();
+    const auto& tt = target_thunks();
     ResolverState rs;
     void* klasses[6] = {klass_b(), klass_c(), klass_d(), klass_e(), klass_f(),
                         klass_g()};
-    uint64_t targets[6] = {fn_bits(&target_b), fn_bits(&target_c),
-                           fn_bits(&target_d), fn_bits(&target_e),
-                           fn_bits(&target_f), fn_bits(&target_g)};
+    uint64_t targets[6] = {tt.b, tt.c, tt.d, tt.e, tt.f, tt.g};
     for (int i = 0; i < 6; ++i) {
         rs.klass_ptrs[i + 1] = ptr_bits(klasses[i]);
         rs.per_klass[i + 1] = targets[i];
     }
     mgr.set_target_resolver(&resolve_by_klass, &rs);
-    auto site = mgr.emit_skeleton(1, 0, ptr_bits(klass_a()),
-                                  fn_bits(&target_a));
+    auto site = mgr.emit_skeleton(1, 0, ptr_bits(klass_a()), tt.a);
     VORTEX_EXPECT(site.has_value());
     if (!site) return;
     VORTEX_EXPECT(mgr.publish().has_value());
@@ -243,13 +294,13 @@ VORTEX_TEST(ldpt_mega_swizzle_needs_no_session) {
 }
 
 VORTEX_TEST(ldpt_invalidation_degrades_to_resolver) {
-    LdptManager mgr;
+    LdptManager mgr = range_manager();
+    const auto& tt = target_thunks();
     ResolverState rs;
     rs.klass_ptrs[1] = ptr_bits(klass_b());
-    rs.per_klass[1] = fn_bits(&target_b);
+    rs.per_klass[1] = tt.b;
     mgr.set_target_resolver(&resolve_by_klass, &rs);
-    auto site = mgr.emit_skeleton(1, 0, ptr_bits(klass_a()),
-                                  fn_bits(&target_a));
+    auto site = mgr.emit_skeleton(1, 0, ptr_bits(klass_a()), tt.a);
     VORTEX_EXPECT(site.has_value());
     if (!site) return;
     VORTEX_EXPECT(mgr.publish().has_value());
@@ -273,9 +324,9 @@ VORTEX_TEST(ldpt_invalidation_degrades_to_resolver) {
 
 VORTEX_TEST(ldpt_dependency_batch_invalidation) {
     infra::DependencyGraph deps;
-    LdptManager mgr({}, nullptr, &deps);
-    auto site = mgr.emit_skeleton(42, 3, ptr_bits(klass_a()),
-                                  fn_bits(&target_a));
+    LdptManager mgr = range_manager(nullptr, &deps);
+    const auto& tt = target_thunks();
+    auto site = mgr.emit_skeleton(42, 3, ptr_bits(klass_a()), tt.a);
     VORTEX_EXPECT(site.has_value());
     if (!site) return;
     VORTEX_EXPECT(mgr.publish().has_value());
@@ -289,9 +340,9 @@ VORTEX_TEST(ldpt_dependency_batch_invalidation) {
 }
 
 VORTEX_TEST(ldpt_unresolved_target_returns_zero) {
-    LdptManager mgr;  // no target resolver installed
-    auto site = mgr.emit_skeleton(1, 0, ptr_bits(klass_a()),
-                                  fn_bits(&target_a));
+    LdptManager mgr = range_manager();  // no target resolver installed
+    const auto& tt = target_thunks();
+    auto site = mgr.emit_skeleton(1, 0, ptr_bits(klass_a()), tt.a);
     VORTEX_EXPECT(site.has_value());
     if (!site) return;
     VORTEX_EXPECT(mgr.publish().has_value());
@@ -303,8 +354,9 @@ VORTEX_TEST(ldpt_unresolved_target_returns_zero) {
 }
 
 VORTEX_TEST(ldpt_golden_skeleton_bytes) {
-    LdptManager mgr;
-    auto site = mgr.emit_skeleton(1, 0, 0x1234, fn_bits(&target_a));
+    LdptManager mgr = range_manager();
+    const auto& tt = target_thunks();
+    auto site = mgr.emit_skeleton(1, 0, 0x1234, tt.a);
     VORTEX_EXPECT(site.has_value());
     if (!site) return;
     const uint8_t* code = static_cast<const uint8_t*>(mgr.entry_of(**site));
@@ -323,17 +375,94 @@ VORTEX_TEST(ldpt_golden_skeleton_bytes) {
     VORTEX_EXPECT_EQ(code[19], 0x48);
     VORTEX_EXPECT_EQ(code[20], 0x89);
     VORTEX_EXPECT_EQ(code[21], 0xF7);
-    // mov rax, imm64 (target): 48 b8
-    VORTEX_EXPECT_EQ(code[22], 0x48);
-    VORTEX_EXPECT_EQ(code[23], 0xB8);
-    // call rax: ff d0 ; ret: c3
-    VORTEX_EXPECT_EQ(code[32], 0xFF);
-    VORTEX_EXPECT_EQ(code[33], 0xD0);
-    VORTEX_EXPECT_EQ(code[34], 0xC3);
+    // DIRECT call rel32 (docs/ldpt.md section 1, M2 code-range reservation):
+    // E8 @+22; the rel32 payload reaches the primary target.
+    VORTEX_EXPECT_EQ(code[22], 0xE8);
+    int32_t call_rel = 0;
+    std::memcpy(&call_rel, code + 23, 4);
+    const auto* call_next = code + 27;  // rel32 is next-insn relative
+    const int64_t call_disp = reinterpret_cast<uint64_t>(tt.a) -
+                              reinterpret_cast<uint64_t>(call_next);
+    VORTEX_EXPECT_EQ(call_rel, static_cast<int32_t>(call_disp));
+    // ret: c3 (at +27); nop pad fills the prologue to the hole.
+    VORTEX_EXPECT_EQ(code[27], 0xC3);
     // Hole: mov rdi, imm32sx (48 c7 c7 ...) at the hole offset.
     const size_t hole =
         (*site)->hole_offset - (*site)->trampoline_offset;
     VORTEX_EXPECT_EQ(code[hole], 0x48);
     VORTEX_EXPECT_EQ(code[hole + 1], 0xC7);
     VORTEX_EXPECT_EQ(code[hole + 2], 0xC7);
+}
+
+// ---------------------------------------------------------------------------
+// Code-range reservation (docs/roadmap.md M2, docs/ldpt.md section 1)
+// ---------------------------------------------------------------------------
+
+VORTEX_TEST(code_range_reserve_and_carve) {
+    auto range = infra::CodeRange::reserve(64 * 1024);
+    VORTEX_EXPECT(range.has_value());
+    if (!range) return;
+
+    auto a = range->allocate(4096);
+    VORTEX_EXPECT(a.has_value());
+    auto b = range->allocate(8192);
+    VORTEX_EXPECT(b.has_value());
+    if (a && b) {
+        // Disjoint, page-aligned, inside the reservation.
+        VORTEX_EXPECT(a->data() != b->data());
+        VORTEX_EXPECT(range->contains(a->data()));
+        VORTEX_EXPECT(range->contains(b->data() + b->size() - 1));
+        VORTEX_EXPECT_EQ(reinterpret_cast<uintptr_t>(a->data()) % 4096,
+                         static_cast<uintptr_t>(0));
+    }
+    // Exhaustion is a loud capacity failure, never silent (Rule 91).
+    auto big = range->allocate(1024 * 1024);
+    VORTEX_EXPECT(!big.has_value());
+    // The range itself is not executable (W^X: arenas own their flips).
+    VORTEX_EXPECT(infra::CodeRange::within_rel32(a->data(), b->data()));
+}
+
+VORTEX_TEST(code_range_shared_reach_invariant) {
+    // The M2 invariant: an LDPT arena and published method code carved from
+    // the SAME reservation are always within direct rel32 reach of each
+    // other — the precondition for the skeleton's direct call.
+    auto range = infra::CodeRange::reserve(128 * 1024);
+    VORTEX_EXPECT(range.has_value());
+    if (!range) return;
+
+    auto arena = infra::PatchArena::allocate(4096, &*range);
+    VORTEX_EXPECT(arena.has_value());
+    auto method = infra::WritableCodeMemory::allocate(4096, &*range);
+    VORTEX_EXPECT(method.has_value());
+    if (arena && method) {
+        VORTEX_EXPECT(infra::CodeRange::within_rel32(
+            method->data(), arena->exec_base()));
+        VORTEX_EXPECT(infra::CodeRange::within_rel32(
+            arena->exec_base(), method->data()));
+        VORTEX_EXPECT(range->contains(method->data()));
+    }
+
+    // Out-of-range targets are a loud configuration error at emission, not
+    // a silent constant-indirect fallback: a skeleton whose primary target
+    // lies outside rel32 reach must be REJECTED. The far address is
+    // deterministic: more than +2 GiB from every possible in-arena site
+    // (sites live within the first arena_bytes of the arena).
+    LdptConfig cfg;
+    cfg.arena_bytes = 8192;
+    cfg.code_range = &*range;
+    LdptManager mgr(cfg);
+    const uint64_t far_target = reinterpret_cast<uint64_t>(arena->exec_base()) +
+                                0x80000000ull + 0x10000ull;
+    auto far_site = mgr.emit_skeleton(1, 0, 0x1234, far_target);
+    VORTEX_EXPECT(!far_site.has_value());
+}
+
+VORTEX_TEST(code_range_within_rel32_arithmetic) {
+    const uint8_t* base = reinterpret_cast<const uint8_t*>(0x100000000ull);
+    VORTEX_EXPECT(infra::CodeRange::within_rel32(
+        base, base + 0x7FFFFFFF));  // exactly the forward limit
+    VORTEX_EXPECT(!infra::CodeRange::within_rel32(
+        base, base + 0x80000000ull));  // one byte beyond
+    VORTEX_EXPECT(infra::CodeRange::within_rel32(
+        base + 0x7FFFFFFF, base));  // backward reach is symmetric
 }

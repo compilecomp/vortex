@@ -68,8 +68,14 @@ using J1InvokeTokenFn = int64_t (*)(J1Context*, uint32_t token,
                                     TaggedValue* out);
 
 /// CALL_BUILTIN with lazy name resolution + per-token caching.
-using J1GetFieldSlowFn = uint64_t (*)(J1Context*, uint64_t obj_bits,
-                                      uint32_t field_token);
+///
+/// GetField slow path: writes the field value through `out` and returns 1 on
+/// success, 0 on failure (receiver bad / field unresolved). The value is
+/// NEVER the failure channel — raw bits 0 is a legal Smi, and doubling it as
+/// an error sentinel would misreport a stored Smi 0 as an unresolved field
+/// (ADR-005: no value doubles as an error sentinel).
+using J1GetFieldSlowFn = uint32_t (*)(J1Context*, uint64_t obj_bits,
+                                      uint32_t field_token, TaggedValue* out);
 using J1SetFieldSlowFn = uint32_t (*)(J1Context*, uint64_t obj_bits,
                                       uint64_t value_bits,
                                       uint32_t field_token);

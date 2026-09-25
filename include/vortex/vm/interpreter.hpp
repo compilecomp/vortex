@@ -115,6 +115,17 @@ public:
     Result<RunResult> run(ugb::UGBModule& module, std::string_view entry,
                           std::span<const TaggedValue> args);
 
+    /// State-exact continuation (Rules 39/42 — J2 deopt lands here): resumes
+    /// `method` at bytecode offset `pc` with the given register file. When
+    /// `inject_dst` is set, `inject` is written to that register first (the
+    /// returning-call continuation: the resumed pc is the instruction AFTER
+    /// the call). Observable state is exactly what the deoptimizing frame
+    /// held — no restart, no duplicated effects (Rule 41).
+    Result<TaggedValue> resume(ugb::UGBModule& module, uint32_t method_id,
+                               std::span<const TaggedValue> vregs, uint32_t pc,
+                               uint32_t inject_dst = 0xFFFFFFFFu,
+                               TaggedValue inject = TaggedValue::undefined());
+
     const InterpStats& stats() const noexcept { return stats_; }
     const InterpreterConfig& config() const noexcept { return config_; }
     InterpreterConfig& config_mutable() noexcept { return config_; }
@@ -161,6 +172,14 @@ private:
     Result<RunResult> execute(ugb::UGBModule& module,
                               ugb::UGBMethod& method,
                               std::span<const TaggedValue> args);
+
+    /// Shared body of run/resume (Rule 39: one execution path — resumed
+    /// state and fresh entry execute the identical dispatch loop).
+    Result<RunResult> execute_impl(ugb::UGBModule& module,
+                                   ugb::UGBMethod& method,
+                                   std::span<const TaggedValue> args,
+                                   size_t entry_pc, uint32_t inject_dst,
+                                   TaggedValue inject);
 
     // Slow-path helpers (called from the dispatch loop). @hot (CEM-26):
     // pure register arithmetic, noexcept, inline-sized.

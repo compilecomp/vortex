@@ -49,20 +49,76 @@ Every milestone below lists its definition-of-done as verifiable test criteria.
 
 ## M2 — J2 fast optimizing JIT
 
-- [ ] LDPT code-range reservation: place patch arenas within ±2 GB of published
+- [x] LDPT code-range reservation: place patch arenas within ±2 GB of published
       code so the skeleton primary path becomes a direct `call rel32`
       (docs/ldpt.md section 1); profile-driven IC guard strengthening at J1
       instantiation
+- [x] Light SoN graph construction from UGB + profiles
+- [x] Pass pipeline (21 passes) with budget enforcement and graceful degradation
+- [x] Linear scan register allocation
+- [x] OSR entry/exit between T0/J1/J2
+- [x] DoD: cliff-removal benchmark suite — strict J2 > J1 > T0 on the call-cliff
+      shape (the tier's target: J1 routes callees through T0 dispatch, J2
+      inlines), and the floor T0 > J2·2 / T0 > J1·2 on the direct-loop shape
+      (J1's typed stencils are its best case; J2's residual guard cost there is
+      an M3 arith/guard-fusion + phi-coalescing item); deopt to T0 correct under
+      profile violation; 136 tests green in Release and ASan/UBSan
 
-- [ ] Light SoN graph construction from UGB + profiles
-- [ ] Pass pipeline (21 passes) with budget enforcement and graceful degradation
-- [ ] Linear scan register allocation
-- [ ] OSR entry/exit between T0/J1/J2
-- [ ] DoD: cliff-removal benchmark suite; J2 > J1 > T0 on hot-loop microbenchmarks;
-      deopt to T0 correct under profile violation
+## Emission scheduling note (M2 review fix)
+
+Inlined graphs break the "node id order is a topological order" assumption:
+the splice appends callee definitions behind caller consumers. `plan_emission`
+(now in `include/vortex/j2/regalloc.hpp`) computes the per-block
+definition-before-use order once and it drives BOTH the register allocator's
+position numbering (`emission_positions`) and the emitter's walk — a value
+read after a call is guaranteed an interval crossing the call's safepoint, so
+it lives in a callee-saved register or a spill slot (Rule 78). The splice also
+wires the callee's first effect node onto the caller's effect chain
+(Rule 55: side-effect order is part of the pass contract).
+
+## M2 review round (subagent audit — all findings fixed)
+
+Two independent reviewers audited the M2 delta (emission/allocation core;
+pipeline/deopt/tests). Verdicts: FIX-REQUIRED (4 blockers, 6 majors). Fixed
+and locked by the Rule-121 regression pack in tests/test_j2.cpp. A third
+verification pass re-audited every fix (10/11 VERIFIED) and caught one
+incomplete arm — the constant-folding compare still materialized smi 0/1 —
+now fixed and locked (`j2_folded_constants_use_canonical_words`), plus: the
+builder refuses unsigned Div/Rem with a named error (T0 has no M0 handler),
+VN's cross-origin soundness argument documented, stale frame comment fixed.
+Findings:
+
+- fused-Mul overflow deopt was dead (unpatched `jo` + self-compare roundtrip)
+  — `j2_fused_mul_overflow_deopts_like_t0`
+- SHL wrapped silently where T0 traps (Rule 110/ADR-005) —
+  `j2_shl_out_of_range_traps_like_t0` (also pins the wrap-in-range parity)
+- boolean constants were smi 0/1 instead of the canonical 0xB/0xF words —
+  `j2_bool_constants_canonical_words`
+- Div/Rem were not safepoints AND passed their DivSignedness aux as the
+  helper's op id (every division executed as op 0, op 0 = Add.Any) —
+  `j2_div_helper_call_keeps_live_values`
+- guard merging crossed the splice origin line (a caller guard could prove a
+  spliced guard, dropping the callee's exact deopt state) —
+  `j2_spliced_guard_keeps_own_deopt_record`
+- stage 16 (IC specialization) was dead code (the IC table was never handed
+  to the BuiltGraph) — wired, `j2_mono_field_site_specializes_and_stays_parity`
+- edge-copy ordering vs flag-fused compares (true-edge copies ran before the
+  compare read its inputs; phi intervals now cover the predecessor block and
+  the compare stages first), value numbering now validates hits against the
+  dominator chain, Kahn cycle fallback fails loudly (Rule 76), field
+  accesses write safepoint homes/GC maps, dead guards no longer emit deopt
+  records, `PipelineStats` is exposed on `J2Code` (Rule 120 telemetry)
+  — `j2_kill_switch_inline_off_keeps_parity_and_telemetry`,
+  `j2_budget_refusal_names_the_reason`
 
 ## M3 — J3 adaptive full optimizing JIT
 
+- [ ] No-capture deopt at safepoint polls re-runs the whole method in T0
+      (effects committed before the poll re-execute — M1-parity contract;
+      RBPD's region-capture machinery replaces it, Rules 41/113)
+- [ ] Executed OSR-entry parity test with a T0 register snapshot (the M2
+      test pins the stub's presence and offset; executing it lands with the
+      J3 tiering driver that produces real mid-loop snapshots)
 - [ ] Interop message protocol dispatch: POLY_EXECUTE/POLY_READ/POLY_WRITE/
       POLY_SEND lowering, vtable registration, capability-gated load
       (docs/interop-protocol.md)

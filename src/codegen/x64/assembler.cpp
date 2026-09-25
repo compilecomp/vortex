@@ -1,5 +1,7 @@
 #include "vortex/codegen/x64/assembler.hpp"
 
+#include <cstdlib>
+
 namespace vortex::codegen::x64 {
 
 // ---- low-level encoders ------------------------------------------------------
@@ -13,6 +15,17 @@ void Assembler::rex_w(Reg reg, Reg rm_or_index) {
 
 void Assembler::rex_raw(uint8_t bits) {
     if (bits != 0x40) out_.emit8(bits);  // bare REX is a no-op prefix
+}
+
+/// Group-op extension encoding: the modrm reg field carries the opcode
+/// EXTENSION (/0../7), never a register ordinal — passing Reg enums here
+/// silently encodes the wrong group op (ROL instead of SHL, etc.).
+void Assembler::modrm_ext(uint8_t mod, uint8_t ext, Reg rm) {
+    // Same 3-bit discipline as modrm(): bit 3 of R8-R15 rides REX.B (set by
+    // the caller's rex_*), so the rm ordinal must be masked — an unmasked
+    // R10 ORs 0b1010 and leaks bit 3 into the extension field (SHL -> SHR).
+    out_.emit8(static_cast<uint8_t>((mod << 6) | ((ext & 7) << 3) |
+                                    (reg_id(rm) & 7)));
 }
 
 void Assembler::modrm(uint8_t mod, Reg reg, Reg rm) {
@@ -125,7 +138,10 @@ void Assembler::movsd_mem_xmm(const Mem& dst, Xmm src) {
 
 void Assembler::movsd_xmm_xmm(Xmm dst, Xmm src) {
     const uint8_t pfx[1] = {0xF2};
-    sse_op(pfx, 1, false, 0x11, dst, src);  // movsd r/m, xmm (reg,reg form)
+    // F2 0F 10 /r — MOVSD xmm1, xmm2/m64 (load form): reg = DEST, rm = SRC.
+    // The 0x11 store form has the reg field as SOURCE; using it here moved
+    // the operands backwards and silently corrupted every xmm-to-xmm copy.
+    sse_op(pfx, 1, false, 0x10, dst, src);
 }
 
 void Assembler::movq_xmm_gpr(Xmm dst, Reg src) {
@@ -267,6 +283,37 @@ void Assembler::lea_reg_mem(Reg dst, const Mem& src) {
     emit_mem_operand(dst, src);
 }
 
+void Assembler::lea_reg_scaled_disp(Reg dst, Reg index, uint8_t scale_log2,
+                                    int32_t disp) {
+    // mod=00, rm=100 (SIB follows); SIB base=101 in mod=00 = no base, so
+    // the address is index*scale + disp. Flags are untouched, so this may
+    // sit between a compare and its JCC.
+    uint8_t rex = 0x48;  // W set
+    if (reg_id(dst) >= 8) rex |= 0x4;    // R
+    if (reg_id(index) >= 8) rex |= 0x1;  // X
+    out_.emit8(rex);
+    out_.emit8(0x8D);
+    out_.emit8(static_cast<uint8_t>(((reg_id(dst) & 7) << 3) | 0x04));
+    out_.emit8(static_cast<uint8_t>((scale_log2 << 6) |
+                                    ((reg_id(index) & 7) << 3) | 0x05));
+    imm32(disp);
+}
+
+void Assembler::setcc(uint8_t cc, Reg r8) {
+    // 0F 90+cc /r with mod=11: sets the register's low byte to the flag.
+    // Only al/cl/dl/bl (codes 0-3) are accepted — they encode without REX
+    // and without the high-byte aliasing hazard. Flag preserving.
+    const uint8_t code = static_cast<uint8_t>(reg_id(r8) & 7);
+    if (reg_id(r8) >= 8 || code >= 4) {
+        // Unsupported operand class for this helper; kept out of the API to
+        // avoid a silent mis-encode (Rule 76).
+        std::abort();
+    }
+    out_.emit8(0x0F);
+    out_.emit8(static_cast<uint8_t>(0x90 + cc));
+    out_.emit8(static_cast<uint8_t>(0xC0 | code));
+}
+
 // ---- arithmetic -----------------------------------------------------------------
 
 void Assembler::add_reg_reg(Reg dst, Reg src) {
@@ -277,6 +324,12 @@ void Assembler::add_reg_reg(Reg dst, Reg src) {
 void Assembler::or_reg_reg(Reg dst, Reg src) {
     rex_w(src, dst);
     out_.emit8(0x09);
+    modrm(0x3, src, dst);
+}
+
+void Assembler::and_reg_reg(Reg dst, Reg src) {
+    rex_w(src, dst);
+    out_.emit8(0x21);  // AND r/m64, r64
     modrm(0x3, src, dst);
 }
 
@@ -382,19 +435,19 @@ void Assembler::and_reg_imm8(Reg dst, int8_t imm) {
 void Assembler::shl_reg_cl(Reg dst) {
     rex_w(dst, dst);
     out_.emit8(0xD3);
-    modrm(0x3, Reg::RAX, dst);  // /4 = SHL
+    modrm_ext(0x3, 0x4, dst);  // /4 = SHL
 }
 
 void Assembler::shr_reg_cl(Reg dst) {
     rex_w(dst, dst);
     out_.emit8(0xD3);
-    modrm(0x3, Reg::RCX, dst);  // /5 = SHR
+    modrm_ext(0x3, 0x5, dst);  // /5 = SHR
 }
 
 void Assembler::sar_reg_cl(Reg dst) {
     rex_w(dst, dst);
     out_.emit8(0xD3);
-    modrm(0x3, Reg::RBP, dst);  // /7 = SAR
+    modrm_ext(0x3, 0x7, dst);  // /7 = SAR
 }
 
 void Assembler::imul_reg_reg(Reg dst, Reg src) {
@@ -427,7 +480,7 @@ void Assembler::neg_reg(Reg r) {
 void Assembler::shift_reg_imm8(Reg dst, uint8_t count, uint8_t op_ext) {
     rex_w(dst, dst);
     out_.emit8(0xC1);
-    modrm(0x3, static_cast<Reg>(op_ext), dst);
+    modrm_ext(0x3, op_ext, dst);  // op_ext = the group extension (/4 SHL etc.)
     out_.emit8(count);
 }
 

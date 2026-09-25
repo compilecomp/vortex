@@ -424,6 +424,203 @@ VORTEX_TEST(j1_parity_fields_and_objects) {
     if (j1) VORTEX_EXPECT_EQ(j1->as_smi(), 7);
 }
 
+// ---- profile-driven IC guard strengthening (M2) ------------------------------------
+
+namespace {
+
+// Compiles `entry` with an explicit IC table on the job (the M2 profile
+// plumbing) and returns the published code bytes for inspection.
+vm::Result<std::vector<uint8_t>> compile_with_ics(
+    ugb::UGBModule& module, gc::Heap& heap, vm::Interpreter& interp,
+    StencilTable& corpus, int32_t method_id, const ugb::IcSlot* ics,
+    size_t ic_count) {
+    j1::J1Bindings bindings;
+    auto br = j1::make_j1_bindings(heap, module, &interp, bindings);
+    if (!br) return std::unexpected(br.error());
+    j1::BaselineJit jit(corpus);
+    j1::BaselineJob job;
+    job.module = &module;
+    job.method_id = static_cast<uint32_t>(method_id);
+    job.klass_addrs = &bindings.klass_addr_table;
+    job.field_offsets = bindings.field_offsets.data();
+    job.field_offset_count = bindings.field_offsets.size();
+    job.double_klass = bindings.double_klass;
+    job.ic_slots = ics;
+    job.ic_slot_count = ic_count;
+    auto code = jit.compile(job);
+    if (!code) return std::unexpected(code.error());
+    return code->code;
+}
+
+// Counts IC-guard flips by comparing against the un-strengthened compile
+// of the same method: a flip is the M1 always-slow slot (90 E9 = nop;
+// jmp rel32) rewritten in place into the guarded 0F 85 (jne rel32).
+// (Counting 0F 85 pairs globally is wrong: the prologue's argument-copy
+// loop legitimately branches backward with 0F 85.)
+size_t count_guard_flips(const std::vector<uint8_t>& base,
+                         const std::vector<uint8_t>& strong) {
+    size_t n = 0;
+    const size_t lim = std::min(base.size(), strong.size());
+    for (size_t i = 0; i + 1 < lim; ++i) {
+        if (base[i] == 0x90 && base[i + 1] == 0xE9 && strong[i] == 0x0F &&
+            strong[i + 1] == 0x85) {
+            ++n;
+        }
+    }
+    return n;
+}
+
+}  // namespace
+
+VORTEX_TEST(j1_ic_guard_strengthened_from_mono_profile) {
+    constexpr const char* kSrc = R"(
+.class Point
+.field x in Point
+.field y in Point
+
+.method make(regs=3, args=2)
+    New.Object v2, Point
+    SetField v2, v0, Point.x
+    SetField v2, v1, Point.y
+    Return v2
+.end
+
+.method getx(regs=2, args=1)
+    GetField v1, v0, Point.x
+    Return v1
+.end
+
+.method main(regs=4, args=0)
+    Const.I32 v0, 7
+    Const.I32 v1, 9
+    Call.Direct v2, v0, 2, make
+    Call.Direct v3, v2, 1, getx
+    Return v3
+.end
+)";
+    auto module = assemble_module(kSrc);
+    VORTEX_EXPECT(module.has_value());
+    if (!module) return;
+    gc::Heap heap;
+    vm::Interpreter interp(heap);
+    interp.register_builtin(
+        "print", [](std::span<const TaggedValue>, void*) {
+            return TaggedValue::undefined();
+        });
+    // 1. T0 executes main: the GET_FIELD site in getx turns Monomorphic
+    //    (the authentic profile producer — docs/tier-t0.md section 3).
+    auto t0 = interp.run(*module, "main", {});
+    VORTEX_EXPECT(t0.has_value());
+    if (t0) VORTEX_EXPECT_EQ(t0->value.as_smi(), 7);
+
+    StencilTable corpus = make_corpus();
+    const int32_t getx = module->find_method("getx");
+    auto& method = module->method_table[static_cast<size_t>(getx)];
+
+    // 2. Baseline compile (no profiles): always-slow guard, correct result.
+    auto base_code =
+        compile_with_ics(*module, heap, interp, corpus, getx, nullptr, 0);
+    VORTEX_EXPECT(base_code.has_value());
+
+    // 3. Profiled compile: the mono slot strengthens the guard.
+    const auto& ics = method.ics;
+    auto strengthened = compile_with_ics(*module, heap, interp, corpus,
+                                         getx, ics.data(), ics.size());
+    VORTEX_EXPECT(strengthened.has_value());
+    if (base_code && strengthened) {
+        VORTEX_EXPECT_EQ(count_guard_flips(*base_code, *strengthened),
+                         static_cast<size_t>(1));
+    }
+
+    // 4. The strengthened method still executes correctly end-to-end.
+    j1::J1Bindings bindings;
+    auto br = j1::make_j1_bindings(heap, *module, &interp, bindings);
+    VORTEX_EXPECT(br.has_value());
+    if (br) {
+        j1::BaselineJit jit(corpus);
+        j1::BaselineJob job;
+        job.module = &*module;
+        job.method_id = static_cast<uint32_t>(getx);
+        job.klass_addrs = &bindings.klass_addr_table;
+        job.field_offsets = bindings.field_offsets.data();
+        job.field_offset_count = bindings.field_offsets.size();
+        job.double_klass = bindings.double_klass;
+        job.ic_slots = ics.data();
+        job.ic_slot_count = ics.size();
+        auto code = jit.compile(job);
+        VORTEX_EXPECT(code.has_value());
+        if (code) {
+            auto ex = j1::publish_baseline(*code);
+            VORTEX_EXPECT(ex.has_value());
+            if (ex) {
+                // Fresh receiver (different allocation than the T0 run).
+                const std::vector<TaggedValue> margs{TaggedValue::smi(11),
+                                                     TaggedValue::smi(22)};
+                auto made = interp.run(*module, "make", margs);
+                VORTEX_EXPECT(made.has_value());
+                if (made) {
+                    const std::vector<TaggedValue> args{made->value};
+                    auto res = j1::run_baseline(*ex, bindings, args);
+                    VORTEX_EXPECT(res.has_value());
+                    if (res) VORTEX_EXPECT_EQ(res->as_smi(), 11);
+                }
+            }
+        }
+    }
+}
+
+VORTEX_TEST(j1_ic_guard_poly_profile_stays_always_slow) {
+    constexpr const char* kSrc = R"(
+.class Point
+.field x in Point
+
+.method getx(regs=2, args=1)
+    GetField v1, v0, Point.x
+    Return v1
+.end
+)";
+    auto module = assemble_module(kSrc);
+    VORTEX_EXPECT(module.has_value());
+    if (!module) return;
+    gc::Heap heap;
+    vm::Interpreter interp(heap);
+    StencilTable corpus = make_corpus();
+    const int32_t getx = module->find_method("getx");
+
+    // Poly/mega profiles and unknown klass ids must NOT strengthen: the
+    // specialization is unprofitable or unsound, the always-slow default
+    // stays (Rule 34).
+    auto base_code =
+        compile_with_ics(*module, heap, interp, corpus, getx, nullptr, 0);
+    VORTEX_EXPECT(base_code.has_value());
+
+    std::vector<ugb::IcSlot> poly(3);
+    poly[1].state = ugb::IcState::Polymorphic;
+    poly[1].poly[0] = {1, 0};
+    poly[1].poly[1] = {2, 0};
+    poly[1].poly_count = 2;
+    auto code = compile_with_ics(*module, heap, interp, corpus, getx,
+                                 poly.data(), poly.size());
+    VORTEX_EXPECT(code.has_value());
+    if (code && base_code) {
+        VORTEX_EXPECT_EQ(count_guard_flips(*base_code, *code),
+                         static_cast<size_t>(0));
+    }
+
+    // Mono with a klass id no klass in this job carries: unresolved, keep
+    // the sentinel.
+    std::vector<ugb::IcSlot> ghost(3);
+    ghost[1].state = ugb::IcState::Monomorphic;
+    ghost[1].mono = {0xDEADBEEF, 0};
+    auto code2 = compile_with_ics(*module, heap, interp, corpus, getx,
+                                  ghost.data(), ghost.size());
+    VORTEX_EXPECT(code2.has_value());
+    if (code2 && base_code) {
+        VORTEX_EXPECT_EQ(count_guard_flips(*base_code, *code2),
+                         static_cast<size_t>(0));
+    }
+}
+
 // ---- superstencils ----------------------------------------------------------------
 
 VORTEX_TEST(j1_superstencil_promotion_and_match) {

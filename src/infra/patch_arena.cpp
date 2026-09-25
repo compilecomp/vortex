@@ -6,6 +6,8 @@
 #include <cstring>
 #include <string>
 
+#include "vortex/infra/code_range.hpp"
+
 namespace vortex::infra {
 
 namespace {
@@ -27,10 +29,18 @@ size_t round_pages(size_t bytes) noexcept {
 // READS: 0  WRITES: 0 (fresh anonymous mapping)
 // BRANCHES: 1 (mmap failure)
 // CACHE: n/a — kernel operation
-support::Result<PatchArena> PatchArena::allocate(size_t bytes) {
+support::Result<PatchArena> PatchArena::allocate(size_t bytes,
+                                                 CodeRange* range) {
     if (bytes == 0) {
         return support::fail(support::ErrorCode::InvalidArgument,
                              "patch arena requires a non-zero size");
+    }
+    if (range != nullptr) {
+        auto region = range->allocate(bytes);
+        if (!region) return std::unexpected(std::move(region).error());
+        PatchArena a(region->data(), region->size());
+        a.owner_range_ = range;
+        return a;
     }
     const size_t aligned = round_pages(bytes);
     void* p = ::mmap(nullptr, aligned, PROT_READ | PROT_WRITE,
@@ -45,27 +55,42 @@ support::Result<PatchArena> PatchArena::allocate(size_t bytes) {
 
 PatchArena::PatchArena(PatchArena&& other) noexcept
     : base_(other.base_), bytes_(other.bytes_), used_(other.used_),
-      published_(other.published_), in_session_(other.in_session_) {
+      published_(other.published_), in_session_(other.in_session_),
+      owner_range_(other.owner_range_) {
     other.base_ = nullptr;
     other.bytes_ = 0;
+    other.owner_range_ = nullptr;
 }
 
 PatchArena& PatchArena::operator=(PatchArena&& other) noexcept {
     if (this != &other) {
-        if (base_ != nullptr) ::munmap(base_, bytes_);
+        if (base_ != nullptr) {
+            if (owner_range_ != nullptr) {
+                owner_range_->deallocate(std::span<uint8_t>(base_, bytes_));
+            } else {
+                ::munmap(base_, bytes_);
+            }
+        }
         base_ = other.base_;
         bytes_ = other.bytes_;
         used_ = other.used_;
         published_ = other.published_;
         in_session_ = other.in_session_;
+        owner_range_ = other.owner_range_;
         other.base_ = nullptr;
         other.bytes_ = 0;
+        other.owner_range_ = nullptr;
     }
     return *this;
 }
 
 PatchArena::~PatchArena() {
-    if (base_ != nullptr) ::munmap(base_, bytes_);
+    if (base_ == nullptr) return;
+    if (owner_range_ != nullptr) {
+        owner_range_->deallocate(std::span<uint8_t>(base_, bytes_));
+        return;
+    }
+    ::munmap(base_, bytes_);
 }
 
 // @cold — emission-phase copy (skeletons and stubs are assembled once).

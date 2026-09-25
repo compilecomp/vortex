@@ -223,14 +223,17 @@ Result<void> Interpreter::build_module_runtime(ugb::UGBModule& module) {
     if (rt.ready) return ok();
 
     // Class tokens -> klass handles. Klass layouts are built from the
-    // module's field tokens (owner class known from "Class.field" refs) so
-    // NEW_OBJECT allocates the full field array up front.
+    // module's DECLARED field tokens (owner class known from "Class.field"
+    // refs) so NEW_OBJECT allocates the full field array up front. Tokens
+    // created by bare instruction references (declared=false, UGB v3) never
+    // shape a layout: access to one resolves through find_field -> miss ->
+    // the canonical unresolved-field error instead of an out-of-bounds slot.
     rt.klass_table.clear();
     for (const auto& c : module.classes) {
         rt.klass_table.push_back(registry_.create(c.name));
     }
     for (const auto& f : module.fields) {
-        if (f.klass_token < rt.klass_table.size()) {
+        if (f.declared && f.klass_token < rt.klass_table.size()) {
             static_cast<Klass*>(rt.klass_table[f.klass_token])->add_field(f.name);
         }
     }
@@ -664,6 +667,30 @@ Result<RunResult> Interpreter::run(ugb::UGBModule& module, std::string_view entr
 Result<RunResult> Interpreter::execute(ugb::UGBModule& module,
                                        ugb::UGBMethod& method,
                                        std::span<const TaggedValue> args) {
+    return execute_impl(module, method, args, 0, 0xFFFFFFFFu,
+                        TaggedValue::undefined());
+}
+
+Result<TaggedValue> Interpreter::resume(ugb::UGBModule& module,
+                                        uint32_t method_id,
+                                        std::span<const TaggedValue> vregs,
+                                        uint32_t pc, uint32_t inject_dst,
+                                        TaggedValue inject) {
+    if (method_id >= module.method_table.size()) {
+        return fail(ErrorCode::InvalidArgument, "resume: no such method");
+    }
+    auto& method = module.method_table[method_id];
+    auto rr = execute_impl(module, method, vregs, pc, inject_dst, inject);
+    if (!rr) return std::unexpected(std::move(rr).error());
+    return rr->value;
+}
+
+Result<RunResult> Interpreter::execute_impl(ugb::UGBModule& module,
+                                            ugb::UGBMethod& method,
+                                            std::span<const TaggedValue> args,
+                                            size_t entry_pc,
+                                            uint32_t inject_dst,
+                                            TaggedValue inject) {
     if (call_depth_ >= config_.max_call_depth) {
         return fail(ErrorCode::RuntimeError,
                     "call depth exceeded (" +
@@ -710,10 +737,17 @@ Result<RunResult> Interpreter::execute(ugb::UGBModule& module,
     }
     TaggedValue* R = frame.regs.data();
     for (size_t i = 0; i < args.size(); ++i) R[i] = args[i];
+    if (inject_dst != 0xFFFFFFFFu) {
+        if (static_cast<size_t>(inject_dst) >= method.register_count) {
+            return fail(ErrorCode::InvalidArgument,
+                        "resume: inject register out of range");
+        }
+        R[inject_dst] = inject;
+    }
 
     const uint8_t* code = method.code.data();
     const size_t code_size = method.code.size();
-    size_t pc = 0;
+    size_t pc = entry_pc;
     Decoded ins;
     Op last_op = Op::ILLEGAL;
 

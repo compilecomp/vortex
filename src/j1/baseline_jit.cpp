@@ -220,8 +220,9 @@ uint64_t helper_generic_binop(J1Context* ctx, uint32_t op, uint64_t a,
 
 // @cold — unresolved-field slow path: name-based resolution through the
 // klass (the cold string compare the IC system exists to avoid; Rule 5).
-uint64_t helper_get_field_slow(J1Context* ctx, uint64_t obj_bits,
-                               uint32_t field_token) noexcept {
+uint32_t helper_get_field_slow(J1Context* ctx, uint64_t obj_bits,
+                               uint32_t field_token,
+                               TaggedValue* out) noexcept {
     const TaggedValue obj = TaggedValue::from_raw(obj_bits);
     if (!obj.is_heap_object()) return 0;
     auto* o = obj.as_heap_object();
@@ -231,7 +232,10 @@ uint64_t helper_get_field_slow(J1Context* ctx, uint64_t obj_bits,
     const int idx =
         o->header.klass->find_field(module->fields[field_token].name);
     if (idx < 0) return 0;
-    return static_cast<Object*>(o)->field(static_cast<uint32_t>(idx)).raw();
+    // ADR-005: success/failure rides the return code only; the field value
+    // (which may legally be raw bits 0 = Smi 0) goes through `out`.
+    *out = static_cast<Object*>(o)->field(static_cast<uint32_t>(idx));
+    return 1;
 }
 
 // @cold — unresolved-field store + ICGGC card marking. Returns 1 on
@@ -436,7 +440,7 @@ Result<void> make_j1_bindings(gc::Heap& heap, ugb::UGBModule& module,
             bindings.klass_addr_table.push_back(k);
         }
         for (const auto& f : module.fields) {
-            if (f.klass_token < bindings.owned_klasses.size()) {
+            if (f.declared && f.klass_token < bindings.owned_klasses.size()) {
                 bindings.owned_klasses[f.klass_token]->add_field(f.name);
             }
         }
@@ -519,6 +523,22 @@ Result<void> make_j1_bindings(gc::Heap& heap, ugb::UGBModule& module,
 
 // ---- compile ------------------------------------------------------------------------
 
+// Resolves a T0 IC klass id to the Klass* the J1 guard compares against.
+// The bindings' klass table is indexed by class token; ids and tokens agree
+// for registry-built klasses (make_j1_bindings), but the lookup goes through
+// the authoritative id() rather than assuming the layout. Returns nullptr
+// when the profiled klass is unknown to this job (caller keeps the
+// never-matching sentinel — always-slow, always correct).
+static const void* klass_addr_by_id(const BaselineJob& job,
+                                    uint32_t klass_id) {
+    if (job.klass_addrs == nullptr) return nullptr;
+    for (const void* addr : *job.klass_addrs) {
+        if (addr == nullptr) continue;
+        if (static_cast<const Klass*>(addr)->id() == klass_id) return addr;
+    }
+    return nullptr;
+}
+
 Result<BaselineCode> BaselineJit::compile(const BaselineJob& job) {
     if (job.module == nullptr ||
         job.method_id >= job.module->method_table.size()) {
@@ -584,6 +604,38 @@ Result<BaselineCode> BaselineJit::compile(const BaselineJob& job) {
     for (auto& kv : native_of) kv.second += body_off;
     buf.code().resize(native_end, 0x00);
 
+    // ---- error tail + shared epilogue (emitted BEFORE the body so the
+    // region behind native_end is fixed) ---------------------------------------
+    // Error tail: BT_Error sites (every error_exit) jump here AFTER storing
+    // the error id into ctx->last_error. run_baseline keys on rax != 0 (rc),
+    // so the tail LOADS the id. The old layout routed error tails into the
+    // same plain epilogue as the ok tail, and error paths returned rax = 0
+    // ("success") whenever the faulting sequence left rax cleared.
+    constexpr int32_t kCtxLastErrorOffset = 0xD8;  // J1Context::last_error
+    const size_t error_tail = a.current_offset();
+    a.mov_reg_mem(Reg::RAX, Mem{Reg::R15, Reg::RSP, 0, kCtxLastErrorOffset});
+    const size_t err_to_epi = a.current_offset() + 1;  // E9 + rel32
+    a.jmp_rel32(0);
+    const size_t epilogue_off = a.current_offset();
+
+    // Epilogue: pop r14; pop r15; add rsp, frame; pop rbp; ret. rax carries
+    // 0 (normal; *ret written) or the error id (via the error tail above).
+    // Deallocate the local frame FIRST, then restore the saved registers in
+    // reverse push order (prologue: push rbp, r15, r14). Popping before the
+    // add would read the frame's bottom — stale memory — into r14/r15 and
+    // silently corrupt every caller-side callee-saved register.
+    const size_t epi_sub = a.current_offset() + 3;  // REX + 81 + modrm
+    a.add_reg_imm32(Reg::RSP, 0);
+    a.pop_reg(Reg::R14);
+    a.pop_reg(Reg::R15);
+    a.pop_reg(Reg::RBP);
+    a.ret();
+    patch_imm32(buf.code().data() + epi_sub, frame);
+    patch_imm32(buf.code().data() + err_to_epi,
+                static_cast<int32_t>(epilogue_off - (err_to_epi + 4)));
+    patch_imm32(buf.code().data() + pro.sub_site, frame);
+    patch_disp32(buf.code().data() + pro.vreg0_site, vreg_disp(rc, 0));
+
     // ---- pass 2: instantiate ------------------------------------------------------
     for (size_t i = 0; i < seq.size(); ++i) {
         const Decoded& d = seq[i];
@@ -592,7 +644,7 @@ Result<BaselineCode> BaselineJit::compile(const BaselineJob& job) {
         std::memcpy(buf.code().data() + inst_base, st.bytes.data(),
                     st.bytes.size());
         const size_t next_native =
-            i + 1 < seq.size() ? native_of[seq[i + 1].pc] : native_end;
+            i + 1 < seq.size() ? native_of[seq[i + 1].pc] : epilogue_off;
 
         for (const PatchSite& ps : st.patch_sites) {
             uint8_t* at = buf.code().data() + inst_base + ps.offset;
@@ -695,7 +747,7 @@ Result<BaselineCode> BaselineJit::compile(const BaselineJob& job) {
                 break;
             }
             case PatchKind::BranchTarget: {
-                size_t target_native = native_end;
+                size_t target_native = epilogue_off;
                 if (ps.operand == 0) {
                     const auto it = native_of.find(d.ins.meta);
                     if (it == native_of.end()) {
@@ -703,10 +755,13 @@ Result<BaselineCode> BaselineJit::compile(const BaselineJob& job) {
                                     "J1: branch to instruction boundary");
                     }
                     target_native = it->second;
+                } else if (ps.operand == 1) {
+                    // BT_Error: load rax = last_error first, then return.
+                    target_native = error_tail;
                 } else if (ps.operand == 3) {
                     target_native = next_native;  // falls into the epilogue
                 }
-                // operands 1/2: both epilogue operands share the one body.
+                // operand 2 (BT_Ok): the plain epilogue — default above.
                 const int32_t rel = static_cast<int32_t>(
                     static_cast<int64_t>(target_native) -
                     static_cast<int64_t>(inst_base + ps.offset + 4));
@@ -721,10 +776,47 @@ Result<BaselineCode> BaselineJit::compile(const BaselineJob& job) {
                         static_cast<int64_t>(slow_native) -
                         static_cast<int64_t>(inst_base + ps.offset + 4));
                     patch_imm32(at, rel);
+
+                    // ---- profile-driven guard strengthening (M2) ----------
+                    // A Monomorphic IC at this site flips the always-slow
+                    // `nop; jmp rel32` into `jne rel32` against the profiled
+                    // klass: receivers of that klass take the inline slot
+                    // load/store, everything else falls to the helper — the
+                    // same two-layer shape T0 executes (docs/tier-t0.md
+                    // section 3, docs/tier-j1.md section 7). No profile, an
+                    // unresolved klass id, or a poly/mega slot keeps the M1
+                    // always-slow default, which is correct for every
+                    // receiver (Rule 34: specialization keeps a fallback).
+                    if (job.ic_slots != nullptr && i < job.ic_slot_count &&
+                        job.ic_slots[i].state == ugb::IcState::Monomorphic) {
+                        const void* klass_addr = klass_addr_by_id(
+                            job, job.ic_slots[i].mono.klass_or_shape_id);
+                        if (klass_addr != nullptr) {
+                            // The paired compare-immediate site of THIS
+                            // instance (one PA_KlassAddr per IC-guarded
+                            // template).
+                            for (const PatchSite& qs : st.patch_sites) {
+                                if (qs.kind == PatchKind::ConstantIndex &&
+                                    qs.operand == 3 /* PA_KlassAddr */) {
+                                    patch_imm64(
+                                        buf.code().data() + inst_base +
+                                            qs.offset,
+                                        ptr_bits(klass_addr));
+                                    break;
+                                }
+                            }
+                            // Pure opcode-prefix flip: `nop; jmp rel32`
+                            // (90 E9) -> `jne rel32` (0F 85). The jmp starts
+                            // at ps.offset-1 with next-ip ps.offset+4; the
+                            // jne starts at ps.offset-2 with the SAME
+                            // next-ip, so the displacement (already patched
+                            // above) needs no adjustment.
+                            uint8_t* prefix = at - 2;
+                            prefix[0] = 0x0F;
+                            prefix[1] = 0x85;
+                        }
+                    }
                 }
-                // operand 0 (guard imm) stays at the 0 sentinel until IC
-                // profile plumbing lands (M2): the always-slow path is
-                // correct for every receiver.
                 break;
             }
             default:
@@ -733,22 +825,6 @@ Result<BaselineCode> BaselineJit::compile(const BaselineJob& job) {
             }
         }
     }
-
-    // ---- epilogue: pop r14; pop r15; add rsp, frame; pop rbp; ret ------------
-    // rax carries 0 (normal; *ret written) or the error id.
-    // Deallocate the local frame FIRST, then restore the saved registers in
-    // reverse push order (prologue: push rbp, r15, r14). Popping before the
-    // add would read the frame's bottom — stale memory — into r14/r15 and
-    // silently corrupt every caller-side callee-saved register.
-    const size_t epi_sub = a.current_offset() + 3;  // REX + 81 + modrm
-    a.add_reg_imm32(Reg::RSP, 0);
-    a.pop_reg(Reg::R14);
-    a.pop_reg(Reg::R15);
-    a.pop_reg(Reg::RBP);
-    a.ret();
-    patch_imm32(buf.code().data() + epi_sub, frame);
-    patch_imm32(buf.code().data() + pro.sub_site, frame);
-    patch_disp32(buf.code().data() + pro.vreg0_site, vreg_disp(rc, 0));
 
     // ---- OSR entry stubs (one per backward-branch target) ----------------------
     // J1OsrFn(ctx=rdi, vreg_state=rsi, count=edx, ret=rcx): fresh frame, all
@@ -847,8 +923,9 @@ Result<BaselineCode> BaselineJit::compile(const BaselineJob& job) {
 
 // ---- publish + run ------------------------------------------------------------------
 
-Result<BaselineExecutable> publish_baseline(const BaselineCode& code) {
-    auto mem = infra::WritableCodeMemory::allocate(code.code.size());
+Result<BaselineExecutable> publish_baseline(const BaselineCode& code,
+                                            infra::CodeRange* range) {
+    auto mem = infra::WritableCodeMemory::allocate(code.code.size(), range);
     if (!mem) return std::unexpected(std::move(mem).error());
     mem->write(code.code, 0);
     if (auto r = mem->publish(); !r) {

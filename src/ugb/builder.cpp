@@ -349,7 +349,13 @@ Result<UGBModule> assemble_module(std::string_view source) {
             if (err.failed) break;
             const std::string klass = cur.expect_word("a class name");
             if (err.failed) break;
-            module.intern_field(fname, module.intern_class(klass));
+            // A directive is a DECLARATION: it shapes the owner klass's
+            // layout (build_module_runtime). intern_field dedupes against
+            // tokens already created by instruction refs; the flag is then
+            // set in place so both orders converge on one declared entry.
+            const uint32_t ftok =
+                module.intern_field(fname, module.intern_class(klass));
+            module.fields[ftok].declared = true;
             continue;
         }
         if (head.text == ".builtin") {

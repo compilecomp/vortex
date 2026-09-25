@@ -29,11 +29,17 @@
 
 namespace vortex::infra {
 
+class CodeRange;
+
 class PatchArena {
 public:
     /// Allocates `bytes` (rounded up to whole pages) of code memory in RW
-    /// state for the emission phase.
-    static support::Result<PatchArena> allocate(size_t bytes);
+    /// state for the emission phase. When `range` is given, the arena is
+    /// carved from that shared code-range reservation (docs/ldpt.md section
+    /// 1) so every trampoline in it stays within rel32 reach of published
+    /// tier code — the precondition for the skeleton's direct `call rel32`.
+    static support::Result<PatchArena> allocate(size_t bytes,
+                                                CodeRange* range = nullptr);
 
     PatchArena() noexcept = default;
     PatchArena(PatchArena&& other) noexcept;
@@ -91,6 +97,10 @@ private:
     size_t used_ = 0;
     bool published_ = false;
     bool in_session_ = false;
+    // Non-null when carved from a shared CodeRange: the destructor returns
+    // the span to the range instead of munmap (a hole through the shared
+    // reservation would break the rel32 invariant for every later arena).
+    CodeRange* owner_range_ = nullptr;
 };
 
 }  // namespace vortex::infra

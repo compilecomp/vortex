@@ -30,7 +30,12 @@ inline constexpr uint16_t kUgbVersionMajor = 0;
 // v2 adds: runtime ABI + metadata schema versions, extension table, module
 // capability mask, per-method capability lists. v1 payloads decode with
 // defaults (empty capability set); incompatible majors are rejected.
-inline constexpr uint16_t kUgbVersionMinor = 2;
+// v3 adds: per-field `declared` flag — distinguishes fields introduced by a
+// `.field` directive (they shape the klass layout) from field tokens created
+// by bare instruction references (accessing one is the canonical unresolved-
+// field error, never an out-of-bounds slot). Older minors decode with
+// declared=true (the v2 layout contract).
+inline constexpr uint16_t kUgbVersionMinor = 3;
 inline constexpr uint32_t kRuntimeAbiVersion = 1;
 inline constexpr uint32_t kMetadataSchemaVersion = 1;
 
@@ -132,6 +137,12 @@ struct Constant {
 struct FieldTokenInfo {
     std::string name;
     uint32_t klass_token = 0;
+    /// Set by the `.field` directive (text) or the v3 binary flag. Only
+    /// declared fields contribute to their owner klass's layout; a token
+    /// created solely by an instruction reference never does, so access
+    /// resolves through find_field -> miss -> canonical unresolved-field
+    /// error (the helper contract, ADR-005).
+    bool declared = false;
 };
 
 struct ClassTokenInfo {
