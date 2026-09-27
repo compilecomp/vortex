@@ -424,6 +424,68 @@ VORTEX_TEST(j1_parity_fields_and_objects) {
     if (j1) VORTEX_EXPECT_EQ(j1->as_smi(), 7);
 }
 
+// ---- bindings rebind idempotency (Rule 121 regression pack) -------------------------
+//
+// make_j1_bindings used to push_back into the bindings' vectors without
+// clearing them first: rebinding a REUSED J1Bindings against a fresh
+// module left the previous module's klass addresses in the table — index
+// 0 then held a DANGLING pointer that every JIT klass lookup (guards,
+// alloc lowering, XLEA remat klass tokens) trusts. The failure surfaced
+// as a garbage field count on the J3 deopt remat path (the table's slot
+// pointed into a destroyed module runtime). The contract now: rebinding
+// resets every bindings-owned container; the klass table maps tokens 1:1
+// onto the LIVE module runtime (Rule 48: no stale references survive).
+VORTEX_TEST(j1_bindings_rebind_is_idempotent) {
+    constexpr const char* kSrc = R"(
+.class W
+.field a in W
+.field b in W
+
+.method main(regs=4, args=0)
+    Const.I32 v0, 30
+    Const.I32 v1, 12
+    New.Object v2, W
+    SetField v2, v0, W.a
+    SetField v2, v1, W.b
+    Return v2
+.end
+)";
+    auto module = assemble_module(kSrc);
+    VORTEX_EXPECT(module.has_value());
+    if (!module) return;
+    gc::Heap heap;
+    vm::Interpreter interp(heap);
+    // T0 bootstrap populates module.runtime.klass_table — exercising the
+    // copy branch of make_j1_bindings (the branch the tiering harness
+    // takes after warmup).
+    auto boot = interp.build_module_runtime(*module);
+    VORTEX_EXPECT(boot.has_value());
+    if (!boot) return;
+    const size_t runtime_klasses = module->runtime.klass_table.size();
+    VORTEX_EXPECT_EQ(runtime_klasses, size_t{1});
+
+    j1::J1Bindings bindings;
+    auto br1 = j1::make_j1_bindings(heap, *module, &interp, bindings);
+    VORTEX_EXPECT(br1.has_value());
+    if (!br1) return;
+    VORTEX_EXPECT_EQ(bindings.klass_addr_table.size(), runtime_klasses);
+    VORTEX_EXPECT_EQ(bindings.constants.size(), module->constants.size());
+    VORTEX_EXPECT_EQ(bindings.field_offsets.size(), module->fields.size());
+
+    // Rebind the SAME bindings object: the table must rebuild exactly —
+    // no stale entries, no growth (the regression shape).
+    auto br2 = j1::make_j1_bindings(heap, *module, &interp, bindings);
+    VORTEX_EXPECT(br2.has_value());
+    if (!br2) return;
+    VORTEX_EXPECT_EQ(bindings.klass_addr_table.size(), runtime_klasses);
+    for (size_t i = 0; i < runtime_klasses; ++i) {
+        VORTEX_EXPECT(bindings.klass_addr_table[i] ==
+                      module->runtime.klass_table[i]);
+    }
+    VORTEX_EXPECT_EQ(bindings.constants.size(), module->constants.size());
+    VORTEX_EXPECT_EQ(bindings.field_offsets.size(), module->fields.size());
+}
+
 // ---- profile-driven IC guard strengthening (M2) ------------------------------------
 
 namespace {

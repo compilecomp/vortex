@@ -18,7 +18,7 @@
 //
 // CEM-26: the arena is setup/patching infrastructure (@cold per patch
 // session). The mprotect pair is a registered PERF_PERMIT (PERF-005,
-// docs/cem26.md section 5): page flips cost microseconds and are amortized
+// register in tools/lint/compliance.sh): page flips cost microseconds and are amortized
 // over a whole patch batch, never per guest call.
 #pragma once
 

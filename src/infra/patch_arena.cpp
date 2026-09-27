@@ -129,7 +129,7 @@ support::Result<size_t> PatchArena::carve(size_t bytes) {
 }
 
 // @cold — publication flip. PERF_PERMIT PERF-005 covers both this and the
-// session flips (docs/cem26.md): mprotect costs microseconds and is amortized
+// session flips (register in tools/lint/compliance.sh): mprotect costs microseconds and is amortized
 // over the whole patch batch.
 support::Result<void> PatchArena::publish() {
     if (base_ == nullptr) {

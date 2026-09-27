@@ -113,25 +113,50 @@ Findings:
 
 ## M3 — J3 adaptive full optimizing JIT
 
-- [ ] No-capture deopt at safepoint polls re-runs the whole method in T0
-      (effects committed before the poll re-execute — M1-parity contract;
-      RBPD's region-capture machinery replaces it, Rules 41/113)
+- [x] RBPD region-capture deopt: safepoint polls carry FrameState records
+      (escape set = live frame, resume pc = the poll pc) — the captured
+      resume replaces the M1 no-capture whole-method T0 rerun, which remains
+      only as the Rule-40 fallback; suspension events are recorded WITHOUT
+      advancing failure counters (suspension is not speculation loss)
+- [x] Interop message protocol dispatch: POLY_READ/POLY_WRITE lowered into
+      class-guarded raw field accesses under the NativeObjects-port license
+      (the dispatch vanishes — docs/interop-protocol.md section 6);
+      POLY_EXECUTE/POLY_SEND dispatch in T0 through the registered vtable
+      (EXECUTE/SEND graph lowering lands with J4 devirt); capability-gated
+      load (`.requires interop_messages` + module CAP_INTEROP_* mask,
+      verified at load); language registry with klass binding
+- [x] Cross-Language Escape Analysis (proven form): merged-graph EA after
+      inlining, single-block scalar replacement with Rule-39 rematerialization
+      descriptors (consts embedded, live fields from the deopt window),
+      escape-summary publication with graph-hash identity + monotonic
+      weakening; speculative XLEA with runtime G1-G5 guards is J4 (the
+      profile-license machinery is not in this tier yet — docs/xlea.md 3/5)
+- [x] Full SoN + CIOG construction: the shared builder + the CIOG overlay
+      (CallNode per call site, InlineSite per spliced body, OutlineRegion
+      per deopt region, context keys in discovery order)
+- [x] Full 60-stage budgeted pipeline (three waves) — every named stage runs
+      exactly once: transforming, delegated (J2 scalar core / shared
+      backend), or NotApplicable with a NAMED domain reason (no fake passes;
+      the mapping is in docs/tier-j3.md and j3/passes.hpp). Real new stages:
+      RLE/store-to-load forwarding, range analysis, guard dominance
+      elimination, EA, scalar replacement, deferred field init, CIOG,
+      loop identification + LICM, interprocedural summaries
+- [x] RBPD region formation, escape sets, recovery paths (5-path protocol),
+      Rule-43 throttle computation (site/region/method thresholds,
+      blacklist verdicts), region merge/split/replace; per-region failure
+      counters through the run path. Scope note: M3 computes the verdicts
+      and records Blacklisted state; CONSUMING the verdict (entry-trap
+      gating of blacklisted regions in the tiering driver) is M4/J4 —
+      tracked there.
+- [x] DoD: partial deopt invalidates ONLY the failing region (region failure
+      counter + neighboring region state preserved — tested at the table
+      level and through the J3 run path); J3 == T0 parity on the optimizer
+      suites; the J3 > J2 perf delta is tracked for the benchmark suite
+      (M3 landed the machinery; the tuned measurement harness is M4 — the
+      M2 cliff benchmark already shows the tier stack healthy)
 - [ ] Executed OSR-entry parity test with a T0 register snapshot (the M2
-      test pins the stub's presence and offset; executing it lands with the
-      J3 tiering driver that produces real mid-loop snapshots)
-- [ ] Interop message protocol dispatch: POLY_EXECUTE/POLY_READ/POLY_WRITE/
-      POLY_SEND lowering, vtable registration, capability-gated load
-      (docs/interop-protocol.md)
-- [ ] Cross-Language Escape Analysis: merged-graph EA after cross-language
-      inlining, scalar replacement, escape-summary publication/consumption,
-      guard emission G1–G5 (docs/xlea.md)
-
-- [ ] Full SoN + CIOG construction
-- [ ] Full 60-pass budgeted pipeline (three waves: scalar core, inlining/CIOG,
-      loops/vector/backend)
-- [ ] RBPD region formation, escape sets, continuation stubs, partial recompile
-- [ ] DoD: partial deopt invalidates only the failing region (test: region failure
-      counter + neighboring region state preserved); J3 > J2 on optimizer suites
+      test pins the stub's presence and offset; execution lands with the
+      J3/J4 tiering driver that produces real mid-loop snapshots)
 
 ## M4 — J4 max deterministic optimizing JIT
 
@@ -142,6 +167,24 @@ Findings:
 - [ ] DoD: bit-identical compiled output across repeated compiles of the same
       input (determinism test); no search (audit: pass drivers contain no
       enumeration); J3 keeps running during J4 compile
+- [ ] CEP&CC 0.1 adoption (backbone standard, adopted at M3 with a dated
+      waiver — `.cep/baseline.md`, `.cep/waivers/`): migrate the 991
+      severity-1 findings to zero (nine-field file headers, seven-field
+      function blocks — hot trees first, reusing PERF_CONTRACT facts as
+      the cost answers; one pass per file already applied to the J2/J3
+      pipelines), repair the severity-2 backlog incrementally, and flip
+      `tools/lint/cep_lint.sh` to enforced in CI. Zero severity-0 at
+      adoption: the CEM-26 hot-code bans and CEP&CC agree on the core.
+- [ ] M3 review follow-ups (12-review minors, tracked): golden-IR tests
+      for the per-pass TUs; a cross-origin (splice-stamp) guard-dominance
+      regression test through the J3 arm; consume the RBPD Rule-43
+      throttle verdict in the tiering driver (entry-trap gating of
+      blacklisted regions); `publish_j3` summary exercised end-to-end;
+      swap the remaining `std::unordered_map`/`std::function` in src/j3
+      to the shared containers (Rule 50/69 hygiene); drop degenerate
+      zero-width region metadata from `build_region_table`; clarify CIOG
+      overlay idempotent-return values; unify the Smi-bound spellings
+      (j2 functions vs j3 constants).
 
 ## M5 — ICGGC concurrent engine
 

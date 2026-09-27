@@ -291,7 +291,7 @@ Result<TrampolineSite*> LdptManager::emit_skeleton(
 // CACHE: cold pages + the patched lines
 // PERF_PERMIT PERF-005 (mprotect pair): the W^X law makes every code write a
 //          two-flip session; batching per escalation bounds the cost.
-// OWNER: @vortex/rt (registered in docs/cem26.md section 5)
+// OWNER: @vortex/rt (registered in tools/lint/compliance.sh)
 Result<void> LdptManager::patch_session(
     const std::vector<std::pair<size_t, std::span<const uint8_t>>>& writes) {
     // M:N safe-point freeze (docs/ldpt.md section 2). M1 binds the contract

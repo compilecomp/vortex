@@ -419,10 +419,22 @@ FramePreamble emit_frame_preamble(x64::Assembler& a,
 // REASON: context setup is per-module-load @warm work; steady-state guest
 //         execution allocates only through the corpus's inline TLAB paths.
 // COST: O(constants + classes) allocations at bind time.
-// OWNER: @vortex/rt (registered in docs/cem26.md section 5)
+// OWNER: @vortex/rt (registered in tools/lint/compliance.sh)
 Result<void> make_j1_bindings(gc::Heap& heap, ugb::UGBModule& module,
                               vm::Interpreter* interpreter,
                               J1Bindings& bindings) {
+    // Idempotent (re-)binding: reset EVERY bindings-owned container first.
+    // A reused J1Bindings must rebuild from scratch — stale entries from a
+    // previous module would survive as dangling pointers (e.g. a klass
+    // address from a destroyed module runtime at index 0, which every JIT
+    // guard/alloc-lowering then trusts). The context is refreshed from the
+    // final vector state at the end, so clearing here is safe (Rule 48:
+    // no stale references survive a rebind).
+    bindings.constants.clear();
+    bindings.klass_addr_table.clear();
+    bindings.field_offsets.clear();
+    bindings.registry = KlassRegistry{};
+    bindings.owned_klasses.clear();
     bindings.heap = &heap;
 
     // Klass table: reuse the T0-prepared table when present; otherwise

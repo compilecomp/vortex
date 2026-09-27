@@ -26,8 +26,10 @@
 // safepoint are force-spilled (SysV has no callee-saved xmm).
 //
 // CEM-26: this file is @warm per-method compile work (PERF-006 class — see
-// docs/cem26.md); the GENERATED code's contracts are the emission comments
+// the embedded register in tools/lint/compliance.sh); the GENERATED code's contracts are the emission comments
 // above. The deopt hook (j2_deopt_hook) is the one @hot runtime entry.
+#include <chrono>
+
 #include "vortex/j2/fast_jit.hpp"
 
 #include <algorithm>
@@ -549,6 +551,11 @@ private:
                     ++record_count;
                 }
             }
+            // Region-capture polls: every Safepoint with a FrameState is a
+            // materializable suspension point (docs/deopt-rbpd.md 2-4).
+            if (n.kind == NodeKind::Safepoint && !n.data_inputs.empty()) {
+                ++record_count;
+            }
         }
         records_->reserve(record_count);
 
@@ -561,6 +568,9 @@ private:
                 return UINT32_MAX;
             }
             DeoptRecord rec;
+            rec.region_id = static_cast<uint32_t>(records_->size());
+            rec.suspension =
+                g_.node(fs_owner).kind == NodeKind::Safepoint;
             std::vector<NodeId> nodes;  // per frame: the FrameState node
             uint32_t base = 0;
             NodeId cur = fs0;
@@ -581,6 +591,44 @@ private:
                     // resumes (call-return pc, dst injected).
                     fr.resume_pc = incoming.return_pc;
                     fr.inject_dst = incoming.inject_dst;
+                }
+                // Scalar-replaced allocations in this frame become
+                // rematerialization descriptors (XLEA phase 2): the window
+                // slot holds the undefined word; the runtime rebuilds the
+                // object from the field-value slots (Rule 39).
+                for (uint32_t i = 0; i < f.data_inputs.size(); ++i) {
+                    const auto it =
+                        built_.scalar_replacements.find(f.data_inputs[i]);
+                    if (it == built_.scalar_replacements.end()) continue;
+                    DeoptFrame::RematEntry rm;
+                    rm.slot = fr.vreg_base + i;
+                    rm.klass_token = it->second.klass_token;
+                    rm.field_count = it->second.field_count;
+                    for (const auto& field : it->second.fields) {
+                        rm.field_keys.push_back(field.slot);
+                        if (g_.node(field.value).kind == NodeKind::Const) {
+                            // Constants rematerialize from the record.
+                            rm.field_slots.push_back(
+                                DeoptFrame::RematEntry::kConstSlot);
+                            rm.const_words.push_back(
+                                const_word(g_.node(field.value)));
+                            continue;
+                        }
+                        int64_t found = -1;
+                        for (uint32_t j = 0; j < f.data_inputs.size(); ++j) {
+                            if (f.data_inputs[j] == field.value) {
+                                found = static_cast<int64_t>(j);
+                                break;
+                            }
+                        }
+                        if (found < 0) {
+                            return UINT32_MAX;  // pass invariant broken:
+                                                // no silent wrong rebuild
+                        }
+                        rm.field_slots.push_back(
+                            static_cast<uint32_t>(found));
+                    }
+                    fr.remats.push_back(std::move(rm));
                 }
                 rec.frames.push_back(fr);
                 base += fr.vreg_count;
@@ -610,6 +658,16 @@ private:
                 continue;
             }
             if (static_cast<AccessKind>(n.aux) != AccessKind::ArrayElement) {
+                continue;
+            }
+            record_index_of_[id] = build_record(id);
+        }
+        // Region-capture suspension polls (docs/deopt-rbpd.md 2-4): the
+        // escape set is the live frame, the resume pc is the poll's pc.
+        for (uint32_t id = 0; id < g_.node_count(); ++id) {
+            const Node& n = g_.node(id);
+            if (n.dead) continue;
+            if (n.kind != NodeKind::Safepoint || n.data_inputs.empty()) {
                 continue;
             }
             record_index_of_[id] = build_record(id);
@@ -2488,14 +2546,23 @@ private:
     support::Result<void> emit_safepoint_poll(NodeId id) {
         if (auto r = emit_safepoint_state(id); !r) return r;
         // J1 suspension contract: the poll word is a pointer to a u32; a
-        // nonzero word exits with the deopt id (no capture — run_j2 reruns
-        // the method in T0 from the entry).
+        // nonzero word takes the captured-deopt path — the SAME materialize
+        // + resume machinery as a guard failure, with the poll's record
+        // (escape set = live frame, resume pc = the poll's pc — Rule 39
+        // state-exact, docs/deopt-rbpd.md section 4 path B). The uncaptured
+        // whole-method rerun stays in the runtime as the Rule-40 fallback.
         asm_.mov_reg_mem(Reg::RCX,
                          Mem{Reg::R15, Reg::RSP, 0, kCtxSafepointWord});
         asm_.mov_reg32_mem(kScratch, Mem{Reg::RCX, Reg::RSP, 0, 0});
         asm_.test_reg_imm32(kScratch, -1);
         const size_t armed = asm_.placeholder_jcc(CC_NE);
-        error_fixups_.push_back({armed, kErrDeopt});
+        const uint32_t rec = record_of(id);
+        if (rec == UINT32_MAX) {
+            // No materializable record: legacy uncaptured suspension.
+            error_fixups_.push_back({armed, kErrDeopt});
+            return support::ok();
+        }
+        guard_sites_.push_back({id, armed, rec});
         return support::ok();
     }
 
@@ -2811,47 +2878,44 @@ void j2_deopt_hook(j1::J1Context* ctx, const DeoptRecord* record,
 
 // ---- orchestration ----------------------------------------------------------
 
+/// RBPD region table for one compiled method (docs/deopt-rbpd.md section
+/// 1): one region per deopt record — every trap site aligns with a region
+/// boundary (the hard invariant, section 8). The escape set is the record's
+/// materialization map: one stack location per frame vreg.
+deopt::RegionTable build_region_table(
+    const std::vector<DeoptRecord>& records, uint8_t tier) {
+    deopt::RegionTable table;
+    for (const DeoptRecord& rec : records) {
+        deopt::RegionDescriptor desc;
+        desc.kind = rec.suspension ? deopt::RegionKind::Hot
+                                   : deopt::RegionKind::Deopt;
+        desc.tier = tier;
+        desc.deopt.bytecode_resume_pc =
+            rec.frames.empty() ? 0 : rec.frames.front().resume_pc;
+        desc.deopt.tier_fallback_target = 0;  // T0 (Rule 40)
+        for (const DeoptFrame& fr : rec.frames) {
+            for (uint32_t i = 0; i < fr.vreg_count; ++i) {
+                deopt::EscapeLocation loc;
+                loc.virtual_register = static_cast<uint16_t>(i);
+                loc.location = deopt::EscapeLocation::Loc::Stack;
+                loc.payload = fr.vreg_base + i;
+                desc.deopt.escape_locations.push_back(loc);
+            }
+        }
+        desc.bytecode_pc_begin = desc.deopt.bytecode_resume_pc;
+        desc.bytecode_pc_end = desc.deopt.bytecode_resume_pc;
+        table.add_region(std::move(desc));
+    }
+    return table;
+}
+
 }  // namespace
 
 void set_j2_trace(bool enabled) noexcept { g_j2_trace = enabled; }
 
-support::Result<J2Code> compile_j2(const J2Job& job) {
-    if (job.module == nullptr ||
-        job.method_id >= job.module->method_table.size()) {
-        return support::fail(support::ErrorCode::InvalidArgument,
-                             "J2: unknown method id " +
-                                 std::to_string(job.method_id));
-    }
-    const ugb::UGBMethod& method =
-        job.module->method_table[job.method_id];
-
-    j2::GraphBuilderParams bp;
-    bp.module = job.module;
-    bp.method = &method;
-    bp.profiles = job.profiles;
-    bp.ics = job.ics;
-    bp.klass_addrs = job.klass_addrs;
-    bp.node_cap = job.node_cap;
-    j2::BuildResult br = build_graph(bp);
-    if (!br.ok || br.out == nullptr) {
-        const support::ErrorCode code =
-            br.error == BuildError::UnsupportedOpcode ||
-                    br.error == BuildError::BudgetExceeded
-                ? support::ErrorCode::Unimplemented
-                : support::ErrorCode::DecodeError;
-        return support::fail(code, std::string("J2: build refused: ") +
-                                       build_error_message(br.error) +
-                                       " at pc " +
-                                       std::to_string(br.error_pc));
-    }
-    BuiltGraph& built = *br.out;
-
-    j2::PipelineBudget budget;
-    budget.node_cap = job.node_cap;
-    budget.pass_control =
-        static_cast<uint64_t>(PassAll) & ~job.pass_kill_switches;
-    const j2::PipelineStats stats = run_pipeline(*built.graph, built, budget);
-
+support::Result<J2Code> emit_optimized(const J2Job& job, BuiltGraph& built,
+                                       const PipelineStats& stats,
+                                       vortex::Tier tier) {
     // Backend placement: LCA-of-uses, then the profile-driven layout.
     built.block_of = dominance_placement(*built.graph, built);
     std::vector<uint32_t> layout = block_layout_order(built);
@@ -2952,7 +3016,48 @@ support::Result<J2Code> compile_j2(const J2Job& job) {
     // the code valid — the graph just never finished optimizing.
     code->budget_exceeded = stats.budget_stop != 0;
     code->stats = stats;
+    code->regions = build_region_table(*records, static_cast<uint8_t>(tier));
     return code;
+}
+
+support::Result<J2Code> compile_j2(const J2Job& job) {
+    if (job.module == nullptr ||
+        job.method_id >= job.module->method_table.size()) {
+        return support::fail(support::ErrorCode::InvalidArgument,
+                             "J2: unknown method id " +
+                                 std::to_string(job.method_id));
+    }
+    const ugb::UGBMethod& method =
+        job.module->method_table[job.method_id];
+
+    j2::GraphBuilderParams bp;
+    bp.module = job.module;
+    bp.method = &method;
+    bp.profiles = job.profiles;
+    bp.ics = job.ics;
+    bp.klass_addrs = job.klass_addrs;
+    bp.interop = job.interop;
+    bp.node_cap = job.node_cap;
+    j2::BuildResult br = build_graph(bp);
+    if (!br.ok || br.out == nullptr) {
+        const support::ErrorCode code =
+            br.error == BuildError::UnsupportedOpcode ||
+                    br.error == BuildError::BudgetExceeded
+                ? support::ErrorCode::Unimplemented
+                : support::ErrorCode::DecodeError;
+        return support::fail(code, std::string("J2: build refused: ") +
+                                       build_error_message(br.error) +
+                                       " at pc " +
+                                       std::to_string(br.error_pc));
+    }
+    BuiltGraph& built = *br.out;
+
+    j2::PipelineBudget budget;
+    budget.node_cap = job.node_cap;
+    budget.pass_control =
+        static_cast<uint64_t>(PassAll) & ~job.pass_kill_switches;
+    const j2::PipelineStats stats = run_pipeline(*built.graph, built, budget);
+    return emit_optimized(job, built, stats);
 }
 
 support::Result<J2Executable> publish_j2(const J2Code& code,
@@ -2977,6 +3082,8 @@ support::Result<J2Executable> publish_j2(const J2Code& code,
     }
     ex.method_id = code.method_id;
     ex.records = code.records;
+    ex.regions =
+        std::make_shared<deopt::RegionTable>(std::move(code.regions));
     return ex;
 }
 
@@ -3012,8 +3119,9 @@ support::Result<TaggedValue> run_j2(J2Executable& ex, j1::J1Bindings& bindings,
     if (rc == static_cast<int64_t>(j1::J1ErrorId::kErrDeopt)) {
         DeoptCapture& c = deopt_capture();
         if (!c.valid || c.record == nullptr) {
-            // No capture: the safepoint poll fired (M1 suspension
-            // contract) — rerun the whole method in the attached T0.
+            // Rule-40 fallback: NO materializable record (legacy uncaptured
+            // poll) — rerun the whole method in the attached T0. Every
+            // captured path below resumes state-exact instead (Rule 39).
             auto* module = static_cast<ugb::UGBModule*>(
                 const_cast<void*>(bindings.context.module));
             if (module != nullptr &&
@@ -3030,6 +3138,23 @@ support::Result<TaggedValue> run_j2(J2Executable& ex, j1::J1Bindings& bindings,
             return support::fail(support::ErrorCode::RuntimeError,
                                  "J2: deopt without a capture");
         }
+        // RBPD accounting (Rule 43): guard failures advance ONLY the
+        // failing region's counter; a poll-fired record is suspension, not
+        // failure (the M1 contract — suspension never loses speculation).
+        if (ex.regions != nullptr) {
+            const uint64_t tick =
+                std::chrono::steady_clock::now().time_since_epoch().count();
+            if (c.record->suspension) {
+                ex.regions->on_suspension(c.record->region_id,
+                                          c.record->region_id, tick);
+            } else {
+                const deopt::ThrottlePolicy policy;
+                ex.regions->on_guard_failure(c.record->region_id, policy,
+                                             c.record->region_id,
+                                             deopt::DeoptReason::GuardFailed,
+                                             tick);
+            }
+        }
         // State-exact continuation (Rule 39): resume innermost-first,
         // threading the completed frame's value into the caller's inject
         // register. One code path with fresh execution (Rule 39 — the
@@ -3038,6 +3163,38 @@ support::Result<TaggedValue> run_j2(J2Executable& ex, j1::J1Bindings& bindings,
         const DeoptRecord& rec = *c.record;
         for (size_t f = 0; f < rec.frames.size(); ++f) {
             const DeoptFrame& fr = rec.frames[f];
+            // Rematerialize scalar-replaced allocations (XLEA phase 2): the
+            // window slot holds the undefined word; rebuild the object from
+            // the field-value slots so the T0 frame sees the real reference
+            // it expects — observationally identical state (Rule 39).
+            for (const DeoptFrame::RematEntry& rm : fr.remats) {
+                if (rm.klass_token >= bindings.klass_addr_table.size()) {
+                    return support::fail(
+                        support::ErrorCode::InternalError,
+                        "J2 deopt: remat klass token out of range " +
+                            std::to_string(rm.klass_token));
+                }
+                auto* k = static_cast<Klass*>(
+                    bindings.klass_addr_table[rm.klass_token]);
+                auto obj = heap->allocate_object(k, rm.field_count);
+                if (!obj) {
+                    return support::fail(support::ErrorCode::OutOfMemory,
+                                         "J2 deopt: remat allocation failed");
+                }
+                for (size_t i = 0; i < rm.field_slots.size(); ++i) {
+                    if (rm.field_keys[i] >= rm.field_count) {
+                        return support::fail(
+                            support::ErrorCode::InternalError,
+                            "J2 deopt: remat field slot out of range");
+                    }
+                    (*obj)->field(rm.field_keys[i]) =
+                        rm.field_slots[i] ==
+                                DeoptFrame::RematEntry::kConstSlot
+                            ? TaggedValue::from_raw(rm.const_words[i])
+                            : c.window[fr.vreg_base + rm.field_slots[i]];
+                }
+                c.window[rm.slot] = TaggedValue::heap_pointer(*obj);
+            }
             const TaggedValue* vregs = c.window.data() + fr.vreg_base;
             auto run = interp.resume(
                 *static_cast<ugb::UGBModule*>(const_cast<void*>(

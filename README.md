@@ -167,13 +167,15 @@ are `PERF_PERMIT`-granted and registered.
   surface (POLY_* opcodes, per-language vtables, tier progression)
 - `docs/xlea.md` — Cross-Language Escape Analysis: merged-graph EA,
   speculative scalar replacement, escape summaries, guard rules G1-G5
-- `docs/cem26.md` — scope, cost-block conventions, layout audits, the live
-  PERF_PERMIT register and the validation plan.
+- CEP&CC 0.1 (github.com/axiomzero0/CEP-CC) — the backbone standard
+  (cycle-exact performance + clean code); `tools/lint/cep_lint.sh` runs
+  its `cep_lint` tool against this tree, and `.cep/` carries the
+  adoption baseline and the dated waiver for the ongoing migration.
 - `include/vortex/support/cem.hpp` + `include/vortex/ugb/encoding.hpp` —
   the semantic-domain constant registries (magic-number ban, section 2).
 - `tools/lint/compliance.sh` — mechanical CEM-26 subset: no seq_cst in hot
   trees (s14), no mutexes (s7/14), `@hot` files must carry cost blocks
-  (s3/4), permits must be registered (s17).
+  (s3/4), permits must be registered against the embedded register (s17).
 
 Build with compliance checks:
 

@@ -47,8 +47,10 @@ check 69 "no shared_ptr/function in hot trees" 'std::shared_ptr|std::function' \
     "$ROOT/include/vortex/ir" "$ROOT/src/ir" "$ROOT/include/vortex/vm" "$ROOT/src/vm"
 
 # ---- CEM-26 Rev 1.1 (Cycle-Exact Maintainable C++26) -------------------------
-# Mechanical subset of the standard; the full contract/review process is
-# documented in docs/cem26.md. Hot trees = vm, ir, gc, runtime.
+# Mechanical subset of the standard; the backbone standard is now CEP&CC 0.1
+# (github.com/axiomzero0/CEP-CC, enforced by tools/lint/cep_lint.sh) and the
+# PERF_PERMIT register is embedded below (s17 check). Hot trees = vm, ir,
+# gc, runtime.
 
 cem_fail=0
 
@@ -99,21 +101,38 @@ if [ "$cem_fail" -eq 0 ]; then
 fi
 
 # CEM-26 sections 4/17: every PERF_PERMIT site must carry a registered ID
-# (PERF-00N) and every ID must exist in the docs/cem26.md register.
+# (PERF-00N). The register lives HERE, where it is enforced (Law 8: no
+# stale documentation): docs/cem26.md was removed upstream when the
+# CEP&CC standard (github.com/axiomzero0/CEP-CC) became the backbone —
+# the permit register is the one CEM-26 artifact the toolchain still
+# consumes, so it is embedded below with its justifications. Adding a
+# permit = adding its entry here AND a waiver note under .cep/waivers/
+# (CEP&CC 34: waivers carry an owner and an expiration).
+permit_register() {
+    cat <<'EOF'
+PERF-001: computed-goto threaded dispatch (execute, src/vm/interpreter.cpp)
+PERF-002: CALL_BUILTIN host-function pointer (src/vm/interpreter.cpp)
+PERF-003: SAFEPOINT_POLL hook pointer (src/vm/interpreter.cpp)
+PERF-004: per-instruction bigram probe (record_bigram, src/vm/interpreter.cpp)
+PERF-005: mprotect pair per patch session (PatchArena, src/infra/patch_arena.cpp; LdptManager::patch_session, src/runtime/ldpt.cpp)
+PERF-006: allocation on the compile/bind path (make_j1_bindings, src/j1/baseline_jit.cpp)
+PERF-007: LDPT resolver cold path (resolve_miss, src/runtime/ldpt.cpp)
+EOF
+}
 permit_ids=$(grep -rhoE 'PERF-[0-9]+' "$ROOT/src" "$ROOT/include" 2>/dev/null | sort -u)
 if [ -n "$permit_ids" ]; then
     unregistered=""
     for id in $permit_ids; do
-        if ! grep -q "$id" "$ROOT/docs/cem26.md" 2>/dev/null; then
+        if ! permit_register | grep -q "^$id:"; then
             unregistered="$unregistered $id"
         fi
     done
     if [ -n "$unregistered" ]; then
-        echo "VIOLATION CEM-26 s17: PERF_PERMIT ID(s) not registered in docs/cem26.md:$unregistered"
+        echo "VIOLATION CEM-26 s17: PERF_PERMIT ID(s) not registered in the embedded register:$unregistered"
         cem_fail=1
     else
         n=$(echo "$permit_ids" | wc -l | tr -d ' ')
-        echo "ok       CEM-26 s17: all $n PERF_PERMIT ID(s) registered in docs/cem26.md"
+        echo "ok       CEM-26 s17: all $n PERF_PERMIT ID(s) registered (embedded register)"
     fi
 else
     echo "ok       CEM-26 s17: no PERF_PERMIT sites in code"

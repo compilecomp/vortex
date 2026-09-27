@@ -21,6 +21,13 @@ enum class ErrorCode : uint8_t {
     InvalidArgument,
     OutOfMemory,
     InternalError,
+    // M3 additions (appended: existing ordinals are serialized in deopt
+    // records and golden tests — never reorder).
+    TypeError,
+    Unsupported,
+    // A mutation is legal only before dependent state exists (e.g. an
+    // interop port-kind rebind after JIT code speculated on the binding).
+    InvalidState,
 };
 
 const char* error_code_name(ErrorCode code) noexcept;

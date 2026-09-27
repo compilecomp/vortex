@@ -60,21 +60,33 @@ class CiogOverlay {
 public:
     explicit CiogOverlay(Graph& graph) noexcept : graph_(graph) {}
 
-    // Contract stubs (docs/roadmap.md, M3): construction + maintenance.
+    // M3 construction contracts (docs/ir-son-ciog.md 2.x): one CallNode per
+    // call site (idempotent by site id), one InlineSite per spliced body
+    // (keyed by its FrameState; context keys assigned in discovery order),
+    // one OutlineRegion per deopt region (ids from a deterministic counter).
     support::Result<uint32_t> record_call(uint32_t call_site_id,
                                           uint32_t bytecode_pc);
     support::Result<uint32_t> build_inline_site(uint32_t call_node,
-                                                uint32_t callee_method);
+                                                uint32_t deopt_continuation);
     support::Result<uint32_t> extract_outline(uint32_t entry_node,
                                               OutlineKind kind);
 
     std::span<const CallNode> calls() const noexcept { return calls_; }
+    std::span<const InlineSite> inline_sites() const noexcept {
+        return inline_sites_;
+    }
+    std::span<const OutlineRegion> outlines() const noexcept {
+        return outlines_;
+    }
+    uint32_t next_context_key() const noexcept { return next_context_key_; }
 
 private:
     Graph& graph_;
     std::vector<CallNode> calls_;
     std::vector<InlineSite> inline_sites_;
     std::vector<OutlineRegion> outlines_;
+    uint32_t next_context_key_ = 1;
+    uint32_t next_region_id_ = 1;
 };
 
 }  // namespace vortex::ir

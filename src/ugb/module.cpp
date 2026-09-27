@@ -20,12 +20,25 @@ const char* capability_name(Capability c) noexcept {
     case Capability::FFI: return "ffi";
     case Capability::Extensions: return "extensions";
     case Capability::Debug: return "debug";
+    case Capability::InteropMessages: return "interop_messages";
     default: return "unknown";
     }
 }
 
 bool is_valid_capability(uint8_t raw) noexcept {
     return raw < static_cast<uint8_t>(Capability::_COUNT);
+}
+
+bool capability_from_name(const std::string& name,
+                          uint8_t& ordinal) noexcept {
+    for (uint8_t raw = 0; raw < static_cast<uint8_t>(Capability::_COUNT);
+         ++raw) {
+        if (name == capability_name(static_cast<Capability>(raw))) {
+            ordinal = raw;
+            return true;
+        }
+    }
+    return false;
 }
 
 CapabilitySet engine_advertised_capabilities() noexcept {
@@ -41,6 +54,10 @@ CapabilitySet engine_advertised_capabilities() noexcept {
     caps.add(Capability::BuiltinCalls);
     caps.add(Capability::GuardedAccess);
     caps.add(Capability::Debug);
+    // M3: POLY_* executes through the interop registry when one is
+    // installed; a runtime without a registry safe-rejects the message at
+    // dispatch with a named error (Rule 3: never silent misexecution).
+    caps.add(Capability::InteropMessages);
     return caps;
 }
 
@@ -85,7 +102,7 @@ bool is_valid_extension_name(std::string_view name) noexcept {
 // PERF_OBSERVATION:
 // TARGET: Zen 5 / ARM Neoverse V2
 // VALIDATED: g++ 14.2, -O2 -fno-rtti
-// ACTUAL: PENDING microbench (M0) — see docs/cem26.md section 4
+// ACTUAL: PENDING microbench (M0) — see the validation plan tracked in docs/roadmap.md (M4 CEP&CC adoption)
 // LAST_VALIDATED: 2026-09-22
 const IcEntry* IcSlot::lookup(uint32_t klass_id) const noexcept {
     switch (state) {

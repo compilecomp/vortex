@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "vortex/gc/icggc.hpp"
+#include "vortex/runtime/interop.hpp"
 #include "vortex/runtime/tiering.hpp"
 #include "vortex/support/containers.hpp"
 #include "vortex/support/result.hpp"
@@ -154,6 +155,23 @@ public:
         safepoint_hook_user_ = user;
     }
 
+    /// Interop message registry (docs/interop-protocol.md): POLY_* dispatch
+    /// resolves receivers through it. Null = no interop runtime installed;
+    /// POLY_* then fails with a named error (never silent misexecution).
+    void set_interop_registry(
+        runtime::interop::InteropRegistry* registry) noexcept {
+        interop_registry_ = registry;
+    }
+
+    runtime::interop::InteropRegistry* interop_registry() const noexcept {
+        return interop_registry_;
+    }
+
+    /// Builds the per-module runtime (klass handles + token caches) on
+    /// demand. @cold. Public so host runtimes can bootstrap a module
+    /// BEFORE first execution — interop klass binding needs the handles.
+    Result<void> build_module_runtime(ugb::UGBModule& module);
+
 private:
     // Arithmetic slow-path result: distinct overflow vs type-error statuses
     // so guest-visible error messages are precise (Rule 110: numeric
@@ -201,13 +219,19 @@ private:
                           ugb::UGBModule& module, TaggedValue& out,
                           int32_t* resolved_slot = nullptr);
     bool set_field_cached(TaggedValue obj, TaggedValue value,
-                          uint32_t field_token, ugb::UGBModule& module);
+                          uint32_t field_token, ugb::UGBModule& module,
+                          int32_t* resolved_slot = nullptr);
 
     // Rule 3: capability negotiation at load time.
     Result<void> check_capabilities(const ugb::UGBModule& module) const;
 
+    // Rule 7/9: verify + negotiate ONCE per module, caching the verdict in
+    // ModuleRuntimeData::verified. Both bootstrap paths (run() and
+    // build_module_runtime) go through this — a ready-but-unverified
+    // module can never exist again.
+    Result<void> ensure_verified(ugb::UGBModule& module);
+
     // Builds klass handles + token->slot tables on first execution.
-    Result<void> build_module_runtime(ugb::UGBModule& module);
 
     // Dispatch-loop helpers.
     void record_backedge(ugb::UGBModule& module, ugb::UGBMethod& method,
@@ -258,6 +282,8 @@ private:
 
     void (*safepoint_hook_)(void*) = nullptr;
     void* safepoint_hook_user_ = nullptr;
+
+    runtime::interop::InteropRegistry* interop_registry_ = nullptr;
 
     uint32_t call_depth_ = 0;
 };

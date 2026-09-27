@@ -29,6 +29,17 @@ public:
                 std::initializer_list<uint16_t> srcs = {}, bool has_meta = false,
                 uint32_t meta = 0);
 
+    /// Declares a required capability for this method (Rule 3/7; the text
+    /// assembler's .requires directive routes here).
+    void require_capability(uint8_t ordinal) {
+        required_capabilities_.push_back(ordinal);
+    }
+
+  private:
+    std::vector<uint8_t> required_capabilities_;
+
+  public:
+
     // ---- convenience emitters ------------------------------------------------
     size_t const_i64(uint16_t dst, int64_t value);        // pool-interned
     size_t const_i32(uint16_t dst, int32_t value);        // immediate

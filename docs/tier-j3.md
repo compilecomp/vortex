@@ -113,5 +113,34 @@ J3 is the balanced high-performance tier: budgeted but aggressive, profile-direc
 speculation, PEA, vectorization, loop optimization, scheduling, barrier
 optimization.
 
-Status in this milestone: API complete (`include/vortex/j3/`), pipeline staged on
-the roadmap in three waves (scalar core -> inlining/CIOG -> loops/vector/peephole).
+Status in this milestone (M3): implemented as `compile_j3`/`publish_j3`/`run_j3`
+(`include/vortex/j3/`), executing on the shared J1 ABI + code range. The
+60-stage pipeline runs in three waves (j3/passes.hpp); every stage slot runs
+exactly once and reports Ran / Delegated / NotApplicable-with-reason:
+
+- **Ran (new in M3)**: 7 PSE (redundant-load elimination + store-to-load
+  forwarding), 10 range analysis (saturating interval lattice), 11/26/41/42
+  guard dominance elimination (klass/guard-shape propagation), 12 escape
+  analysis (merged graph), 16 scalar replacement (single-block, Rule-39
+  rematerialization), 19 deferred field init, 20 CIOG construction, 29
+  interprocedural escape summaries, 30 loop identification, 31 LICM
+- **Delegated**: 1-5, 8, 9, 21-23, 45-49, 53-60 (the J2 scalar-core stages and
+  the shared backend: regalloc, isel, scheduling, peephole, layout, metadata)
+- **NotApplicable (named reasons)**: 6 PRE (edge predication needs SSA
+  reconstruction — J4), 13/14/15 PEA/temporal/connection (J4; proven EA
+  covers the M3 non-escaping domain), 17 lock elision + 18 object slicing
+  (no monitors/narrowing in the M0 guest ISA), 24/25 static/cross-function
+  devirtualization (J4 dispatch-model work), 27/28 polyvariant/context-
+  sensitive (context cloning is J4), 32/33/34/35/37 loop rewrites (loop-closed
+  SSA update machinery is J4), 38/39/40 vectorization/SLP (no SIMD opcodes in
+  the M0 guest ISA), 43/44/46 guard motion (FrameState re-derivation at the
+  target point is J4), 51 barrier hoisting (single-store sites), 52 barrier
+  elimination (own spec queued next — docs/xlea.md section 7 RBE)
+
+XLEA in this tier is the PROVEN form: after inlining, a wrapper allocated,
+field-stored, field-read and identity-guarded within one block does not
+escape and is scalar-replaced; its deopt records carry rematerialization
+descriptors (klass token + field sources) so T0 resumes state-exactly
+(Rule 39). The SPECULATIVE form (profile-licensed replacement with runtime
+G1-G5 guards) lands with J4's persistent-profile machinery (docs/xlea.md
+sections 3/5).

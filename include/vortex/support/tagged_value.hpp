@@ -23,6 +23,11 @@ namespace vortex {
 
 class HeapObject;
 
+/// Byte size of one tagged slot in objects, frames, and deopt windows
+/// (Rule 72: every raw field-offset computation names this — the byte
+/// offset of field slot i is sizeof(ObjectHeader) + i * kTaggedSlotBytes).
+inline constexpr int64_t kTaggedSlotBytes = 8;
+
 class TaggedValue {
 public:
     constexpr TaggedValue() noexcept : bits_(kUndefinedBits) {}

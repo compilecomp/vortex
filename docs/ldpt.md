@@ -68,7 +68,7 @@ tearing hazard. Vortex's M:N scheduler makes the protocol simple:
 4. **The W^X session** — `PatchArena::begin_session()` flips the arena
    RX→RW; the hole and OOL stub are patched; `end_session()` flips back.
    All writes of one escalation batch behind one flip pair
-   (PERF-005, docs/cem26.md).
+   (PERF-005, register in tools/lint/compliance.sh).
 5. **Resume** — the resolver tail-jmps to the resolved target. The next
    hit on this site executes native code directly: no interpreter, no IC
    lookup, no C++.

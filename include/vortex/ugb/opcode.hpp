@@ -179,12 +179,21 @@ enum class Op : uint16_t {
     // ---- 15a. interop messages (docs/interop-protocol.md section 5) ---------------
     // Hot interop messages hold dedicated opcodes so the tiers can
     // devirtualize and inline them; the generic send is the fallback.
-    // Loader law: the module's capability mask must carry the matching
-    // CAP_INTEROP_* bit (runtime/interop.hpp) or the load is rejected.
-    POLY_EXECUTE,  // dst(result), arg_base, argc; meta = language/member ctx
-    POLY_READ,     // dst, recv, member_idx
-    POLY_WRITE,    // recv, member_idx, value
-    POLY_SEND,     // dst, msg_id, recv, arg_base (cold/generic fallback)
+    // Loader law: the method must declare the interop_messages capability
+    // AND the module capability_mask must carry the matching CAP_INTEROP_*
+    // group bits (runtime/interop.hpp) or the load is rejected.
+    // Locked operand contract (mirrored in the verifier + the text
+    // assembler + the T0 handlers — changing any side requires all three):
+    //   POLY_EXECUTE dst, recv, arg_base, argc   (srcs = recv, arg_base, argc)
+    //   POLY_READ    dst, recv, member_idx       (srcs = recv; meta = member idx)
+    //   POLY_WRITE   recv, value, member_idx     (srcs = recv, value; meta = idx)
+    //   POLY_SEND    dst, msg_id, recv, arg_base, argc
+    //                                            (srcs = recv, arg_base, argc;
+    //                                             meta = msg id)
+    POLY_EXECUTE,
+    POLY_READ,
+    POLY_WRITE,
+    POLY_SEND,
 
     // ---- 16. debug -------------------------------------------------------------------
     DEBUG_SRCPOS,  // meta = line number
@@ -216,7 +225,18 @@ bool is_speculative(Op op) noexcept;
 Op canonical_form(Op op) noexcept;
 
 constexpr bool is_interop_call(Op op) noexcept {
+    // The call-shaped interop messages (window ABI like CALL); used by the
+    // verifier's window discipline and the T0 runtime window check.
     return op == Op::POLY_EXECUTE || op == Op::POLY_SEND;
+}
+
+/// True if `op` is any of the four dedicated interop message opcodes
+/// (docs/interop-protocol.md section 5). Deliberately NOT enum adjacency:
+/// the loader's group detection must survive opcode additions between the
+/// POLY block and its neighbors.
+constexpr bool is_interop_message(Op op) noexcept {
+    return op == Op::POLY_EXECUTE || op == Op::POLY_READ ||
+           op == Op::POLY_WRITE || op == Op::POLY_SEND;
 }
 
 constexpr bool is_branch(Op op) noexcept {

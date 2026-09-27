@@ -23,7 +23,7 @@
 //                     LAST_VALIDATED)
 //   PERF_NOTE:        justification for a known theoretical regression
 //   PERF_PERMIT:      documented exception (REASON/COST/OWNER), see
-//                     docs/cem26.md for the live register
+//                     tools/lint/compliance.sh for the live register
 #pragma once
 
 #include <cstddef>

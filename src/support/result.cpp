@@ -14,6 +14,9 @@ const char* error_code_name(ErrorCode code) noexcept {
     case ErrorCode::InvalidArgument: return "InvalidArgument";
     case ErrorCode::OutOfMemory: return "OutOfMemory";
     case ErrorCode::InternalError: return "InternalError";
+    case ErrorCode::TypeError: return "TypeError";
+    case ErrorCode::Unsupported: return "Unsupported";
+    case ErrorCode::InvalidState: return "InvalidState";
     }
     return "?";
 }

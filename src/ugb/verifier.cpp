@@ -3,6 +3,12 @@
 #include <set>
 #include <sstream>
 
+#include "vortex/runtime/interop.hpp"  // loader law: POLY_* -> CAP_INTEROP_*
+
+using vortex::runtime::interop::CAP_INTEROP_EXECUTE;
+using vortex::runtime::interop::CAP_INTEROP_MEMBERS;
+using vortex::runtime::interop::capability_of;
+
 namespace vortex::ugb {
 
 namespace {
@@ -23,6 +29,15 @@ struct Shape {
 Shape shape_of(Op op) {
     using S = Op;
     switch (op) {
+    case S::POLY_EXECUTE:  // dst = result; srcs = (recv, arg_base, argc)
+        return {3, 3, false};
+    case S::POLY_READ:     // dst = result; srcs = (recv); meta = member_idx
+        return {1, 1, true};
+    case S::POLY_WRITE:    // srcs = (recv, value); meta = member_idx
+        return {2, 2, true};
+    case S::POLY_SEND:     // dst = result; srcs = (recv, arg_base, argc);
+                           // meta = msg_id
+        return {3, 3, true};
     case S::CONST_NULL: case S::CONST_UNDEFINED: case S::CONST_FALSE:
     case S::CONST_TRUE:
         return {0, 0, false};
@@ -172,8 +187,27 @@ Result<void> verify_method(const UGBModule& module, const UGBMethod& method) {
                 }
             }
         } else {
-            for (uint16_t r : ins.srcs) {
-                if (r >= method.register_count) {
+            // Interop message windows: POLY_EXECUTE/POLY_SEND carry a call
+            // window (recv, arg_base, argc) — same bounds discipline as
+            // calls, but the callee is a language port, not a method token.
+            if (is_interop_call(ins.opcode)) {
+                const uint32_t base = ins.srcs[1];
+                const uint32_t argc = ins.srcs[2];
+                if (ins.srcs[0] >= method.register_count ||
+                    base + argc > method.register_count) {
+                    return support::fail(
+                        support::ErrorCode::VerifyError,
+                        ctx(method, offset,
+                            "interop argument window out of range"));
+                }
+            }
+            for (size_t si = 0; si < ins.srcs.size(); ++si) {
+                // The argc slot of the interop calls rides a COUNT in a src
+                // slot (the locked contract in opcode.hpp) — the window
+                // check above is its bounds discipline; the register range
+                // check does not apply (a full-frame window is legal).
+                if (si == 2 && is_interop_call(ins.opcode)) continue;
+                if (ins.srcs[si] >= method.register_count) {
                     return support::fail(support::ErrorCode::VerifyError,
                                          ctx(method, offset, "source register out of range"));
                 }
@@ -277,6 +311,64 @@ Result<void> verify_module(const UGBModule& module) {
                     "verify: method '" + m.name + "' requires unknown "
                     "capability id " + std::to_string(raw));
             }
+        }
+    }
+    // Interop loader law (docs/interop-protocol.md section 3): a method that
+    // emits POLY_* must declare Capability::InteropMessages, and the module
+    // capability_mask must carry the runtime group bits for every message
+    // group it uses. Negotiation happens at load — a missing bit is a load-
+    // time rejection, never a runtime surprise.
+    for (const UGBMethod& m : module.method_table) {
+        uint32_t needed_groups = 0;
+        size_t offset = 0;
+        InstructionStream stream(m.code.data(), m.code.size());
+        Instruction ins_probe;
+        bool uses_interop = false;
+        while (stream.decode_at(offset, ins_probe)) {
+            if (is_interop_message(ins_probe.opcode)) {
+                uses_interop = true;
+                if (ins_probe.opcode == Op::POLY_READ ||
+                    ins_probe.opcode == Op::POLY_WRITE) {
+                    needed_groups |= CAP_INTEROP_MEMBERS;
+                } else if (ins_probe.opcode == Op::POLY_EXECUTE) {
+                    needed_groups |= CAP_INTEROP_EXECUTE;
+                } else {
+                    const auto group = capability_of(
+                        static_cast<uint16_t>(ins_probe.meta));
+                    if (group == 0) {
+                        return support::fail(
+                            support::ErrorCode::VerifyError,
+                            "verify: method '" + m.name +
+                                "' sends unknown interop message id " +
+                                std::to_string(ins_probe.meta));
+                    }
+                    needed_groups |= group;
+                }
+            }
+        }
+        if (!uses_interop) continue;
+        bool declares = false;
+        for (uint8_t raw : m.required_capabilities) {
+            if (raw == static_cast<uint8_t>(Capability::InteropMessages)) {
+                declares = true;
+                break;
+            }
+        }
+        if (!declares) {
+            return support::fail(
+                support::ErrorCode::VerifyError,
+                "verify: method '" + m.name +
+                    "' emits interop messages without declaring the "
+                    "interop_messages capability");
+        }
+        if ((module.capability_mask & needed_groups) != needed_groups) {
+            return support::fail(
+                support::ErrorCode::VerifyError,
+                "verify: module emits interop message groups 0x" +
+                    std::to_string(needed_groups) +
+                    " missing from the capability mask 0x" +
+                    std::to_string(module.capability_mask) + " (method '" +
+                    m.name + "')");
         }
     }
     for (const ExtensionRef& e : module.extensions) {

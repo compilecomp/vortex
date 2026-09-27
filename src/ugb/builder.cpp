@@ -118,6 +118,7 @@ Result<void> MethodBuilder::finish() {
         p[3] = static_cast<uint8_t>((target >> 24) & 0xFF);
     }
     method_.code = std::move(code_);
+    method_.required_capabilities = std::move(required_capabilities_);
     module_.method_table.push_back(std::move(method_));
     return support::ok();
 }
@@ -363,6 +364,17 @@ Result<UGBModule> assemble_module(std::string_view source) {
             module.intern_builtin(cur.expect_word("a builtin name"));
             continue;
         }
+        if (head.text == ".interop_mask") {
+            if (in_method) {
+                err.fail(head.line,
+                         ".interop_mask is a module-level directive");
+                continue;
+            }
+            cur.next();
+            module.capability_mask = static_cast<uint32_t>(
+                parse_int(cur.next(), err));
+            continue;
+        }
         if (head.text == ".method") {
             if (in_method) err.fail(head.line, "nested .method");
             if (err.failed) break;
@@ -409,6 +421,24 @@ Result<UGBModule> assemble_module(std::string_view source) {
             builder->bind_label(head.text);
             cur.pos += 2;
             if (cur.eof()) continue;
+        }
+
+        // Method-body directives (declarations inside .method blocks).
+        if (head.text == ".requires") {
+            if (!in_method || !builder) {
+                err.fail(head.line, ".requires outside .method");
+                continue;
+            }
+            cur.next();
+            const std::string cap = cur.expect_word("a capability name");
+            if (err.failed) break;
+            uint8_t ordinal = 0;
+            if (!capability_from_name(cap, ordinal)) {
+                err.fail(head.line, "unknown capability '" + cap + "'");
+                break;
+            }
+            builder->require_capability(ordinal);
+            continue;
         }
 
         // Instruction.
@@ -623,6 +653,42 @@ Result<UGBModule> assemble_module(std::string_view source) {
             need(2);
             if (!err.failed) {
                 off = builder->emit(op, reg(0), {reg(1)}, true,
+                                    static_cast<uint32_t>(parse_int(ops[1], err)));
+            }
+            break;
+        case Op::POLY_EXECUTE:
+            // poly_execute dst, recv, arg_base, argc
+            need(4);
+            if (!err.failed) {
+                off = builder->emit(op, reg(0),
+                                    {reg(1), reg(2),
+                                     static_cast<uint16_t>(parse_int(ops[3], err))});
+            }
+            break;
+        case Op::POLY_READ:
+            // poly_read dst, recv, member_idx  (member_idx = immediate token)
+            need(3);
+            if (!err.failed) {
+                off = builder->emit(op, reg(0), {reg(1)}, true,
+                                    static_cast<uint32_t>(parse_int(ops[2], err)));
+            }
+            break;
+        case Op::POLY_WRITE:
+            // poly_write recv, value, member_idx
+            need(3);
+            if (!err.failed) {
+                off = builder->emit(op, 0xFFFF, {reg(0), reg(1)}, true,
+                                    static_cast<uint32_t>(parse_int(ops[2], err)));
+            }
+            break;
+        case Op::POLY_SEND:
+            // poly_send dst, msg_id, recv, arg_base, argc
+            need(5);
+            if (!err.failed) {
+                off = builder->emit(op, reg(0),
+                                    {reg(2), reg(3),
+                                     static_cast<uint16_t>(parse_int(ops[4], err))},
+                                    true,
                                     static_cast<uint32_t>(parse_int(ops[1], err)));
             }
             break;

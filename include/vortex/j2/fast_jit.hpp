@@ -19,9 +19,12 @@
 
 #include "vortex/infra/code_range.hpp"
 #include "vortex/infra/security.hpp"
+#include "vortex/deopt/rbpd.hpp"
+#include "vortex/ir/escape_summary.hpp"
 #include "vortex/j1/context.hpp"
 #include "vortex/j1/baseline_jit.hpp"  // J1Bindings (shared runtime binding)
 #include "vortex/j2/passes.hpp"        // PipelineStats (Rule 120 telemetry)
+#include "vortex/runtime/interop.hpp"  // POLY_* lowering license
 #include "vortex/support/result.hpp"
 #include "vortex/ugb/module.hpp"
 
@@ -45,6 +48,9 @@ struct J2Job {
     /// Bitmask of DISABLED passes (Rule 59/131): bit i set = pass i off.
     /// 0 = every pass enabled. Bits follow the PassControl enum.
     uint64_t pass_kill_switches = 0;
+    /// The interop registry (docs/interop-protocol.md): the POLY_* lowering
+    /// license source. Null = POLY_* stays T0-only (named refusal).
+    const runtime::interop::InteropRegistry* interop = nullptr;
 };
 
 /// One deopt frame of one guard record (Rule 42: complete FrameState).
@@ -54,12 +60,40 @@ struct DeoptFrame {
     uint32_t inject_dst = 0xFFFFFFFFu;  // call continuation register
     uint32_t vreg_base = 0;   // index into the window capture
     uint32_t vreg_count = 0;
+    /// Rematerialization descriptors for scalar-replaced allocations in
+    /// this frame (XLEA phase 2 deopt contract, docs/xlea.md section 2):
+    /// the runtime rebuilds each object from the window's field values
+    /// before resuming T0 — state-exact (Rule 39). The serialized
+    /// deopt_records blob (replay/inspection) does not carry remats; the
+    /// live structs the stubs reference do.
+    struct RematEntry {
+        uint32_t slot = 0;        // window slot carrying the undefined word
+        uint32_t klass_token = 0;
+        uint32_t field_count = 0;
+        /// Field sources, parallel: window slots of live field values, or
+        /// kConstSlot (UINT32_MAX) with the word embedded in const_words
+        /// (constants rematerialize without a window slot).
+        static constexpr uint32_t kConstSlot = 0xFFFFFFFFu;
+        /// Parallel to field_slots/const_words: the klass FIELD SLOT each
+        /// entry writes (positional fills would swap fields when the store
+        /// order differs from slot order).
+        std::vector<uint32_t> field_keys;
+        std::vector<uint32_t> field_slots;
+        std::vector<uint64_t> const_words;
+    };
+    std::vector<RematEntry> remats;
 };
 
 /// One guard's deopt metadata. Owned by the J2Code the emitted stubs point
 /// into (stable addresses — the stubs embed them as immediates).
 struct DeoptRecord {
     std::vector<DeoptFrame> frames;  // innermost first
+    /// RBPD identity: region_id == the index of this record's region in the
+    /// compiled method's RegionTable; suspension marks poll-fired records
+    /// (accounted as suspension events, not guard failures — Rule 43 counts
+    /// them separately).
+    uint32_t region_id = 0;
+    bool suspension = false;
 };
 
 /// Codegen artifact: code + compact metadata (J1-shape contracts).
@@ -83,6 +117,15 @@ struct J2Code {
     std::vector<uint32_t> osr_pcs;
     std::vector<uint8_t> gc_maps;
     std::vector<uint8_t> deopt_records;
+    /// RBPD region table (docs/deopt-rbpd.md section 1): one region per
+    /// deopt record — every trap site aligns with a region boundary (the
+    /// hard invariant). Failure counters live here at runtime.
+    deopt::RegionTable regions;
+    /// Stage-29 output (J3): the escape summary of the compiled body,
+    /// bound to the post-pipeline graph hash (docs/xlea.md section 4.1).
+    /// J2 leaves has_summary = false.
+    ir::EscapeSummary summary;
+    bool has_summary = false;
     /// Live deopt records — the emitted stubs embed addresses INTO this
     /// vector, so it is shared (never copied) from compilation through
     /// publication. Stable addresses: reserved once, filled once.
@@ -101,6 +144,8 @@ struct J2Executable {
     J1OsrFn osr_entry = nullptr;
     uint32_t method_id = 0;
     std::shared_ptr<const std::vector<DeoptRecord>> records;
+    /// Mutable: the runtime advances failure counters on it (Rule 43).
+    std::shared_ptr<deopt::RegionTable> regions;
 };
 
 /// Compiles one method through the full J2 pipeline. Refusal (unsupported
@@ -111,6 +156,15 @@ struct J2Executable {
 void set_j2_trace(bool enabled) noexcept;
 
 support::Result<J2Code> compile_j2(const J2Job& job);
+
+/// Shared optimizing backend (J2 and J3): dominance placement, profile
+/// layout, the emission plan, linear scan, instruction selection and
+/// emission. `built` must have completed its tier's pass pipeline; `stats`
+/// rides into J2Code for telemetry (Rule 120). The region table is built
+/// under `tier` (the RBPD descriptors name their owning tier).
+support::Result<J2Code> emit_optimized(const J2Job& job, BuiltGraph& built,
+                                       const PipelineStats& stats,
+                                       Tier tier = Tier::J2);
 
 /// W^X publication (the shared code range keeps J2 code within rel32 of the
 /// LDPT arenas and the tier stack).

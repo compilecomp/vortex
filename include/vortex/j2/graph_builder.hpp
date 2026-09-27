@@ -21,6 +21,7 @@
 
 #include "vortex/ir/son_graph.hpp"
 #include "vortex/ir/value_types.hpp"
+#include "vortex/runtime/interop.hpp"
 #include "vortex/support/arena.hpp"
 #include "vortex/support/result.hpp"
 #include "vortex/ugb/module.hpp"
@@ -99,9 +100,33 @@ struct BuiltGraph {
         uint32_t return_pc = 0;                // pc after the call
     };
     std::unordered_map<uint32_t, InlineCallerInfo> inline_caller_frame;
+    /// The interop license source the builder used (inlined callee builds
+    /// must run under the SAME license — POLY_* lowering consistency).
+    const runtime::interop::InteropRegistry* interop = nullptr;
     uint32_t inlined_sites = 0;
     uint32_t argc = 0;
     uint32_t method_id = 0;
+    /// Scalar-replacement metadata (XLEA phase 2, docs/xlea.md section 2):
+    /// a killed allocation's per-field SSA values, keyed by the access key
+    /// the loads/stores used (RawOffset byte offset or Field token). The
+    /// backend's deopt-record builder turns this into rematerialization
+    /// descriptors so a deopt while the object is "scalar" rebuilds it
+    /// exactly (Rule 39 — the T0 state is observationally identical).
+    struct ScalarReplacement {
+        struct Field {
+            int64_t key = 0;              // normalized access key
+            ir::NodeId value = ir::kNoNode;
+            uint32_t slot = 0;            // klass field-slot index
+        };
+        uint32_t klass_token = 0;
+        uint32_t field_count = 0;         // Klass::field_count() at pass time
+        ir::NodeId undef_id = ir::kNoNode;  // the injected FS placeholder —
+                                            // build_deopt_records keys the
+                                            // lookup on it (the FS no longer
+                                            // references the alloc id)
+        std::vector<Field> fields;        // sorted by slot ascending
+    };
+    std::unordered_map<ir::NodeId, ScalarReplacement> scalar_replacements;
 };
 
 /// Builder diagnostics: why construction refused the method (Rule 76 — no
@@ -126,6 +151,11 @@ struct GraphBuilderParams {
     /// no speculation material, passes stay conservative).
     const std::vector<ugb::IcSlot>* ics = nullptr;
     const std::vector<void*>* klass_addrs = nullptr;
+    /// The interop registry (docs/interop-protocol.md): the speculation
+    /// license source for POLY_* lowering. Null or missing profile material
+    /// -> the builder refuses POLY_* and the method stays on T0, whose
+    /// generic dispatch is always correct (Rules 3/30/76).
+    const runtime::interop::InteropRegistry* interop = nullptr;
     /// Node cap (Budget::node_cap). Construction refuses (BudgetExceeded)
     /// beyond it — J2 must never become a large compile.
     size_t node_cap = 20'000;

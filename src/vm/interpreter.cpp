@@ -127,7 +127,7 @@ static_assert(std::is_trivially_copyable_v<Decoded>,
 // TARGET: Zen 5 / ARM Neoverse V2
 // VALIDATED: g++ 14.2, -O2 -fno-rtti
 // ACTUAL: PENDING microbench (M0); source cost above is the contract of
-//         record — see docs/cem26.md section 4 validation plan
+//         record — see the validation plan tracked in docs/roadmap.md (M4 CEP&CC adoption)
 // LAST_VALIDATED: 2026-09-22
 inline bool decode_fast(const uint8_t* code, size_t size, size_t pc,
                         Decoded& d) noexcept {
@@ -222,6 +222,13 @@ Result<void> Interpreter::build_module_runtime(ugb::UGBModule& module) {
     ugb::ModuleRuntimeData& rt = module.runtime;
     if (rt.ready) return ok();
 
+    // Rule 7/9: NO bootstrap path skips verification. The JIT tier-up
+    // sequence (build_module_runtime -> make_j1_bindings) calls this
+    // directly, so the verify+capability gate lives HERE, not only in
+    // run().
+    auto v = ensure_verified(module);
+    if (!v) return std::unexpected(v.error());
+
     // Class tokens -> klass handles. Klass layouts are built from the
     // module's DECLARED field tokens (owner class known from "Class.field"
     // refs) so NEW_OBJECT allocates the full field array up front. Tokens
@@ -296,6 +303,22 @@ Result<void> Interpreter::check_capabilities(const ugb::UGBModule& module) const
     return ok();
 }
 
+// Rule 7/9: the verification verdict is cached ONCE per module. Both
+// bootstrap paths funnel through here, so a module that reaches table
+// build or execution always carries a verdict (the M3 review proved the
+// ready-flag-only shape was a load-gate bypass: build_module_runtime set
+// `ready` without verifying, and the JIT bootstrap sequence then executed
+// unverified POLY_* code).
+Result<void> Interpreter::ensure_verified(ugb::UGBModule& module) {
+    if (module.runtime.verified) return ok();
+    auto verified = ugb::verify_module(module);
+    if (!verified) return std::unexpected(verified.error());
+    auto caps = check_capabilities(module);
+    if (!caps) return std::unexpected(caps.error());
+    module.runtime.verified = true;
+    return ok();
+}
+
 // ---------------------------------------------------------------------------
 // Generic (canonical) slow paths — the ADD_ANY-style fallbacks the spec
 // describes as "handle all cases but are slower". Numeric semantics are
@@ -321,7 +344,7 @@ Result<void> Interpreter::check_capabilities(const ugb::UGBModule& module) const
 // TARGET: Zen 5 / ARM Neoverse V2
 // VALIDATED: g++ 14.2, -O2 -fno-rtti
 // ACTUAL: PENDING microbench (M0); smi path emits lea + 2 test/jcc + jo —
-//         see docs/cem26.md section 4 validation plan
+//         see the validation plan tracked in docs/roadmap.md (M4 CEP&CC adoption)
 // LAST_VALIDATED: 2026-09-22
 Interpreter::ArithResult Interpreter::generic_add(TaggedValue a,
                                                   TaggedValue b) const noexcept {
@@ -382,7 +405,7 @@ Interpreter::ArithResult Interpreter::generic_mul(TaggedValue a,
 // TARGET: Zen 5 / ARM Neoverse V2
 // VALIDATED: g++ 14.2, -O2 -fno-rtti
 // ACTUAL: PENDING microbench (M0); inlined call sites emit one setcc per
-//         comparison — see docs/cem26.md section 4
+//         comparison — see the validation plan tracked in docs/roadmap.md (M4 CEP&CC adoption)
 // LAST_VALIDATED: 2026-09-22
 Interpreter::ArithResult Interpreter::generic_compare(TaggedValue a,
                                                       TaggedValue b,
@@ -460,7 +483,9 @@ bool Interpreter::get_field_cached(TaggedValue obj, uint32_t field_token,
 //        keeps the card byte line-stable across neighboring stores)
 bool Interpreter::set_field_cached(TaggedValue obj, TaggedValue value,
                                    uint32_t field_token,
-                                   ugb::UGBModule& module) {
+                                   ugb::UGBModule& module,
+                                   int32_t* resolved_slot) {
+    if (resolved_slot != nullptr) *resolved_slot = kNoSlot;
     if (!obj.is_heap_object() || field_token >= module.fields.size()) return false;
     auto* o = obj.as_heap_object();
     auto* k = o->header.klass;
@@ -468,6 +493,7 @@ bool Interpreter::set_field_cached(TaggedValue obj, TaggedValue value,
     auto* objp = static_cast<Object*>(o);
     const uint64_t key = klass_token_key(k->id(), field_token);
     if (int32_t* slot = module.runtime.field_slot_cache.find(key)) {
+        if (resolved_slot != nullptr) *resolved_slot = *slot;
         store_field(&objp->field(static_cast<uint32_t>(*slot)), value);
         if (value.is_heap_object()) heap_.card_table().mark_dirty(o);
         return true;
@@ -475,6 +501,7 @@ bool Interpreter::set_field_cached(TaggedValue obj, TaggedValue value,
     const int idx = k->find_field(module.fields[field_token].name);
     if (idx < 0) return false;
     module.runtime.field_slot_cache.insert(key, idx);
+    if (resolved_slot != nullptr) *resolved_slot = idx;
     store_field(&objp->field(static_cast<uint32_t>(idx)), value);
     if (value.is_heap_object()) heap_.card_table().mark_dirty(o);
     return true;
@@ -530,7 +557,7 @@ void Interpreter::maybe_rewrite_to_generic(ugb::UGBMethod& m, size_t pc,
 // PERF_OBSERVATION:
 // TARGET: Zen 5 / ARM Neoverse V2
 // VALIDATED: g++ 14.2, -O2 -fno-rtti
-// ACTUAL: PENDING microbench (M0) — see docs/cem26.md section 4
+// ACTUAL: PENDING microbench (M0) — see the validation plan tracked in docs/roadmap.md (M4 CEP&CC adoption)
 // LAST_VALIDATED: 2026-09-22
 //
 // PERF_PERMIT PERF-004:
@@ -544,7 +571,7 @@ void Interpreter::maybe_rewrite_to_generic(ugb::UGBMethod& m, size_t pc,
 //       key space is bounded by the opcode alphabet (kOpcodeCount squared),
 //       so the table reaches steady state and stops allocating after
 //       warmup. Steady-state execution performs zero allocation.
-// OWNER: @vortex/rt (registered in docs/cem26.md section 5)
+// OWNER: @vortex/rt (registered in tools/lint/compliance.sh)
 void Interpreter::record_bigram(Op first, Op second) {
     // Bigram hotness feeds superstencil promotion in J1 (docs/tier-j1.md
     // section 3). Counted into the module-level flat table.
@@ -594,16 +621,11 @@ Result<RunResult> Interpreter::run(ugb::UGBModule& module, std::string_view entr
     ugb::UGBMethod& method = module.method_table[static_cast<size_t>(mid)];
 
     // Mandatory verification before execution (Rule 7). The artifact is
-    // untrusted (Rule 9); verification is deterministic, so a module whose
-    // bytecode is unchanged reuses the verdict on later run() calls.
+    // untrusted (Rule 9); the verdict is cached on the module, so a module
+    // whose bytecode is unchanged reuses it on later run() calls. All
+    // bootstrap paths (including the JIT one) gate inside
+    // build_module_runtime.
     if (!module.runtime.ready) {
-        auto verified = ugb::verify_module(module);
-        if (!verified) return std::unexpected(verified.error());
-
-        // Rule 3: negotiate capabilities before any execution.
-        auto caps = check_capabilities(module);
-        if (!caps) return std::unexpected(caps.error());
-
         auto built = build_module_runtime(module);
         if (!built) return std::unexpected(built.error());
     }
@@ -646,7 +668,7 @@ Result<RunResult> Interpreter::run(ugb::UGBModule& module, std::string_view entr
 // TARGET: Zen 5 / ARM Neoverse V2
 // VALIDATED: g++ 14.2, -O2 -fno-rtti
 // ACTUAL: PENDING microbench (M0); the source-cost budget above is the
-//         review baseline until the harness lands — see docs/cem26.md
+//         review baseline until the harness lands — see the validation plan tracked in docs/roadmap.md (M4 CEP&CC adoption)
 //         section 4 validation plan
 // LAST_VALIDATED: 2026-09-22
 //
@@ -658,7 +680,7 @@ Result<RunResult> Interpreter::run(ugb::UGBModule& module, std::string_view entr
 //         no stack traffic, no call/ret pair, handler bodies inline-sized.
 // COST: one indirect jump per instruction; alternation of hot opcodes is
 //       handled by the BTB, mispredict cost is bounded by handler size.
-// OWNER: @vortex/rt (ADR-002, docs/cem26.md section 5)
+// OWNER: @vortex/rt (ADR-002; register in tools/lint/compliance.sh)
 //
 // PERF_NOTE (memory orders): the dispatch table publication below uses
 // acquire/release only. seq_cst is deliberately avoided (CEM-26 section
@@ -861,6 +883,10 @@ Result<RunResult> Interpreter::execute_impl(ugb::UGBModule& module,
             MAP(Op::CALL_DIRECT, L(CALL_DIRECT));
             MAP(Op::CALL_VIRTUAL, L(CALL_VIRTUAL));
             MAP(Op::CALL_BUILTIN, L(CALL_BUILTIN));
+            MAP(Op::POLY_EXECUTE, L(POLY_EXECUTE));
+            MAP(Op::POLY_READ, L(POLY_READ));
+            MAP(Op::POLY_WRITE, L(POLY_WRITE));
+            MAP(Op::POLY_SEND, L(POLY_SEND));
             MAP(Op::NEW_OBJECT, L(NEW_OBJECT));
             MAP(Op::NEW_ARRAY, L(NEW_ARRAY));
             MAP(Op::GET_FIELD, L(GET_FIELD));
@@ -1477,7 +1503,7 @@ L_CALL_BUILTIN: {
     // COST: one indirect call per CALL_BUILTIN execution; branch target is
     //       stable per site (mono builtin resolution caches by token), so
     //       the BTB predicts it after first execution.
-    // OWNER: @vortex/rt (registered in docs/cem26.md section 5)
+    // OWNER: @vortex/rt (registered in tools/lint/compliance.sh)
     R[ins.dst] = b.fn(std::span<const TaggedValue>(&R[ins.s0], ins.s1), b.user);
     VORTEX_NEXT();
 }
@@ -1574,9 +1600,150 @@ L_GET_FIELD_SHAPE: {
 }
 L_SET_FIELD: {
     VORTEX_PROFILE();
-    if (!set_field_cached(R[ins.s0], R[ins.s1], ins.meta, module)) {
+    // IC feedback (symmetric with GetField, docs/tier-t0.md section 3):
+    // the (klass id -> slot) record is the specialization material the
+    // optimizing tiers need to rewrite stores to raw offsets.
+    const TaggedValue obj = R[ins.s0];
+    const uint32_t idx = instruction_index_at(method, pc);
+    if (obj.is_heap_object() &&
+        obj.as_heap_object()->header.klass != nullptr &&
+        idx != kInvalidInstructionIndex) {
+        // The IC entry's target is the RESOLVED FIELD SLOT (the layout
+        // identity every IC consumer reads) — never the module-wide field
+        // token. Recording the token made stage 16 emit raw stores at
+        // header+8*token: out-of-object offsets on every multi-class
+        // module (ASan-verified mis-store).
+        int32_t slot = kNoSlot;
+        if (set_field_cached(obj, R[ins.s1], ins.meta, module, &slot) &&
+            slot >= 0) {
+            method.ics[idx].record_hit(
+                obj.as_heap_object()->header.klass->id(),
+                static_cast<uint32_t>(slot));
+            VORTEX_NEXT();
+        }
         VORTEX_RT_ERROR("SetField: unresolved field or bad receiver");
     }
+    if (!set_field_cached(obj, R[ins.s1], ins.meta, module)) {
+        VORTEX_RT_ERROR("SetField: unresolved field or bad receiver");
+    }
+    VORTEX_NEXT();
+}
+
+// ---- interop messages (docs/interop-protocol.md sections 5-6) ----------------------
+// Dispatch resolves the receiver's language through its klass word, gates
+// on the language's capability bits, and calls the port's vtable slot.
+// Feedback: each site records (language id, member idx) into its IC slot —
+// the specialization material the optimizing tiers consume (docs section 6).
+// A null registry or missing slot is a named error, never silent (Rule 3).
+L_POLY_READ: {
+    VORTEX_PROFILE();
+    if (interop_registry_ == nullptr) {
+        VORTEX_RT_ERROR("Poly.Read: no interop registry installed");
+    }
+    const TaggedValue recv = R[ins.s0];
+    // Speculation license (docs/interop-protocol.md section 6): only a
+    // NativeObjects port's member_idx has provable field-slot semantics,
+    // so only those sites feed the IC slot the optimizing tiers read.
+    // Foreign-port sites stay IC-silent -> the tiers never speculate.
+    const uint32_t idx = instruction_index_at(method, pc);
+    if (recv.is_heap_object() &&
+        recv.as_heap_object()->header.klass != nullptr &&
+        interop_registry_->port_kind_of_klass(
+            recv.as_heap_object()->header.klass) ==
+            runtime::interop::PortKind::NativeObjects &&
+        idx != kInvalidInstructionIndex) {
+        method.ics[idx].record_hit(
+            recv.as_heap_object()->header.klass->id(), ins.meta);
+    }
+    auto r = runtime::interop::dispatch_read_member(*interop_registry_,
+                                                    recv, ins.meta);
+    if (!r) {
+        exit_result = std::unexpected(r.error());
+        goto L_done;
+    }
+    R[ins.dst] = *r;
+    VORTEX_NEXT();
+}
+L_POLY_WRITE: {
+    VORTEX_PROFILE();
+    if (interop_registry_ == nullptr) {
+        VORTEX_RT_ERROR("Poly.Write: no interop registry installed");
+    }
+    const TaggedValue recv = R[ins.s0];
+    const uint32_t idx = instruction_index_at(method, pc);
+    if (recv.is_heap_object() &&
+        recv.as_heap_object()->header.klass != nullptr &&
+        interop_registry_->port_kind_of_klass(
+            recv.as_heap_object()->header.klass) ==
+            runtime::interop::PortKind::NativeObjects &&
+        idx != kInvalidInstructionIndex) {
+        method.ics[idx].record_hit(
+            recv.as_heap_object()->header.klass->id(), ins.meta);
+    }
+    auto r = runtime::interop::dispatch_write_member(
+        *interop_registry_, recv, ins.meta, R[ins.s1]);
+    if (!r) {
+        exit_result = std::unexpected(r.error());
+        goto L_done;
+    }
+    VORTEX_NEXT();
+}
+L_POLY_EXECUTE: {
+    VORTEX_PROFILE();
+    if (interop_registry_ == nullptr) {
+        VORTEX_RT_ERROR("Poly.Execute: no interop registry installed");
+    }
+    // Call-window discipline, identical to the CALL family (Rule 9: the
+    // artifact is untrusted — the verifier check is mirrored here so a
+    // ready-but-unverified module can never read out of the frame).
+    const uint16_t arg_base = ins.s1;
+    const uint16_t argc = ins.s2;
+    if (static_cast<size_t>(arg_base) + argc > method.register_count) {
+        VORTEX_RT_ERROR("Poly.Execute: argument window out of range");
+    }
+    const uint32_t idx = instruction_index_at(method, pc);
+    const uint16_t lang = runtime::interop::receiver_language(
+        *interop_registry_, R[ins.s0]);
+    // Speculation license (docs/interop-protocol.md section 6): feedback
+    // is recorded ONLY for NativeObjects-port receivers — a Foreign port's
+    // language id gives the tiers no provable field/handler semantics.
+    if (lang != 0 && idx != kInvalidInstructionIndex &&
+        R[ins.s0].is_heap_object() &&
+        R[ins.s0].as_heap_object()->header.klass != nullptr &&
+        interop_registry_->port_kind_of_klass(
+            R[ins.s0].as_heap_object()->header.klass) ==
+            runtime::interop::PortKind::NativeObjects) {
+        method.ics[idx].record_hit(lang, 0);
+    }
+    auto r = runtime::interop::dispatch_execute(
+        *interop_registry_, R[ins.s0],
+        std::span<const TaggedValue>(&R[arg_base], argc));
+    if (!r) {
+        exit_result = std::unexpected(r.error());
+        goto L_done;
+    }
+    R[ins.dst] = *r;
+    VORTEX_NEXT();
+}
+L_POLY_SEND: {
+    VORTEX_PROFILE();
+    if (interop_registry_ == nullptr) {
+        VORTEX_RT_ERROR("Poly.Send: no interop registry installed");
+    }
+    // Call-window discipline, identical to the CALL family (Rule 9).
+    const uint16_t arg_base = ins.s1;
+    const uint16_t argc = ins.s2;
+    if (static_cast<size_t>(arg_base) + argc > method.register_count) {
+        VORTEX_RT_ERROR("Poly.Send: argument window out of range");
+    }
+    auto r = runtime::interop::dispatch_send(
+        *interop_registry_, static_cast<uint16_t>(ins.meta), R[ins.s0],
+        std::span<const TaggedValue>(&R[arg_base], argc));
+    if (!r) {
+        exit_result = std::unexpected(r.error());
+        goto L_done;
+    }
+    R[ins.dst] = *r;
     VORTEX_NEXT();
 }
 L_SET_FIELD_SHAPE: {
@@ -1682,7 +1849,7 @@ L_SAFEPOINT_POLL:
     //         and this site converts to it then.
     // COST: one null test + (rare) indirect call per SAFEPOINT_POLL
     //       execution; the null test is the common case in M0 (no hook).
-    // OWNER: @vortex/rt (registered in docs/cem26.md section 5; expiry M2)
+    // OWNER: @vortex/rt (registered in tools/lint/compliance.sh; expiry M2)
     if (safepoint_hook_ != nullptr) safepoint_hook_(safepoint_hook_user_);
     VORTEX_NEXT();
 L_NOP:
@@ -1815,7 +1982,7 @@ int32_t Interpreter::resolve_builtin(ugb::UGBModule& module, uint32_t token) con
 // PERF_OBSERVATION:
 // TARGET: Zen 5 / ARM Neoverse V2
 // VALIDATED: g++ 14.2, -O2 -fno-rtti
-// ACTUAL: PENDING microbench (M0) — see docs/cem26.md section 4
+// ACTUAL: PENDING microbench (M0) — see the validation plan tracked in docs/roadmap.md (M4 CEP&CC adoption)
 // LAST_VALIDATED: 2026-09-22
 bool Interpreter::as_double(TaggedValue v, double& out) const noexcept {
     if (!v.is_heap_object()) return false;

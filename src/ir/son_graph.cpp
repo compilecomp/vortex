@@ -55,13 +55,16 @@ NodeId Graph::add_const(int64_t value, NodeId control) {
 uint32_t Graph::eliminate_dead_nodes() {
     // Roots: Return and End (and nothing else — pure chains die by
     // unreachability, effectful chains die only when their effect is
-    // unobserved). Rule 51: reachability set is a sparse set; the worklist is
-    // a dense index vector.
+    // unobserved). EXCEPTION: Safepoint nodes are NEVER dead — a suspension
+    // point is semantically required regardless of dataflow liveness
+    // (Rule 81; removing one would let the method run un-poll-able forever).
     support::SparseSet live(static_cast<uint32_t>(nodes_.size()));
     std::vector<uint32_t> work;
     work.reserve(nodes_.size());
     for (const Node& n : nodes_) {
-        if ((n.kind == NodeKind::Return || n.kind == NodeKind::End) && !n.dead) {
+        if ((n.kind == NodeKind::Return || n.kind == NodeKind::End ||
+             n.kind == NodeKind::Safepoint) &&
+            !n.dead) {
             live.insert(n.id);
             work.push_back(n.id);
         }

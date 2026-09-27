@@ -52,6 +52,7 @@ public:
         out_.register_count = method_.register_count;
         out_.argc = method_.arg_count;
         out_.method_id = method_.id;
+        out_.interop = p_.interop;
         if (!scan()) return false;
         build_cfg();
         emit_blocks();
@@ -419,7 +420,11 @@ private:
     void lower(uint32_t idx) {
         const ugb::Instruction& ins = code_[idx].ins;
         const uint32_t pc = code_[idx].pc;
-        if (getenv("VORTEX_BUILDER_TRACE")) {
+        // Read ONCE per process (function-local static): getenv is a
+        // cold-path scan — never per instruction on the compile hot path
+        // (CEM-26 hot-path standard).
+        static const bool s_trace = getenv("VORTEX_BUILDER_TRACE") != nullptr;
+        if (s_trace) {
             fprintf(stderr, "[lower] idx=%u pc=%u op=%d dst=%u src0=%u\n",
                     idx, pc, (int)ins.opcode, ins.dst,
                     ins.srcs.empty() ? 0 : ins.srcs[0]);
@@ -702,8 +707,13 @@ private:
             fail(BuildError::UnsupportedOpcode, pc);
             break;
         case Op::SAFEPOINT_POLL: {
-            const NodeId sp = g_.add(NodeKind::Safepoint, {}, cur_region(),
-                                     effect_);
+            // Region-capture poll (docs/deopt-rbpd.md sections 2-4): the
+            // FrameState input makes the poll a materializable partial deopt
+            // point — the escape set is the live frame, the resume pc is
+            // this poll's pc. The M1 no-capture whole-method rerun remains
+            // only as the Rule-40 last resort when no record exists.
+            const NodeId sp = g_.add(NodeKind::Safepoint, {frame_state()},
+                                     cur_region(), effect_);
             chain_effect(sp);
             set_node_block(sp, cur_block_);
             break;
@@ -711,8 +721,21 @@ private:
         case Op::CLOSURE_NEW: case Op::CLOSURE_GET_UPVALUE:
         case Op::CLOSURE_SET_UPVALUE:
         case Op::TRY_BEGIN: case Op::TRY_END: case Op::THROW:
-        case Op::POLY_EXECUTE: case Op::POLY_READ: case Op::POLY_WRITE:
-        case Op::POLY_SEND:
+            fail(BuildError::UnsupportedOpcode, pc);
+            break;
+        case Op::POLY_READ:
+            lower_poly_read(ins);
+            break;
+        case Op::POLY_WRITE:
+            lower_poly_write(ins);
+            break;
+        case Op::POLY_EXECUTE: case Op::POLY_SEND:
+            // T0 executes every interop message; the optimizing tiers take
+            // EXECUTE/SEND only when the handler is a UGB method the devirt
+            // graph can inline (the J4 whole-program pipeline). Named
+            // refusal (Rule 76) — the method stays on T0, results identical.
+            fail(BuildError::UnsupportedOpcode, pc);
+            break;
         case Op::DEBUG_TRAP: case Op::EXT_OP:
             fail(BuildError::UnsupportedOpcode, pc);
             break;
@@ -1012,6 +1035,94 @@ private:
         bind_dst(ins, ld);
     }
 
+    // ---- interop message lowering (docs/interop-protocol.md section 6) -----
+    //
+    // A POLY_READ/POLY_WRITE on a NativeObjects port's wrapper compiles to
+    // a class-guarded raw field access — the interop dispatch is eliminated
+    // and the access becomes EA-visible (the XLEA phase-3 payoff,
+    // docs/xlea.md section 2). The speculation license has three parts,
+    // each individually checked (Rule 30: every PGO decision carries a
+    // guard; Rule 3: no unprovable handler semantics):
+    //   1. a registry is installed and the site's IC slot is monomorphic,
+    //   2. the recorded klass resolves AND is bound to a NativeObjects
+    //      port (member_idx == field slot semantics),
+    //   3. the ClassGuard re-checks the klass at runtime, so a different
+    //      receiver deopts into T0's always-correct generic dispatch.
+    // `ins` is intentionally not consulted: the IC slot is located by the
+    // current instruction's index (cur_insn_index_), not re-matched against
+    // the opcode here — the verifier already proved shape at load time.
+    bool poly_native_license(uint32_t& klass_id, uint32_t& slot) const {
+        if (p_.interop == nullptr || p_.ics == nullptr ||
+            p_.klass_addrs == nullptr || cur_insn_index_ >= p_.ics->size()) {
+            return false;
+        }
+        const ugb::IcSlot& ic = (*p_.ics)[cur_insn_index_];
+        if (ic.state != ugb::IcState::Monomorphic) return false;
+        klass_id = ic.mono.klass_or_shape_id;
+        slot = ic.mono.target;
+        if (klass_id >= p_.klass_addrs->size()) return false;
+        const void* klass = (*p_.klass_addrs)[klass_id];
+        if (klass == nullptr) return false;
+        if (p_.interop->port_kind_of_klass(klass) !=
+            runtime::interop::PortKind::NativeObjects) {
+            return false;
+        }
+        // The lowered raw access assumes slot < field_count (Rule 30: the
+        // layout speculation carries its proof).
+        return slot < static_cast<const Klass*>(klass)->field_count();
+    }
+
+    void lower_poly_read(const ugb::Instruction& ins) {
+        uint32_t klass_id = 0;
+        uint32_t slot = 0;
+        if (!poly_native_license(klass_id, slot)) {
+            fail(BuildError::UnsupportedOpcode, cur_pc_);
+            return;
+        }
+        const NodeId recv = src(ins, 0);
+        const NodeId gd =
+            g_.add_aux(NodeKind::ClassGuard, {recv, frame_state()}, klass_id,
+                       cur_region());
+        set_node_block(gd, cur_block_);
+        set_type(gd, JType::Ref);
+        out_.guards.push_back(gd);
+        const NodeId ld = g_.add_aux(
+            NodeKind::Load, {gd}, static_cast<uint32_t>(AccessKind::RawOffset),
+            cur_region(), effect_);
+        Node& ln = g_.node(ld);
+        ln.const_value = static_cast<int64_t>(sizeof(ObjectHeader)) +
+                         kTaggedSlotBytes * static_cast<int64_t>(slot);
+        chain_effect(ld);
+        set_node_block(ld, cur_block_);
+        set_type(ld, JType::Unknown);
+        bind_dst(ins, ld);
+    }
+
+    void lower_poly_write(const ugb::Instruction& ins) {
+        uint32_t klass_id = 0;
+        uint32_t slot = 0;
+        if (!poly_native_license(klass_id, slot)) {
+            fail(BuildError::UnsupportedOpcode, cur_pc_);
+            return;
+        }
+        const NodeId recv = src(ins, 0);
+        const NodeId gd =
+            g_.add_aux(NodeKind::ClassGuard, {recv, frame_state()}, klass_id,
+                       cur_region());
+        set_node_block(gd, cur_block_);
+        set_type(gd, JType::Ref);
+        out_.guards.push_back(gd);
+        const NodeId st = g_.add_aux(
+            NodeKind::Store, {gd, src(ins, 1)},
+            static_cast<uint32_t>(AccessKind::RawOffset), cur_region(),
+            effect_);
+        Node& sn = g_.node(st);
+        sn.const_value = static_cast<int64_t>(sizeof(ObjectHeader)) +
+                         kTaggedSlotBytes * static_cast<int64_t>(slot);
+        chain_effect(st);
+        set_node_block(st, cur_block_);
+    }
+
     void lower_set_field(const ugb::Instruction& ins) {
         const NodeId obj = heap_guard(src(ins, 0));
         const NodeId st =
@@ -1248,6 +1359,23 @@ private:
     void chain_effect(NodeId n) { effect_ = n; }
 
     bool fail(BuildError e, uint32_t pc) {
+        static const bool s_trace =
+            getenv("VORTEX_BUILDER_TRACE") != nullptr;
+        if (s_trace &&
+            e == BuildError::UnsupportedOpcode) {
+            fprintf(stderr, "[builder-fail] pc=%u cur_pc=%u idx=%u op=%s\n",
+                    pc, cur_pc_, cur_insn_index_,
+                    std::string(ugb::opcode_name(
+                        code_[cur_insn_index_].ins.opcode)).c_str());
+            if (getenv("VORTEX_BUILDER_TRACE") != nullptr) {
+                for (size_t ci = 0; ci < code_.size(); ++ci) {
+                    fprintf(stderr, "  [scan] i=%zu pc=%u op=%s\n", ci,
+                            code_[ci].pc,
+                            std::string(ugb::opcode_name(
+                                code_[ci].ins.opcode)).c_str());
+                }
+            }
+        }
         if (!failed_) {
             failed_ = true;
             error_ = e;

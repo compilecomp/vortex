@@ -6,11 +6,15 @@ structural hashing can operate on canonically. It is the substrate the
 LDPT trampolines (docs/ldpt.md) and Cross-Language Escape Analysis
 (docs/xlea.md) specialize.
 
-Status in this milestone: **spec complete** — the message model, the
-capability bits and the UGB opcode mapping are defined and reflected in
-`include/vortex/runtime/interop.hpp` and the UGB opcode table
-(`POLY_EXECUTE`/`POLY_READ`/`POLY_WRITE`/`POLY_SEND`). Implementation
-lands with the J3 devirtualization pipeline (docs/roadmap.md M3/M4).
+Status (M3): **implemented for T0 dispatch + J3 lowering** — the registry
+(`InteropRegistry`, klass binding, NativeObjects/Foreign port kinds), the
+tagged dispatch surface, capability-gated load (`.requires interop_messages`
++ the module CAP_INTEROP_* mask verified at load), T0 POLY_* handlers with
+klass-id IC feedback, and the J3 lowering of POLY_READ/POLY_WRITE into
+class-guarded raw field accesses (the dispatch vanishes; only NativeObjects
+ports license the lowering — foreign receivers always take the T0 generic
+dispatch). POLY_EXECUTE/POLY_SEND graph lowering lands with the J4
+devirtualization pipeline (it needs inlinable UGB-method handlers).
 
 ---
 

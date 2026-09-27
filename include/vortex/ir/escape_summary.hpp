@@ -56,42 +56,60 @@ struct EscapeSummary {
 /// The published-summary store: per method id, the summary for the
 /// current graph hash. Weakening on invalidation is monotonic; a
 /// strengthen requires publishing a new graph hash (a recompile).
+///
+/// Storage: ids index a dense vector (Rule 50 — the flat map carries only
+/// the id->slot probe; summaries are aggregates, not hot-path granules).
 class EscapeSummaryTable {
 public:
     void publish(const EscapeSummary& summary) {
-        EscapeSummary& slot = summaries_[summary.method_id];
-        if (slot.graph_hash == summary.graph_hash) {
-            // Same graph: monotonic weakening only.
-            for (uint32_t i = 0; i < summary.param_count && i < slot.params.size();
-                 ++i) {
-                if (slot.params[i] == ParamEscape::ArgEscape) continue;
-                if (summary.params[i] == ParamEscape::ArgEscape) {
-                    slot.params[i] = ParamEscape::ArgEscape;
+        const uint32_t* slot = index_.find(summary.method_id);
+        if (slot != nullptr) {
+            EscapeSummary& existing = summaries_[*slot];
+            if (existing.graph_hash == summary.graph_hash) {
+                // Same graph: monotonic weakening only.
+                for (uint32_t i = 0;
+                     i < summary.param_count && i < existing.params.size();
+                     ++i) {
+                    if (existing.params[i] == ParamEscape::ArgEscape) continue;
+                    if (summary.params[i] == ParamEscape::ArgEscape) {
+                        existing.params[i] = ParamEscape::ArgEscape;
+                    }
                 }
+                // returns_heap_allocation is a property of the graph (not
+                // a weakenable claim) — same graph, same value.
+                existing.captures_global =
+                    existing.captures_global || summary.captures_global;
+                return;
             }
-            // returns_heap_allocation is a property of the graph (not a
-            // weakenable claim) — same graph, same value; do not OR it.
-            slot.captures_global = slot.captures_global || summary.captures_global;
+            existing = summary;  // new graph hash: re-registration
             return;
         }
-        summaries_[summary.method_id] = summary;
+        const uint32_t idx = static_cast<uint32_t>(summaries_.size());
+        summaries_.push_back(summary);
+        index_.insert(summary.method_id, idx);
     }
 
     /// Invalidates the summary of a recompiled method (the dependency
     /// graph routes this); the next publish re-registers it.
-    void invalidate(uint32_t method_id) { summaries_.erase(method_id); }
+    void invalidate(uint32_t method_id) {
+        const uint32_t* slot = index_.find(method_id);
+        if (slot == nullptr) return;
+        summaries_[*slot] = EscapeSummary{};  // weakened to empty (Unknown)
+        index_.erase(method_id);
+    }
 
     /// The summary for `method_id`, or nullptr when none is published
     /// (callers then treat every parameter as Unknown).
     const EscapeSummary* lookup(uint32_t method_id) const {
-        auto it = summaries_.find(method_id);
-        return it != summaries_.end() ? &it->second : nullptr;
+        const uint32_t* slot = index_.find(method_id);
+        return slot != nullptr ? &summaries_[*slot] : nullptr;
     }
 
-    size_t size() const noexcept { return summaries_.size(); }
+    size_t size() const noexcept { return index_.size(); }
 
 private:
-    support::FlatHashMap<uint32_t, EscapeSummary> summaries_;
+    std::vector<EscapeSummary> summaries_;
+    support::FlatHashMap<uint32_t, uint32_t> index_;
 };
 
 }  // namespace vortex::ir

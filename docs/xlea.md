@@ -11,10 +11,15 @@ language. **Cross-language speculative EA with RBPD fallback is the
 differentiator**: when the wrapper doesn't escape the merged program, the
 allocation and the interop dispatches vanish entirely.
 
-Status in this milestone: **spec complete** — the mechanism, the
-escape-summary data structure and the guard-emission rules are defined
-below and reflected in `include/vortex/ir/escape_summary.hpp`.
-Implementation lands with the J3/J4 inlining pipeline (docs/roadmap.md).
+Status: J3 implements the PROVEN form (M3) — merged-graph EA after
+inlining, single-block scalar replacement with Rule-39 rematerialization
+(the deopt record carries the klass token + field sources; consts embed
+their words), and escape-summary publication/consumption with graph-hash
+identity and monotonic weakening (`include/vortex/ir/escape_summary.hpp`).
+The SPECULATIVE form with runtime G1-G5 guards (section 3/5) lands with
+J4's persistent-profile machinery; G3 (GC-map exclusion) is realized
+structurally in the proven form — a scalar-replaced wrapper has no vreg to
+root.
 
 ---
 

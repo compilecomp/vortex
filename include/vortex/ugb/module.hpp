@@ -55,11 +55,15 @@ enum class Capability : uint8_t {
     FFI,              // native interop (host must opt in)
     Extensions,       // namespaced extension instructions
     Debug,            // DEBUG_SRCPOS / DEBUG_TRAP observability
+    InteropMessages,  // POLY_* interop message opcodes (docs/interop-protocol.md)
     _COUNT,
 };
 
 const char* capability_name(Capability c) noexcept;
 bool is_valid_capability(uint8_t raw) noexcept;
+/// The canonical name -> ordinal lookup (the text assembler's .requires
+/// directive uses it). False on unknown names.
+bool capability_from_name(const std::string& name, uint8_t& ordinal) noexcept;
 
 /// Bitset of capabilities supported by an engine/runtime (Rule 3: the runtime
 /// advertises what it supports; silent misexecution is forbidden).
@@ -284,6 +288,13 @@ struct ModuleRuntimeData {
     support::FlatHashMap<uint64_t, int32_t> virtual_resolution;
     // (klass_id << 32 | field_token) -> field slot on that klass
     support::FlatHashMap<uint64_t, int32_t> field_slot_cache;
+    // The verification verdict (Rule 7/9). Kept SEPARATE from `ready`:
+    // `ready` means "runtime tables built", `verified` means "verify_module
+    // + capability negotiation passed". Every bootstrap path (run() AND
+    // build_module_runtime) must hold a verdict before tables go live —
+    // a ready-but-unverified module is exactly the load-gate bypass shape
+    // the M3 review proved exploitable on POLY_* window checks.
+    bool verified = false;
     bool ready = false;
 };
 

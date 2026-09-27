@@ -55,6 +55,9 @@ struct PipelineStats {
     uint32_t blocks_unreachable = 0;
     uint32_t inlined_calls = 0;
     uint32_t specialized_sites = 0;
+    /// Scalar-replaced allocations (the J3 EA stage writes it; J2 leaves 0)
+    /// — the XLEA steady-state counter (docs/xlea.md section 6).
+    uint32_t scalar_replaced = 0;
     uint32_t budget_stop = 0;  // 0 = completed; else the stage index that
                                // hit the cap
 };
