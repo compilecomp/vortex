@@ -38,8 +38,10 @@ struct J3Executable {
 
 /// Compiles one method through the full J3 pipeline. Refusal (unsupported
 /// opcode, budget) fails the Result with a named reason — the method stays
-/// on J2/J1/T0 (Rules 11/76).
-support::Result<J2Code> compile_j3(const J2Job& job);
+/// on J2/J1/T0 (Rules 11/76). `stats` optionally receives the full 60-stage
+/// telemetry (Rule 120: structured, assertable — the golden stage tests
+/// lock per-pass TU behavior through it).
+support::Result<J2Code> compile_j3(const J2Job& job, J3Stats* stats = nullptr);
 
 /// W^X publication + summary attach.
 support::Result<J3Executable> publish_j3(const J2Code& code,

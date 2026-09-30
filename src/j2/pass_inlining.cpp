@@ -8,6 +8,7 @@
 
 
 #include "passes_internal.hpp"
+#include "vortex/j2/fast_jit.hpp"
 #include "vortex/runtime/object_model.hpp"
 
 namespace vortex::j2 {
@@ -76,6 +77,17 @@ uint32_t inline_calls(ir::Graph& g, BuiltGraph& built,
         return static_cast<uint32_t>(cur);
     };
     uint32_t inlined = 0;
+    // Termination invariants (docs/tier-j4.md section 12.2): the inline
+    // chain guard is ALWAYS on — a method may never appear twice on one
+    // splice chain and the chain may never exceed the deopt-frame ABI
+    // capacity, so the sweep terminates deterministically for ACYCLIC and
+    // cyclic call graphs alike (tier-j4.md section 6: explosion is avoided
+    // with call-graph cycle detection, never with budgets). Note the
+    // behavior caveat vs the M2/M3 pipelines: on CYCLIC call graphs the
+    // chain guard can refuse an inline the old caps would have spliced
+    // (inlining is optional — semantics are unaffected, Rule 18; the
+    // depth-per-sweep caps still bound J2/J3 shapes identically on acyclic
+    // graphs).
     for (uint32_t depth = 0; depth < budget.inline_depth_cap; ++depth) {
         bool any = false;
         for (uint32_t call_id = 0; call_id < g.node_count(); ++call_id) {
@@ -105,6 +117,32 @@ uint32_t inline_calls(ir::Graph& g, BuiltGraph& built,
             const ugb::UGBMethod& callee =
                 module.method_table[static_cast<size_t>(resolved)];
             if (callee.id == built.method_id) continue;  // no recursion
+            const std::vector<uint32_t>& chain =
+                call_id < built.inline_paths.size()
+                    ? built.inline_paths[call_id]
+                    : std::vector<uint32_t>{};
+            // Call-graph cycle guard (Rule 16): a method may never appear
+            // twice on one splice chain — chain lengths are bounded by the
+            // module's method count, so the sweep terminates.
+            bool on_chain = false;
+            for (const uint32_t m : chain) {
+                if (m == callee.id) {
+                    on_chain = true;
+                    break;
+                }
+            }
+            if (on_chain) continue;
+            // Deopt-frame ABI capacity (the M4 review's blocker): a guard
+            // inside the spliced callee produces one deopt frame per link
+            // of the chain (root + every spliced method). The record
+            // builder's kMaxDeoptFrames capacity must never be exceeded —
+            // silently truncating outer frames would resume state-exact
+            // WRONG (Rules 39/42/113). Splicing callee C into a chain of
+            // length L yields L+1 frames, so L must stay <= kMaxDeoptFrames
+            // - 1. This is the REAL enforcement of the J4 inline bound
+            // (j4_budget's inline_depth_cap names the same number); it
+            // holds in every mode because the record capacity does.
+            if (chain.size() + 1 > j2::kMaxDeoptFrames) continue;
             std::unique_ptr<BuiltGraph> callee_built;
             if (!builds_single_block(module, callee,
                                      budget.inline_callee_node_cap, built,
@@ -301,6 +339,22 @@ uint32_t inline_calls(ir::Graph& g, BuiltGraph& built,
             ++built.inlined_sites;
             ++inlined;
             any = true;
+            // Extend the inline chain: every spliced CALL node carries the
+            // caller chain + the callee id, so the cycle guard above sees
+            // the full path that produced it (sync_built already resized
+            // the table for the spliced nodes).
+            for (uint32_t k = 0; k < cg.node_count(); ++k) {
+                if (cg.node(k).kind != NodeKind::Call) continue;
+                std::vector<uint32_t>& next = built.inline_paths[base + k];
+                if (next.empty()) {
+                    next.reserve(chain.size() + 2);
+                    next.push_back(built.method_id);
+                    for (const uint32_t m : chain) {
+                        if (m != built.method_id) next.push_back(m);
+                    }
+                }
+                next.push_back(callee.id);
+            }
         }
         if (!any) break;
     }

@@ -3,7 +3,6 @@
 #include "passes_internal.hpp"
 
 #include <algorithm>
-#include <unordered_map>
 
 namespace vortex::j3 {
 
@@ -26,15 +25,13 @@ using BuiltGraph = j2::BuiltGraph;
 uint32_t deferred_field_init(Graph& g, BuiltGraph& built) {
     uint32_t killed = 0;
     for (const uint32_t b : built.rpo) {
-        std::unordered_map<NodeId, uint32_t> rank;
-        chain_order(g, built, b, rank);
+        ChainOrder co;
+        chain_order(g, built, b, co);
         std::vector<NodeId> chain;
-        chain.reserve(rank.size());
-        for (const auto& [id, r] : rank) {
+        chain.reserve(co.chain.size());
+        for (const NodeId id : co.chain) {
             if (!g.node(id).dead) chain.push_back(id);
         }
-        std::sort(chain.begin(), chain.end(),
-                  [&](NodeId a, NodeId c) { return rank[a] < rank[c]; });
         for (size_t i = 0; i < chain.size(); ++i) {
             Node& a = g.node(chain[i]);
             if (a.dead || a.kind != NodeKind::Store) continue;

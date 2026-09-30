@@ -101,8 +101,6 @@ constexpr uint64_t kNullBits = 0x3;
 constexpr uint64_t kUndefinedBits = 0x7;
 constexpr uint64_t kFalseBits = 0xB;
 constexpr uint64_t kTrueBits = 0xF;
-constexpr int64_t kSmiMinPayload = static_cast<int64_t>(0xC000000000000000ull);
-constexpr int64_t kSmiMaxPayload = 0x3FFFFFFFFFFFFFFFll;
 constexpr uint32_t kTagMask = 0xF;
 constexpr uint32_t kTagHeapBits = 0b0001;
 
@@ -124,9 +122,10 @@ constexpr uint32_t kAllocDouble = 2;
 // named here and kept equal — the two engines must agree, Rule 18).
 constexpr int32_t kJ2MaxArrayLength = 1'000'000;
 
-// Deopt chain depth bound (the pipeline's inline_depth_cap + root, rounded
-// up; a defensive named bound, not a tuning knob — Rule 72).
-constexpr size_t kMaxDeoptFrames = 8;
+// Deopt chain depth bound: shared named constant, declared in the public
+// J2 header (the J4 engine derives its inline depth cap from it — the
+// record builder and the inliner must never disagree on the capacity).
+constexpr size_t kMaxDeoptFrames = j2::kMaxDeoptFrames;
 
 // Error ids (the J1 surface — identical observable error wording).
 constexpr uint32_t kErrDeopt = 1;
@@ -382,7 +381,9 @@ public:
         out.method_id = job_.method_id;
 
         compute_positions();
-        build_deopt_records();
+        if (auto r = build_deopt_records(); !r) {
+            return std::unexpected(r.error());
+        }
         if (auto r = size_windows(); !r) return std::unexpected(r.error());
 
         // ---- prologue ------------------------------------------------------------
@@ -499,6 +500,7 @@ public:
         out.gc_maps = serialize_gc_maps();
         out.deopt_records = serialize_deopt_records();
         out.records = records_;
+        out.record_relocs = record_relocs_;
         return out;
     }
 
@@ -533,7 +535,7 @@ private:
     }
 
     // ---- deopt records (pre-pass: stable addresses before any stub) ---------
-    void build_deopt_records() {
+    support::Result<void> build_deopt_records() {
         // Capacity first: reserve the exact count so push_back never
         // reallocations (the stubs embed record addresses, Rule 69).
         size_t record_count = 0;
@@ -559,7 +561,8 @@ private:
         }
         records_->reserve(record_count);
 
-        const auto build_record = [&](NodeId fs_owner) -> uint32_t {
+        const auto build_record =
+            [&](NodeId fs_owner) -> support::Result<uint32_t> {
             const Node& owner = g_.node(fs_owner);
             if (owner.data_inputs.empty()) return UINT32_MAX;
             const NodeId fs0 = owner.data_inputs.back();
@@ -576,7 +579,16 @@ private:
             NodeId cur = fs0;
             BuiltGraph::InlineCallerInfo incoming;  // transition INTO `cur`
             bool first = true;
-            while (cur != kNoNode && rec.frames.size() < kMaxDeoptFrames) {
+            bool truncated = false;
+            while (cur != kNoNode) {
+                if (rec.frames.size() == kMaxDeoptFrames) {
+                    // The chain continues past the ABI capacity — the
+                    // inline chain guard prevents this; refuse by name
+                    // rather than silently dropping outer frames (a
+                    // truncated resume is state-inexact, Rules 39/42/113).
+                    truncated = true;
+                    break;
+                }
                 nodes.push_back(cur);
                 const Node& f = g_.node(cur);
                 DeoptFrame fr;
@@ -638,16 +650,31 @@ private:
                 first = false;
                 cur = it->second.frame_state;
             }
+            // Belt-and-braces (M4 review blocker 3): the inline chain guard
+            // makes this unreachable, but a silent truncation here would
+            // resume state-exact WRONG (Rules 39/42/113). Refuse by name.
+            if (truncated) {
+                if (std::getenv("VORTEX_J2_TRACE")) {
+                    fprintf(stderr, "[j2-rec] truncated: owner kind=%d aux=%u frames=%zu map=%zu\n",
+                            (int)g_.node(fs_owner).kind, g_.node(fs_owner).aux,
+                            rec.frames.size(), built_.inline_caller_frame.size());
+                }
+                return support::fail(
+                    support::ErrorCode::InternalError,
+                    "J2: deopt frame chain exceeds kMaxDeoptFrames (" +
+                        std::to_string(kMaxDeoptFrames) + ")");
+            }
             records_->push_back(std::move(rec));
             frame_nodes_.push_back(std::move(nodes));
             return static_cast<uint32_t>(records_->size() - 1);
         };
-
         for (const NodeId id : built_.guards) {
             const Node& n = g_.node(id);
             if (n.dead) continue;  // guard-optimize killed it
             if (!ir::is_guard(n.kind)) continue;  // calls: GC-map points only
-            record_index_of_[id] = build_record(id);
+            auto r = build_record(id);
+            if (!r) return std::unexpected(r.error());
+            record_index_of_[id] = *r;
         }
         // Synthetic bounds checks: array accesses deopt into T0, which
         // re-executes the access with its own canonical behavior (Rule 30).
@@ -660,7 +687,9 @@ private:
             if (static_cast<AccessKind>(n.aux) != AccessKind::ArrayElement) {
                 continue;
             }
-            record_index_of_[id] = build_record(id);
+            auto r = build_record(id);
+            if (!r) return std::unexpected(r.error());
+            record_index_of_[id] = *r;
         }
         // Region-capture suspension polls (docs/deopt-rbpd.md 2-4): the
         // escape set is the live frame, the resume pc is the poll's pc.
@@ -670,8 +699,11 @@ private:
             if (n.kind != NodeKind::Safepoint || n.data_inputs.empty()) {
                 continue;
             }
-            record_index_of_[id] = build_record(id);
+            auto r = build_record(id);
+            if (!r) return std::unexpected(r.error());
+            record_index_of_[id] = *r;
         }
+        return {};
     }
 
     uint32_t record_of(NodeId n) const {
@@ -2654,8 +2686,14 @@ private:
             }
         }
         asm_.mov_reg_reg(Reg::RDI, Reg::R15);  // ctx
-        asm_.mov_reg_imm64(
-            Reg::RSI, reinterpret_cast<uintptr_t>(&(*records_)[record_idx]));
+        // Rule 56 (determinism/replayability): the record ADDRESS is
+        // publish-time data, not compile-time state. Emit a zero
+        // placeholder + a relocation; publish_j2 patches the real address
+        // from the live records vector. Baking the heap address here made
+        // two compiles of the same input differ byte-for-byte.
+        record_relocs_.push_back(
+            {static_cast<uint32_t>(buf_.size() + 2), record_idx});
+        asm_.mov_reg_imm64(Reg::RSI, 0);
         asm_.lea_reg_mem(Reg::RDX,
                          Mem{Reg::RBP, Reg::RSP, 0, deopt_window_disp_});
         asm_.call_mem(Mem{Reg::R15, Reg::RSP, 0, kCtxJ2Deopt});
@@ -2790,6 +2828,11 @@ private:
     const EmissionPlan& plan_;  // declared here to match init-list order
     std::shared_ptr<std::vector<DeoptRecord>> records_;
     std::vector<std::vector<NodeId>> frame_nodes_;  // per record
+    /// Publish-time address patches (Rule 56): {imm64 offset in code,
+    /// record index}. The deopt stubs load their record pointer from here
+    /// instead of a baked heap address — the code bytes stay identical
+    /// across compiles of the same input.
+    std::vector<J2Code::RecordReloc> record_relocs_;
 
     CodeBuffer buf_;
     Assembler asm_;
@@ -2881,9 +2924,12 @@ void j2_deopt_hook(j1::J1Context* ctx, const DeoptRecord* record,
 /// RBPD region table for one compiled method (docs/deopt-rbpd.md section
 /// 1): one region per deopt record — every trap site aligns with a region
 /// boundary (the hard invariant, section 8). The escape set is the record's
-/// materialization map: one stack location per frame vreg.
+/// materialization map: one stack location per frame vreg. The bytecode
+/// span covers the guarded instruction ([resume_pc, next_pc)) — the M3
+/// review flagged the old begin==end metadata as degenerate.
 deopt::RegionTable build_region_table(
-    const std::vector<DeoptRecord>& records, uint8_t tier) {
+    const std::vector<DeoptRecord>& records, uint8_t tier,
+    const ugb::UGBModule& module) {
     deopt::RegionTable table;
     for (const DeoptRecord& rec : records) {
         deopt::RegionDescriptor desc;
@@ -2902,8 +2948,25 @@ deopt::RegionTable build_region_table(
                 desc.deopt.escape_locations.push_back(loc);
             }
         }
-        desc.bytecode_pc_begin = desc.deopt.bytecode_resume_pc;
-        desc.bytecode_pc_end = desc.deopt.bytecode_resume_pc;
+        // Real bytecode span: decode the guarded instruction so the region
+        // covers [resume_pc, next_pc). The one-region-per-record identity
+        // (region_id == record index) is preserved — a decode failure only
+        // leaves the span degenerate, never desyncs the table.
+        const uint32_t resume = desc.deopt.bytecode_resume_pc;
+        desc.bytecode_pc_begin = resume;
+        desc.bytecode_pc_end = resume;
+        if (!rec.frames.empty()) {
+            const uint32_t mid = rec.frames.front().method_id;
+            if (mid < module.method_table.size()) {
+                const ugb::UGBMethod& m = module.method_table[mid];
+                ugb::InstructionStream stream(m.code.data(), m.code.size());
+                size_t cur = resume;
+                ugb::Instruction ins;
+                if (stream.decode_at(cur, ins)) {
+                    desc.bytecode_pc_end = static_cast<uint32_t>(cur);
+                }
+            }
+        }
         table.add_region(std::move(desc));
     }
     return table;
@@ -3016,7 +3079,8 @@ support::Result<J2Code> emit_optimized(const J2Job& job, BuiltGraph& built,
     // the code valid — the graph just never finished optimizing.
     code->budget_exceeded = stats.budget_stop != 0;
     code->stats = stats;
-    code->regions = build_region_table(*records, static_cast<uint8_t>(tier));
+    code->regions =
+        build_region_table(*records, static_cast<uint8_t>(tier), *job.module);
     return code;
 }
 
@@ -3069,6 +3133,21 @@ support::Result<J2Executable> publish_j2(const J2Code& code,
     auto mem = infra::WritableCodeMemory::allocate(code.code.size(), range);
     if (!mem) return std::unexpected(mem.error());
     (*mem).write(code.code, 0);
+    // Apply the record-pointer relocations (Rule 56: the compile output is
+    // address-free; the addresses exist only in executable memory, patched
+    // from the same records vector the emitter reserved — identical values
+    // to the pre-relocation scheme, applied at publication instead).
+    if (code.records != nullptr) {
+        for (const J2Code::RecordReloc& r : code.record_relocs) {
+            const uint64_t addr = reinterpret_cast<uintptr_t>(
+                &(*code.records)[r.record_index]);
+            uint8_t bytes[8];
+            for (int i = 0; i < 8; ++i) {
+                bytes[i] = static_cast<uint8_t>((addr >> (8 * i)) & 0xFF);
+            }
+            (*mem).write({bytes, 8}, r.code_offset);
+        }
+    }
     auto pub = (*mem).publish();
     if (!pub) return std::unexpected(pub.error());
     J2Executable ex;
@@ -3090,6 +3169,28 @@ support::Result<J2Executable> publish_j2(const J2Code& code,
 support::Result<TaggedValue> run_j2(J2Executable& ex, j1::J1Bindings& bindings,
                                     std::span<const TaggedValue> args,
                                     vm::Interpreter& interp) {
+    // Rule-43 entry trap (docs/deopt-rbpd.md section 9; roadmap M4): the
+    // DowngradeTier/RefuseMethod rungs refuse optimized entry — the caller
+    // owns the Rule-40 fallback (the tiering driver runs T0 and schedules
+    // the downgrade/recompile). WeakenAssumptions still ENTERS (the site's
+    // speculation is dead, but entering is legal — the driver owns
+    // scheduling the weaker-assumption recompile). Refusals are named,
+    // never silent (Rule 76).
+    if (ex.regions != nullptr) {
+        const deopt::EntryDecision decision =
+            ex.regions->entry_check(ex.throttle_policy);
+        if (decision == deopt::EntryDecision::DowngradeTier ||
+            decision == deopt::EntryDecision::RefuseMethod) {
+            return support::fail(
+                support::ErrorCode::SpeculationDisabled,
+                std::string("J2: Rule-43 entry trap: ") +
+                    deopt::entry_decision_name(decision) +
+                    " after " +
+                    std::to_string(ex.regions->method_failure_count()) +
+                    " method deopt failures");
+        }
+    }
+
     TaggedValue ret;
     auto* heap = static_cast<gc::Heap*>(bindings.context.heap);
     heap->sync_tlab_top(static_cast<uint8_t*>(bindings.context.tlab_top));
@@ -3141,6 +3242,13 @@ support::Result<TaggedValue> run_j2(J2Executable& ex, j1::J1Bindings& bindings,
         // RBPD accounting (Rule 43): guard failures advance ONLY the
         // failing region's counter; a poll-fired record is suspension, not
         // failure (the M1 contract — suspension never loses speculation).
+        // The returned recovery path needs no runtime action HERE — this
+        // execution always resumes T0 below (Rule 39/40) — because the
+        // NEXT entry consults entry_check with the same policy (the trap
+        // above): TierFallback/RecompileRegion decisions surface as the
+        // named refusal, and successor re-entry is the J4 region
+        // publication machinery (roadmap M4). The path is therefore
+        // consumed by construction, not discarded.
         if (ex.regions != nullptr) {
             const uint64_t tick =
                 std::chrono::steady_clock::now().time_since_epoch().count();
@@ -3148,8 +3256,8 @@ support::Result<TaggedValue> run_j2(J2Executable& ex, j1::J1Bindings& bindings,
                 ex.regions->on_suspension(c.record->region_id,
                                           c.record->region_id, tick);
             } else {
-                const deopt::ThrottlePolicy policy;
-                ex.regions->on_guard_failure(c.record->region_id, policy,
+                ex.regions->on_guard_failure(c.record->region_id,
+                                             ex.throttle_policy,
                                              c.record->region_id,
                                              deopt::DeoptReason::GuardFailed,
                                              tick);

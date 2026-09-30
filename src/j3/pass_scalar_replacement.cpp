@@ -6,7 +6,6 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
-#include <unordered_map>
 #include "vortex/runtime/object_model.hpp"
 
 namespace vortex::j3 {
@@ -43,7 +42,9 @@ using BuiltGraph = j2::BuiltGraph;
 /// (stage 16 appends specialized accesses behind everything) — the chain
 /// is the program-order truth (Rule 55).
 void chain_order(const Graph& g, const BuiltGraph& built, uint32_t block,
-                 std::unordered_map<NodeId, uint32_t>& rank) {
+                 ChainOrder& out) {
+    out.rank.clear();
+    out.chain.clear();
     // Depth = backward-walk length to the block's chain head.
     std::vector<NodeId> nodes;
     for (uint32_t id = 0; id < g.node_count(); ++id) {
@@ -63,14 +64,19 @@ void chain_order(const Graph& g, const BuiltGraph& built, uint32_t block,
             cur = g.node(cur).effect_in;
             if (depth > g.node_count()) break;  // cycle guard (defensive)
         }
-        rank[id] = depth;
+        out.rank.insert(id, depth);
     }
     // Depths share the same head but the walk above stops at already-ranked
     // nodes; normalize by sorting and re-ranking (deterministic).
     std::vector<NodeId> ordered(nodes.begin(), nodes.end());
     std::sort(ordered.begin(), ordered.end(),
-              [&](NodeId a, NodeId b) { return rank[a] < rank[b]; });
-    for (uint32_t i = 0; i < ordered.size(); ++i) rank[ordered[i]] = i;
+              [&](NodeId a, NodeId b) {
+                  return *out.rank.find(a) < *out.rank.find(b);
+              });
+    for (uint32_t i = 0; i < ordered.size(); ++i) {
+        *out.rank.find(ordered[i]) = i;
+    }
+    out.chain = std::move(ordered);
 }
 
 uint32_t scalar_replace(Graph& g, BuiltGraph& built) {
@@ -176,14 +182,13 @@ uint32_t scalar_replace(Graph& g, BuiltGraph& built) {
         }
 
         // Exactly one store per field key (conservative ordering rule).
-        std::unordered_map<int64_t, NodeId> single;
+        support::FlatHashMap<int64_t, NodeId> single;
         for (const auto& [sid, key] : stores) {
-            auto it = single.find(key);
-            if (it != single.end()) {
+            if (single.find(key) != nullptr) {
                 esc = true;
                 break;
             }
-            single.emplace(key, sid);
+            single.insert(key, sid);
         }
         if (esc) {
             if (trace) {
@@ -195,25 +200,29 @@ uint32_t scalar_replace(Graph& g, BuiltGraph& built) {
         // Every load's key must have its single store BEFORE it on the
         // block's effect chain (program order, not id order); otherwise
         // the load sees undefined.
-        std::unordered_map<NodeId, uint32_t> order;
+        ChainOrder order;
         chain_order(g, built, anchor_block, order);
         for (const NodeId lid : loads) {
             int64_t key = 0;
             access_key_of(g.node(lid), key);
-            const auto it = single.find(key);
-            if (it == single.end() ||
-                order[it->second] >= order[lid]) {
+            const NodeId* store_id = single.find(key);
+            const uint32_t* store_rank =
+                store_id != nullptr ? order.rank.find(*store_id) : nullptr;
+            const uint32_t* load_rank = order.rank.find(lid);
+            if (store_rank == nullptr || load_rank == nullptr ||
+                *store_rank >= *load_rank) {
                 if (trace) {
                     std::fprintf(stderr,
                                  "[ea] alloc %u: load %u key=%lld has "
                                  "store=%s store_rank=%u load_rank=%u "
                                  "store_block=%u load_block=%u\n",
                                  id, lid, (long long)key,
-                                 it != nullptr ? "late" : "none",
-                                 it != nullptr ? order[it->second] : 0u,
-                                 order[lid],
-                                 it != nullptr ? built.block_of[it->second]
-                                               : 0u,
+                                 store_id != nullptr ? "late" : "none",
+                                 store_rank != nullptr ? *store_rank : 0u,
+                                 load_rank != nullptr ? *load_rank : 0u,
+                                 store_id != nullptr
+                                     ? built.block_of[*store_id]
+                                     : 0u,
                                  built.block_of[lid]);
                 }
                 esc = true;

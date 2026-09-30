@@ -64,6 +64,13 @@ public:
     // call site (idempotent by site id), one InlineSite per spliced body
     // (keyed by its FrameState; context keys assigned in discovery order),
     // one OutlineRegion per deopt region (ids from a deterministic counter).
+    // M4 return contract: record_call and build_inline_site return the
+    // INDEX of the (existing or newly created) record in their vector;
+    // extract_outline returns the OutlineRegion's region_id (the overlay's
+    // stable identifier) in both paths. Every method gives the return one
+    // meaning, and re-application never rewrites or renumbers earlier
+    // metadata (the fixed-point J4 pipeline may re-run this stage on the
+    // same graph; docs/tier-j4.md section 12.2).
     support::Result<uint32_t> record_call(uint32_t call_site_id,
                                           uint32_t bytecode_pc);
     support::Result<uint32_t> build_inline_site(uint32_t call_node,

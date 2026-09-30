@@ -154,37 +154,82 @@ Findings:
       suites; the J3 > J2 perf delta is tracked for the benchmark suite
       (M3 landed the machinery; the tuned measurement harness is M4 — the
       M2 cliff benchmark already shows the tier stack healthy)
-- [ ] Executed OSR-entry parity test with a T0 register snapshot (the M2
-      test pins the stub's presence and offset; execution lands with the
-      J3/J4 tiering driver that produces real mid-loop snapshots)
+- [x] Executed OSR-entry parity test with a T0 register snapshot (the M2
+      test pins the stub's presence and offset; M4 executes it — the
+      backedge hook produces a real mid-loop snapshot and the compiled
+      OSR entry continues it to parity, `m4_osr_entry_parity_with_t0_snapshot`)
 
 ## M4 — J4 max deterministic optimizing JIT
 
-- [ ] Persistent IR store with incremental reuse
-- [ ] Deterministic fixed-point engine with termination invariants (graph hash,
-      lattice state)
-- [ ] Background worker + incremental region publication
-- [ ] DoD: bit-identical compiled output across repeated compiles of the same
-      input (determinism test); no search (audit: pass drivers contain no
-      enumeration); J3 keeps running during J4 compile
+- [x] Persistent IR store with incremental reuse (`j4::PersistentIrStore`;
+      content-addressed identity, drop-on-stale — `j4_persistent_ir_*`)
+- [x] Deterministic fixed-point engine with termination invariants (graph
+      hash stability or a repeated-hash cycle — never an iteration cap;
+      inline depth bounded only by the deopt-frame ABI capacity)
+- [x] Background worker + incremental region publication (`j4::J4Worker`,
+      stepwise capture/advance/emit/publish; Rule-15 cancellation honored
+      at the next step boundary)
+- [x] DoD: bit-identical compiled output across repeated compiles of the
+      same input (determinism test — which surfaced and fixed the baked
+      deopt-record addresses: emission now carries relocations, publish
+      patches them); no search (the stage order is the fixed J3 driver;
+      inline growth terminates on the call-graph cycle guard); J3 keeps
+      running during a J4 compile (worker-step interleaving test)
 - [ ] CEP&CC 0.1 adoption (backbone standard, adopted at M3 with a dated
-      waiver — `.cep/baseline.md`, `.cep/waivers/`): migrate the 991
-      severity-1 findings to zero (nine-field file headers, seven-field
-      function blocks — hot trees first, reusing PERF_CONTRACT facts as
-      the cost answers; one pass per file already applied to the J2/J3
-      pipelines), repair the severity-2 backlog incrementally, and flip
-      `tools/lint/cep_lint.sh` to enforced in CI. Zero severity-0 at
-      adoption: the CEM-26 hot-code bans and CEP&CC agree on the core.
-- [ ] M3 review follow-ups (12-review minors, tracked): golden-IR tests
-      for the per-pass TUs; a cross-origin (splice-stamp) guard-dominance
-      regression test through the J3 arm; consume the RBPD Rule-43
-      throttle verdict in the tiering driver (entry-trap gating of
-      blacklisted regions); `publish_j3` summary exercised end-to-end;
-      swap the remaining `std::unordered_map`/`std::function` in src/j3
-      to the shared containers (Rule 50/69 hygiene); drop degenerate
-      zero-width region metadata from `build_region_table`; clarify CIOG
-      overlay idempotent-return values; unify the Smi-bound spellings
-      (j2 functions vs j3 constants).
+      waiver — `.cep/baseline.md`, `.cep/waivers/`): migrate the SEV1
+      findings to zero (nine-field file headers, seven-field function
+      blocks — hot trees first, reusing PERF_CONTRACT facts as the cost
+      answers), repair the severity-2 backlog incrementally, and flip
+      `tools/lint/cep_lint.sh` to enforced in CI. **Batch 1 done (M4):
+      the J4 tree + its test/bench files ship CEP&CC-complete and the j4
+      tree is SEV1-clean; the remaining trees continue batch by batch.**
+      Zero severity-0 at adoption: the CEM-26 hot-code bans and CEP&CC
+      agree on the core.
+- [x] M3 review follow-ups (12-review minors, all landed in M4): golden-IR
+      tests for the per-pass TUs (the 60-stage telemetry is now asserted —
+      and the goldens surfaced the Smi-min sign bug that had silently
+      disabled folding, plus the range-flow-through-guards gap, tracked
+      for J4); a cross-origin (splice-stamp) guard-dominance regression
+      test through the J3 arm; the RBPD Rule-43 throttle verdict consumed
+      in the tiering driver (speculation gate + the policy's verdict
+      parameter — escalation refusal and Rule-40 demotion); `publish_j3`
+      summary exercised end-to-end (the harness was publishing a default
+      summary — fixed); the remaining `std::unordered_map`/`std::function`
+      in src/j3 swapped to the shared containers (Rule 50/69 hygiene);
+      degenerate zero-width region metadata dropped (regions now carry the
+      real [resume_pc, next_pc) bytecode span); CIOG overlay
+      idempotent-return values clarified (one meaning per return, no
+      renumbering on re-application); Smi-bound spellings unified on the
+      canonical TaggedValue bounds.
+- [x] M4 review round (two independent reviewers; verdicts SHIP /
+      FIX-REQUIRED, all findings dispositioned): the executed
+      `m4_osr_entry_parity_with_t0_snapshot` and the deopt-frame ABI
+      capacity pair (record side builds TO kMaxDeoptFrames; refusal side
+      keeps the guard beyond capacity out of the graph — the original
+      single test was unsatisfiable by construction); the cyclic
+      call-graph termination test the DoD was missing, which exposed and
+      fixed a real M1-era defect — `helper_invoke_token` resolved callees
+      positionally although the token pool is first-reference ordered, so
+      forward-referenced callees (mutual recursion) silently called the
+      WRONG method (now resolves by name like T0, Rule 18; backward
+      references are bit-identical); `find_reusable` drops half-dead
+      entries so `reused_ir` telemetry cannot lie (Rule 120); the
+      determinism test warms the token cache symmetrically so the byte
+      compare covers spliced shapes; the tiering-gate test pins the
+      gated-phase transition contract; the `.cep/baseline.md` batch-1
+      delta narrative corrected to the verified per-file numbers; spec
+      drift fixed (tier-j4.md 12.1 hash construction, 12.3 publish/swap
+      wording, 12.5 enforcement wording; j4 ADR-002 citations moved to
+      the 12.3 driver model). Deferred minors, tracked for later
+      milestones: a cumulative inline-depth stat in J4Stats (the
+      refusal-side capacity test cannot assert splice depth directly);
+      the advance()-before-capture misuse returning a progress-shaped
+      value; graph_hash not observing effect/control-only rewires
+      (deterministic and terminating, narrower than the 12.2 prose —
+      spec note owed); bench_tiers timing J3 through run_j3 while J2/J4
+      use raw entry stubs (asymmetry documented, not unified); a direct
+      CIOG idempotent-return unit test (currently covered indirectly by
+      fixed-point stability).
 
 ## M5 — ICGGC concurrent engine
 

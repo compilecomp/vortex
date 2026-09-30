@@ -5,6 +5,7 @@
 
 #include <cstdint>
 
+#include "vortex/deopt/rbpd.hpp"
 #include "vortex/support/tier.hpp"
 
 namespace vortex {
@@ -58,20 +59,39 @@ public:
 
     /// Returns the tier the method should be on given its hotness, or the
     /// current tier if no transition should fire.
-    Tier evaluate(const MethodHotness& h) const noexcept {
+    ///
+    /// Rule-43 consumption (docs/tier-j4.md section 12.4; roadmap M4):
+    /// `speculation` is the method's RBPD entry verdict (Enter when the
+    /// method has no optimized code or a healthy region table). A method
+    /// past the throttle ladder is NOT re-speculated: escalations to
+    /// J2/J3/J4 are refused while J1 (the non-speculative stencil) stays
+    /// reachable, and a method already on an optimized tier falls back to
+    /// T0 (Rule 40) until the gate owner clears the block. The caller
+    /// records the transition (Rule 28) — the policy stays a pure function.
+    Tier evaluate(const MethodHotness& h,
+                  deopt::EntryDecision speculation =
+                      deopt::EntryDecision::Enter) const noexcept {
+        const bool blocked =
+            speculation == deopt::EntryDecision::DowngradeTier ||
+            speculation == deopt::EntryDecision::RefuseMethod;
+        if (blocked && h.current >= Tier::J2) {
+            return Tier::T0;  // Rule 40: demote to the fallback tier
+        }
         if (h.current < Tier::J1 && h.invocations >= thresholds_.j1_invocations) {
             return Tier::J1;
         }
-        if (h.current < Tier::J2 && h.invocations >= thresholds_.j2_invocations) {
-            return Tier::J2;
-        }
-        if (h.current < Tier::J3 && h.invocations >= thresholds_.j3_invocations) {
-            return Tier::J3;
-        }
-        if (h.current < Tier::J4 && h.invocations >= thresholds_.j4_invocations) {
-            const double rate =
-                h.invocations > 0 ? static_cast<double>(h.deopts) / h.invocations : 0.0;
-            if (rate <= thresholds_.j4_max_deopt_rate) return Tier::J4;
+        if (!blocked) {
+            if (h.current < Tier::J2 && h.invocations >= thresholds_.j2_invocations) {
+                return Tier::J2;
+            }
+            if (h.current < Tier::J3 && h.invocations >= thresholds_.j3_invocations) {
+                return Tier::J3;
+            }
+            if (h.current < Tier::J4 && h.invocations >= thresholds_.j4_invocations) {
+                const double rate =
+                    h.invocations > 0 ? static_cast<double>(h.deopts) / h.invocations : 0.0;
+                if (rate <= thresholds_.j4_max_deopt_rate) return Tier::J4;
+            }
         }
         return h.current;
     }

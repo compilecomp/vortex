@@ -1365,7 +1365,8 @@ L_F64_TO_I64: {
 L_JUMP:
     VORTEX_PROFILE();
     if (ins.meta <= pc) {  // backward branch: profile + tiering handoff
-        record_backedge(module, method, static_cast<uint32_t>(pc));
+        record_backedge(module, method, static_cast<uint32_t>(pc), R,
+                        method.register_count);
     }
     pc = ins.meta;
     VORTEX_REDIRECT();
@@ -1380,7 +1381,8 @@ L_JUMP_TRUE: {
     }
     if (taken) {
         if (ins.meta <= pc) {
-            record_backedge(module, method, static_cast<uint32_t>(pc));
+            record_backedge(module, method, static_cast<uint32_t>(pc), R,
+                            method.register_count);
         }
         pc = ins.meta;
         VORTEX_REDIRECT();
@@ -1398,7 +1400,8 @@ L_JUMP_FALSE: {
     }
     if (taken) {
         if (ins.meta <= pc) {
-            record_backedge(module, method, static_cast<uint32_t>(pc));
+            record_backedge(module, method, static_cast<uint32_t>(pc), R,
+                            method.register_count);
         }
         pc = ins.meta;
         VORTEX_REDIRECT();
@@ -1893,10 +1896,21 @@ L_done:
 // (edge-triggered, docs/tiering.hpp). Between crossings this function is one
 // increment plus two counter comparisons at the call sites.
 void Interpreter::record_backedge(ugb::UGBModule& module,
-                                  ugb::UGBMethod& method, uint32_t pc) {
+                                  ugb::UGBMethod& method, uint32_t pc,
+                                  const TaggedValue* regs,
+                                  uint32_t reg_count) {
     (void)module;
     ugb::MethodRuntimeData& rt = method.runtime;
     ++rt.backedge_count;
+
+    // OSR snapshot producer (docs/tier-t0.md section 7; roadmap M4): the
+    // hook observes the LIVE register file at the backedge — the tiering
+    // driver's mid-loop snapshot source. The callee copies what it needs
+    // and returns; the dispatch loop never waits on it (Rule 15: the
+    // mutator is never blocked by observation).
+    if (backedge_hook_ != nullptr) {
+        backedge_hook_(backedge_hook_user_, method.id, pc, regs, reg_count);
+    }
 
     // Rule 22: promotion is a deterministic function of heat counters, never
     // wall-clock time. Rule 28: every decision is recorded and observable.
@@ -1915,15 +1929,57 @@ void Interpreter::record_backedge(ugb::UGBModule& module,
             tiering_.observer()->on_osr_request(method.id, pc, Tier::J1);
         }
     }
-    const Tier promoted = tiering_.evaluate(h);
-    if (promoted != Tier::T0) {
-        record_transition(method.id, pc, Tier::T0, promoted,
-                          TierTransitionRecord::Kind::Promote,
-                          "invocation threshold crossed");
+    const Tier promoted = tiering_.evaluate(h, speculation_verdict(method.id));
+    // Rule-43 entry trap (docs/tier-j4.md 12.4): the verdict rides INTO
+    // the policy — escalations are refused and demotions returned there;
+    // the interpreter records the outcome by name (Rules 28/76) and
+    // reports J1-only promotion from its own T0 view.
+    // CEM-26 cost note (@warm, gate-dependent): the verdict consult is a
+    // keyed map probe + an O(live regions + sites) ladder walk per
+    // backedge, and ONLY while a gate is installed for the method (the
+    // gate owner keeps that window bounded and short-lived — the common
+    // case has no gate at all, one map probe per backedge).
+    if (promoted != h.current) {
+        const TierTransitionRecord::Kind kind =
+            promoted < h.current ? TierTransitionRecord::Kind::Fallback
+                                 : TierTransitionRecord::Kind::Promote;
+        record_transition(method.id, pc, h.current, promoted, kind,
+                          promoted < h.current
+                              ? "Rule-43 entry trap: speculation refused"
+                              : "invocation threshold crossed");
         if (tiering_.observer() != nullptr) {
-            tiering_.observer()->on_promote(method.id, Tier::T0, promoted);
+            if (promoted < h.current) {
+                tiering_.observer()->on_demote(method.id, h.current, promoted);
+            } else {
+                tiering_.observer()->on_promote(method.id, h.current, promoted);
+            }
         }
     }
+}
+
+void Interpreter::set_speculation_gate(
+    uint32_t method_id, const deopt::RegionTable* table,
+    deopt::ThrottlePolicy policy) {
+    SpeculationGate* slot = speculation_gates_.find(method_id);
+    if (slot != nullptr) {
+        slot->table = table;
+        slot->policy = policy;
+        return;
+    }
+    speculation_gates_.insert(method_id, SpeculationGate{table, policy});
+}
+
+void Interpreter::clear_speculation_gate(uint32_t method_id) {
+    speculation_gates_.erase(method_id);
+}
+
+deopt::EntryDecision Interpreter::speculation_verdict(
+    uint32_t method_id) const {
+    const SpeculationGate* gate = speculation_gates_.find(method_id);
+    if (gate == nullptr || gate->table == nullptr) {
+        return deopt::EntryDecision::Enter;
+    }
+    return gate->table->entry_check(gate->policy);
 }
 
 // @cold — name-resolution caches: first call per token, then an array index

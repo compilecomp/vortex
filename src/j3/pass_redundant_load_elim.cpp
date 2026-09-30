@@ -3,7 +3,6 @@
 #include "passes_internal.hpp"
 
 #include <algorithm>
-#include <unordered_map>
 #include <utility>
 #include "vortex/support/containers.hpp"
 
@@ -41,15 +40,13 @@ uint32_t redundant_load_elim(Graph& g, BuiltGraph& built) {
         // The block's live effectful nodes in effect-chain order (the chain
         // is the program-order truth after splices — Rule 55; id order is
         // only program order within one origin).
-        std::unordered_map<NodeId, uint32_t> rank;
-        chain_order(g, built, b, rank);
+        ChainOrder co;
+        chain_order(g, built, b, co);
         std::vector<NodeId> chain;
-        chain.reserve(rank.size());
-        for (const auto& [id, r] : rank) {
+        chain.reserve(co.chain.size());
+        for (const NodeId id : co.chain) {
             if (!g.node(id).dead) chain.push_back(id);
         }
-        std::sort(chain.begin(), chain.end(),
-                  [&](NodeId a, NodeId c) { return rank[a] < rank[c]; });
         support::FlatHashMap<std::pair<NodeId, int64_t>, NodeId, PairHash>
             known;
         for (const NodeId id : chain) {

@@ -37,10 +37,6 @@ uint32_t kill_block_nodes(ir::Graph& g, const BuiltGraph& built,
 void compute_dominators(const BuiltGraph& built, std::vector<uint32_t>& rpo,
                         std::vector<uint32_t>& idom);
 
-/// The Smi domain bounds (the int63 payload range, T0-verbatim).
-int64_t smi_min();
-int64_t smi_max();
-
 /// Clones a constant node beside `near_id` and types it (canonicalization,
 /// folding and inlining share it).
 ir::NodeId clone_const(ir::Graph& g, BuiltGraph& built, ir::NodeId near_id,

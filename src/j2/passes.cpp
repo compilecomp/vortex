@@ -35,8 +35,10 @@ using ir::Node;
 using ir::NodeId;
 using ir::NodeKind;
 
-int64_t smi_min() { return static_cast<int64_t>(0xFFFFFFFFFFFFFFFFull / 4 + 1); }
-int64_t smi_max() { return static_cast<int64_t>(0xFFFFFFFFFFFFFFFFull / 4); }
+// The Smi domain bounds are TaggedValue::smi_min()/smi_max()
+// (include/vortex/support/tagged_value.hpp) — ONE spelling for every tier
+// (the M4 unification; the old local pair here had a sign bug in the min
+// bound, silently disabling Smi-const folding).
 
 // ---- growth helper -----------------------------------------------------------
 
@@ -47,6 +49,7 @@ void sync_built(const ir::Graph& g, BuiltGraph& built) {
     if (built.block_of.size() < n) built.block_of.resize(n, UINT32_MAX);
     if (built.insn_of.size() < n) built.insn_of.resize(n, UINT32_MAX);
     if (built.spliced.size() < n) built.spliced.resize(n, 0);
+    if (built.inline_paths.size() < n) built.inline_paths.resize(n);
 }
 
 uint32_t intersect_idom(uint32_t a, uint32_t b,

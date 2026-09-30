@@ -100,6 +100,41 @@ int RegionTable::throttle_verdict(const ThrottlePolicy& policy) const {
     return 0;
 }
 
+// throttle_verdict is not the only consumer of the ladder — the run path
+// and the tiering driver go through entry_check (below), which mirrors
+// these numbers.
+EntryDecision RegionTable::entry_check(const ThrottlePolicy& policy,
+                                       uint32_t target_region) const {
+    // Target-scoped arm: the caller asked to enter THAT region — a dead
+    // target refuses even if the rest of the method is healthy (the entry
+    // would land inside code whose speculation already died).
+    if (target_region != UINT32_MAX) {
+        const RegionDescriptor* target = find_by_id(target_region);
+        if (target == nullptr || target->state == RegionState::Stale ||
+            target->state == RegionState::Blacklisted) {
+            return EntryDecision::DowngradeTier;
+        }
+    }
+    // Whole-method ladder — mirrors throttle_verdict (the two can never
+    // disagree; docs/deopt-rbpd.md section 9).
+    if (method_failure_count_ >= policy.method_threshold) {
+        return EntryDecision::RefuseMethod;
+    }
+    for (const RegionDescriptor& r : regions_) {
+        if (r.state == RegionState::Blacklisted ||
+            r.failure_count >= policy.region_threshold) {
+            return EntryDecision::DowngradeTier;
+        }
+    }
+    for (const auto& [site, count] : site_counts_) {
+        (void)site;
+        if (count >= policy.site_threshold) {
+            return EntryDecision::WeakenAssumptions;
+        }
+    }
+    return EntryDecision::Enter;
+}
+
 void RegionTable::on_suspension(uint32_t region_id, uint32_t site_id,
                                 uint64_t tick) {
     // The event carries the RAW region id (an out-of-range id stays out of

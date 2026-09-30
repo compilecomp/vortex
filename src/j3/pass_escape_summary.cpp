@@ -35,30 +35,38 @@ ir::EscapeSummary summarize(const Graph& g, const BuiltGraph& built,
     // the cycle: a phi cycle alone does not escape; real escapes reach the
     // memo through non-phi users).
     support::FlatHashMap<NodeId, uint8_t> memo;  // bit0 set = escaped
-    std::function<bool(NodeId)> escapes_value = [&](NodeId v) -> bool {
-        if (const uint8_t* m = memo.find(v)) return (*m & 1) != 0;
-        memo.insert(v, 0);  // in progress
-        bool result = false;
-        for (uint32_t id = 0; id < g.node_count() && !result; ++id) {
-            const Node& n = g.node(id);
-            if (n.dead) continue;
-            for (size_t i = 0; i < n.data_inputs.size(); ++i) {
-                if (n.data_inputs[i] != v) continue;
-                if (n.kind == NodeKind::FrameState) continue;  // remat
-                if (n.kind == NodeKind::Return) { result = true; break; }
-                if (n.kind == NodeKind::Store && i == 1) { result = true; break; }
-                if (n.kind == NodeKind::Call) { result = true; break; }
-                if (n.kind == NodeKind::Allocate) { result = true; break; }
-                if (n.kind == NodeKind::Phi && n.id != v) {
-                    if (escapes_value(n.id)) { result = true; break; }
+    // Free function (no std::function — Rule 50 hygiene): the memo rides
+    // as an explicit parameter and the recursion is a plain call.
+    struct EscapeWalk {
+        const Graph& g;
+        support::FlatHashMap<NodeId, uint8_t>& memo;
+
+        bool escapes_value(NodeId v) {
+            if (const uint8_t* m = memo.find(v)) return (*m & 1) != 0;
+            memo.insert(v, 0);  // in progress
+            bool result = false;
+            for (uint32_t id = 0; id < g.node_count() && !result; ++id) {
+                const Node& n = g.node(id);
+                if (n.dead) continue;
+                for (size_t i = 0; i < n.data_inputs.size(); ++i) {
+                    if (n.data_inputs[i] != v) continue;
+                    if (n.kind == NodeKind::FrameState) continue;  // remat
+                    if (n.kind == NodeKind::Return) { result = true; break; }
+                    if (n.kind == NodeKind::Store && i == 1) { result = true; break; }
+                    if (n.kind == NodeKind::Call) { result = true; break; }
+                    if (n.kind == NodeKind::Allocate) { result = true; break; }
+                    if (n.kind == NodeKind::Phi && n.id != v) {
+                        if (escapes_value(n.id)) { result = true; break; }
+                    }
                 }
             }
+            memo.insert(v, static_cast<uint8_t>(result ? 3 : 2));  // bit1 = done
+            return result;
         }
-        memo.insert(v, static_cast<uint8_t>(result ? 3 : 2));  // bit1 = done
-        return result;
     };
+    EscapeWalk walk{g, memo};
     for (uint32_t p = 0; p < params.size(); ++p) {
-        if (escapes_value(params[p])) s.params[p] = ir::ParamEscape::ArgEscape;
+        if (walk.escapes_value(params[p])) s.params[p] = ir::ParamEscape::ArgEscape;
     }
     for (uint32_t id = 0; id < g.node_count(); ++id) {
         const Node& n = g.node(id);

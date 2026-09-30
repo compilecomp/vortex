@@ -19,3 +19,9 @@
 - Progress accounting: each M4 batch updates `.cep/baseline.md` with the
   new counts; a batch that does not reduce the count does not count as
   progress (Rule 121 spirit: measured, not asserted).
+- Amended 2026-09-30 (M4 closure): batch 1 (the J4 tree + its test/bench
+  files) shipped CEP&CC-complete and severity-1 clean; batches 2+ (the
+  remaining trees) continue per the remediation plan in
+  `.cep/baseline.md`. The expiration DATE above is the binding term —
+  the milestone parenthetical is superseded (the migration outlives the
+  M4 boundary and is tracked batch by batch in docs/roadmap.md).

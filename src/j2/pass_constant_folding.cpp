@@ -9,6 +9,7 @@
 
 #include "passes_internal.hpp"
 #include "vortex/runtime/object_model.hpp"
+#include "vortex/support/tagged_value.hpp"
 
 namespace vortex::j2 {
 using ir::AccessKind;
@@ -27,7 +28,9 @@ using ir::NodeKind;
 bool smi_const(const Node& c) {
     if (c.const_value & 1) return false;
     const int64_t raw = c.const_value >> 1;
-    return raw >= smi_min() && raw <= smi_max();
+    // ONE Spelling (M4 unification): the canonical T0 bounds — the old
+    // local pair had a sign-broken min, which silently disabled folding.
+    return raw >= TaggedValue::smi_min() && raw <= TaggedValue::smi_max();
 }
 
 double bits_to_f64(int64_t bits) {
@@ -61,7 +64,9 @@ bool fold_one(ir::Graph& g, BuiltGraph& built, Node& node) {
         if (!smi_const(lhs) || !smi_const(rhs)) return false;
         int64_t r = 0;
         if (__builtin_add_overflow(untag(lhs), untag(rhs), &r)) return false;
-        if (r < smi_min() || r > smi_max()) return false;  // would trap
+        if (r < TaggedValue::smi_min() || r > TaggedValue::smi_max()) {
+            return false;  // would trap
+        }
         return finish(r << 1, JType::Smi);
     }
     case NodeKind::Sub: {
@@ -70,7 +75,7 @@ bool fold_one(ir::Graph& g, BuiltGraph& built, Node& node) {
         if (!smi_const(lhs) || !smi_const(rhs)) return false;
         int64_t r = 0;
         if (__builtin_sub_overflow(untag(lhs), untag(rhs), &r)) return false;
-        if (r < smi_min() || r > smi_max()) return false;
+        if (r < TaggedValue::smi_min() || r > TaggedValue::smi_max()) return false;
         return finish(r << 1, JType::Smi);
     }
     case NodeKind::Mul: {
@@ -79,7 +84,7 @@ bool fold_one(ir::Graph& g, BuiltGraph& built, Node& node) {
         if (!smi_const(lhs) || !smi_const(rhs)) return false;
         int64_t r = 0;
         if (__builtin_mul_overflow(untag(lhs), untag(rhs), &r)) return false;
-        if (r < smi_min() || r > smi_max()) return false;
+        if (r < TaggedValue::smi_min() || r > TaggedValue::smi_max()) return false;
         return finish(r << 1, JType::Smi);
     }
     case NodeKind::And: case NodeKind::Or: case NodeKind::Xor: {

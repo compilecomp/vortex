@@ -84,8 +84,12 @@ struct DeoptFrame {
     std::vector<RematEntry> remats;
 };
 
-/// One guard's deopt metadata. Owned by the J2Code the emitted stubs point
-/// into (stable addresses — the stubs embed them as immediates).
+/// One guard's deopt metadata. Owned by the J2Code; the emitted stubs
+/// reference records through publish-time relocations (Rule 56: the
+/// DEOPT-RECORD references are address-free until publication; the
+/// remaining baked addresses — klass handles passed via the job — are
+/// compile-time inputs shared by every repeated compile of one runtime
+/// instance, so they do not affect the same-instance determinism DoD).
 struct DeoptRecord {
     std::vector<DeoptFrame> frames;  // innermost first
     /// RBPD identity: region_id == the index of this record's region in the
@@ -126,10 +130,23 @@ struct J2Code {
     /// J2 leaves has_summary = false.
     ir::EscapeSummary summary;
     bool has_summary = false;
-    /// Live deopt records — the emitted stubs embed addresses INTO this
-    /// vector, so it is shared (never copied) from compilation through
-    /// publication. Stable addresses: reserved once, filled once.
+    /// Live deopt records — shared (never copied) from compilation through
+    /// publication; publish_j2 patches the stub relocations against THIS
+    /// vector. Stable addresses: reserved once, filled once.
     std::shared_ptr<std::vector<DeoptRecord>> records;
+    /// Publish-time address patches (Rule 56 determinism): the stubs'
+    /// record-pointer imm64s carry ZERO in `code`; publish_j2 patches each
+    /// {code_offset} with &records[record_index]. The deopt-record
+    /// references are therefore address-free and the compile output is
+    /// bit-identical across repeated compiles of one runtime instance
+    /// (klass-handle imm64s are compile-time inputs, see DeoptRecord
+    /// above); the runtime behavior is unchanged (same addresses, applied
+    /// later).
+    struct RecordReloc {
+        uint32_t code_offset = 0;   // offset of the imm64 payload in code
+        uint32_t record_index = 0;  // index into `records`
+    };
+    std::vector<RecordReloc> record_relocs;
     bool budget_exceeded = false;  // pipeline stopped early; code still valid
     /// Pass telemetry (Rule 120: deterministic, assertable in tests —
     /// golden pass counts lock the pipeline's behavior).
@@ -146,7 +163,19 @@ struct J2Executable {
     std::shared_ptr<const std::vector<DeoptRecord>> records;
     /// Mutable: the runtime advances failure counters on it (Rule 43).
     std::shared_ptr<deopt::RegionTable> regions;
+    /// The Rule-43 ladder this executable is judged against (entry trap +
+    /// failure accounting use the SAME policy so the two never disagree).
+    /// The tiering driver may tighten it per method (docs/deopt-rbpd.md 7).
+    deopt::ThrottlePolicy throttle_policy;
 };
+
+/// Deopt chain depth bound (the pipeline's inline_depth_cap + root,
+/// rounded up; a defensive named bound, not a tuning knob — Rule 72).
+/// SHARED with the J4 engine: J4's inline depth is capped at
+/// `kMaxDeoptFrames - 1` so every spliced frame stays representable in
+/// the deopt record (a runtime-ABI capacity constraint — a Rule-15 safety
+/// constraint, not an optimization budget).
+inline constexpr size_t kMaxDeoptFrames = 8;
 
 /// Compiles one method through the full J2 pipeline. Refusal (unsupported
 /// opcode, budget) fails the Result with a named reason — the caller keeps

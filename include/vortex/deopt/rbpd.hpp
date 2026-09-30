@@ -143,6 +143,36 @@ struct ThrottlePolicy {
     uint32_t method_threshold = 64;
 };
 
+/// Rule-43 consumption (docs/deopt-rbpd.md section 9; roadmap M4): the
+/// ENTRY-TRAP decision the run path and the tiering driver must honor
+/// BEFORE entering or continuing in optimized code. The ladder mirrors
+/// throttle_verdict's numbers so the two never disagree.
+enum class EntryDecision : uint8_t {
+    Enter = 0,              // speculation healthy — enter
+    WeakenAssumptions = 1,  // a site is past its threshold — entering is
+                            // still legal, but the driver must schedule a
+                            // weaker-assumption recompile
+    DowngradeTier = 2,      // the target region is dead (Stale /
+                            // Blacklisted) or some region is past its
+                            // threshold — refuse entry; the driver moves
+                            // the method to its fallback tier (Rule 40)
+    RefuseMethod = 3,       // method-wide chronic failure — no speculation
+                            // on this method until the caller resets expiry
+                            // (it owns the reset)
+};
+
+/// Named form of the entry-trap decision (Rule 76: refusals carry the
+/// reason; Rule 120: telemetry is spellable).
+constexpr const char* entry_decision_name(EntryDecision d) noexcept {
+    switch (d) {
+        case EntryDecision::Enter: return "Enter";
+        case EntryDecision::WeakenAssumptions: return "WeakenAssumptions";
+        case EntryDecision::DowngradeTier: return "DowngradeTier";
+        case EntryDecision::RefuseMethod: return "RefuseMethod";
+    }
+    return "Unknown";
+}
+
 class RegionTable {
 public:
     uint32_t add_region(RegionDescriptor desc);
@@ -176,6 +206,15 @@ public:
     /// running, 1 = recompile with weaker assumptions, 2 = downgrade tier,
     /// 3 = blacklist (temporary; the caller owns expiry).
     int throttle_verdict(const ThrottlePolicy& policy) const;
+
+    /// The entry trap (EntryDecision above). `target_region` narrows the decision to one region
+    /// (UINT32_MAX = whole-method entry): a dead target refuses regardless
+    /// of how healthy the rest of the method is, because the caller asked
+    /// to enter THAT region. An executable with no region table records
+    /// (M0 legacy shape) always enters — its fallback is the Rule-40
+    /// whole-method rerun by construction.
+    EntryDecision entry_check(const ThrottlePolicy& policy,
+                              uint32_t target_region = UINT32_MAX) const;
 
     const DeoptEvent* last_event() const noexcept { return &last_event_; }
     uint64_t method_failure_count() const noexcept {

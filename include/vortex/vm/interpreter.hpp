@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "vortex/gc/icggc.hpp"
+#include "vortex/deopt/rbpd.hpp"
 #include "vortex/runtime/interop.hpp"
 #include "vortex/runtime/tiering.hpp"
 #include "vortex/support/containers.hpp"
@@ -140,6 +141,34 @@ public:
         return {transitions_.data(), transitions_size_};
     }
 
+    /// Rule-43 consumption in the tiering driver (docs/tier-j4.md section
+    /// 12.4; roadmap M4): the compile-queue owner installs one gate per
+    /// method that has optimized code, backed by that executable's region
+    /// table. Promotions to J2/J3/J4 consult the gate's entry verdict —
+    /// DowngradeTier/RefuseMethod refuse re-speculation while the caller
+    /// owns expiry (the gate is non-owning; clear_speculation_gate or a
+    /// replacement install ends the block).
+    void set_speculation_gate(uint32_t method_id,
+                              const deopt::RegionTable* table,
+                              deopt::ThrottlePolicy policy);
+    void clear_speculation_gate(uint32_t method_id);
+
+    /// The Rule-43 entry verdict for `method_id` (Enter when no gate is
+    /// installed). The driver API for tier logic beyond promotion gating.
+    deopt::EntryDecision speculation_verdict(uint32_t method_id) const;
+
+    /// OSR snapshot producer (docs/tier-t0.md section 7; roadmap M4):
+    /// fired at every backedge with the live register file — the tiering
+    /// driver's mid-loop snapshot source for executed OSR entry (the M4
+    /// parity test consumes exactly this; Rule 18 parity is pinned there).
+    using BackedgeHook = void (*)(void* user, uint32_t method_id,
+                                  uint32_t pc, const TaggedValue* regs,
+                                  uint32_t reg_count);
+    void set_backedge_hook(BackedgeHook hook, void* user) noexcept {
+        backedge_hook_ = hook;
+        backedge_hook_user_ = user;
+    }
+
     /// J1 helper hook (docs/roadmap.md M1): resolves and invokes a builtin
     /// by its module token — the C++ side of J1's CALL_BUILTIN token path.
     /// Uses the same (token -> registry slot) cache T0's handler uses.
@@ -235,7 +264,8 @@ private:
 
     // Dispatch-loop helpers.
     void record_backedge(ugb::UGBModule& module, ugb::UGBMethod& method,
-                         uint32_t pc);
+                         uint32_t pc, const TaggedValue* regs,
+                         uint32_t reg_count);
     int32_t resolve_method(ugb::UGBModule& module, uint32_t token) const;
     int32_t resolve_builtin(ugb::UGBModule& module, uint32_t token) const;
     int32_t resolve_virtual(ugb::UGBModule& module, uint32_t klass_id,
@@ -275,6 +305,18 @@ private:
 
     // Superinstruction hints for J1 (Rule 50: flat open addressing).
     support::FlatHashMap<uint64_t, uint64_t> bigram_counts_;
+
+    // Rule-43 gates (docs/tier-j4.md 12.4): method id -> the executable's
+    // region table + policy. Non-owning pointers; the gate owner keeps the
+    // executable alive. Flat map (Rule 50); touched on backedges only.
+    struct SpeculationGate {
+        const deopt::RegionTable* table = nullptr;
+        deopt::ThrottlePolicy policy;
+    };
+    support::FlatHashMap<uint32_t, SpeculationGate> speculation_gates_;
+
+    BackedgeHook backedge_hook_ = nullptr;
+    void* backedge_hook_user_ = nullptr;
 
     // Rule 28: bounded, chronologically ordered transition buffer.
     std::array<TierTransitionRecord, 64> transitions_{};

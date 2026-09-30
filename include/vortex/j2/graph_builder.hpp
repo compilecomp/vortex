@@ -66,6 +66,14 @@ struct BuiltGraph {
     /// OSR-capable blocks: bytecode offsets with incoming backedges (the
     /// same set J1 uses for its OSR stubs).
     std::vector<uint32_t> osr_block_offsets;
+    /// Per-CALL-node inline chain (tier-j4.md section 6): the method ids
+    /// whose bodies were spliced to produce this call node, root first.
+    /// The J4 unbounded inliner refuses to splice a method already on the
+    /// chain — the call-graph cycle guard that REPLACES the depth/site
+    /// caps as the termination invariant (Rule 15/16: no artificial inline
+    /// budget, deterministic termination only). J2/J3 keep their caps;
+    /// the chain costs them nothing (caps fire first).
+    std::vector<std::vector<uint32_t>> inline_paths;
     /// vreg count of the compiled method (frame layout input).
     uint32_t register_count = 0;
     /// Per-block ENTRY register maps (the merge/Phi result the block's

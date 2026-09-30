@@ -269,11 +269,29 @@ int64_t helper_invoke_token(J1Context* ctx, uint32_t token,
     auto* module = static_cast<ugb::UGBModule*>(const_cast<void*>(ctx->module));
     auto* interp = static_cast<vm::Interpreter*>(ctx->interpreter);
     if (module == nullptr || interp == nullptr || token == 0 ||
-        token > module->method_table.size()) {
+        token > module->methods.size()) {
         ctx->last_error = static_cast<uint32_t>(J1ErrorId::kErrCallToken);
         return static_cast<int64_t>(J1ErrorId::kErrCallToken);
     }
-    ugb::UGBMethod& callee = module->method_table[token - 1];
+    // Token-pool order is FIRST-REFERENCE order (intern_method interns a
+    // name when first parsed — for a forward reference that is inside an
+    // EARLIER body), so token-1 is NOT the method_table index. Resolve by
+    // NAME exactly like T0's Interpreter::resolve_method (one semantic
+    // contract, Rule 18); the old positional method_table[token-1] lookup
+    // silently called the WRONG method for any forward-referenced callee
+    // (caught by the M4 review's mutual-recursion test: even/odd came
+    // back with odd's parity). Backward references are unaffected: their
+    // token happens to equal index+1, so every existing shape is
+    // bit-identical under this fix.
+    const int32_t resolved =
+        module->find_method(module->methods[token - 1].name);
+    if (resolved < 0 ||
+        static_cast<size_t>(resolved) >= module->method_table.size()) {
+        ctx->last_error = static_cast<uint32_t>(J1ErrorId::kErrCallToken);
+        return static_cast<int64_t>(J1ErrorId::kErrCallToken);
+    }
+    ugb::UGBMethod& callee =
+        module->method_table[static_cast<size_t>(resolved)];
     tlab_adopt(ctx);
     auto run = interp->run(*module, callee.name,
                            std::span<const TaggedValue>(args, argc));

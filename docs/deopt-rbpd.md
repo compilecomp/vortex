@@ -148,3 +148,32 @@ During partial deopt:
 
 Every optimized trap site aligns with a partial deopt region boundary — this is a
 hard architectural invariant.
+
+## 9. Rule-43 consumption — the entry trap (M4)
+
+The throttle ladder is not telemetry. The run path and the tiering driver consume
+it through `RegionTable::entry_check(policy, target_region)` BEFORE entering or
+continuing in optimized code. The decision ladder mirrors `throttle_verdict` so
+the two can never disagree:
+
+| Decision | Meaning | Driver action |
+|----------|---------|---------------|
+| `Enter` | speculation healthy | enter |
+| `WeakenAssumptions` | a site is past its threshold | enter; schedule a weaker-assumption recompile |
+| `DowngradeTier` | target region dead, or some region past its threshold | refuse entry; move the method to its fallback tier (Rule 40) |
+| `RefuseMethod` | method-wide chronic failure | refuse entry until the caller resets expiry (the caller owns the reset) |
+
+`run_j2` (and therefore `run_j3`, which shares the run path) performs the trap at
+every entry and refuses with the named `SpeculationDisabled` error carrying the
+decision name and the method failure count — refusals are never silent
+(Rule 76). Failure accounting and the entry trap use the SAME
+`J2Executable::throttle_policy` so accounting and enforcement cannot drift. A
+target-scoped check (`target_region != UINT32_MAX`) refuses when THAT region is
+`Stale`/`Blacklisted` even if the method is otherwise healthy — entering a dead
+region's code is exactly the re-entry the state machine forbids. An executable
+without region records always enters; its fallback is the Rule-40 whole-method
+rerun by construction. The recovery path returned by `on_guard_failure` needs no
+further runtime action inside the failing execution (the resume is T0 by
+construction); its enforcement surface is the next entry's trap, and
+successor-region re-entry is the J4 region publication machinery (docs/tier-j4.md
+section 4).

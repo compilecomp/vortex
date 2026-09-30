@@ -79,4 +79,11 @@ struct J3Stats {
 ir::EscapeSummary run_j3_pipeline(ir::Graph& graph, j2::BuiltGraph& built,
                                   const J3Budget& budget, J3Stats& stats);
 
+/// The canonical graph hash (Rule 56): an FNV-1 walk over live nodes in id
+/// order (kind, aux, payload, data inputs). ONE construction shared by the
+/// escape-summary Identity binding (docs/xlea.md section 4.1) and the J4
+/// fixed-point fingerprint (docs/tier-j4.md section 12.2) — the two must
+/// never disagree about a graph's identity.
+uint64_t graph_hash(const ir::Graph& graph);
+
 }  // namespace vortex::j3

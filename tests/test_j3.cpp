@@ -126,13 +126,17 @@ public:
         job.double_klass = bindings_.double_klass;
         job.node_cap = node_cap;
         job.interop = interop_;
-        auto code = compile_j3(job);
+        auto code = compile_j3(job, &j3_stats_);
         if (!code) {
             std::printf("  [j3-harness] compile: %s\n",
                         code.error().message.c_str());
             return std::unexpected(code.error());
         }
         code_ = std::make_unique<J2Code>(std::move(*code));
+        // Publish the summary the compile produced (the M4 end-to-end
+        // follow-up: the harness previously published a default-constructed
+        // summary, so the identity binding was never exercised here).
+        summary_ = code_->summary;
         auto pub = publish_j3(*code_, summary_, infra::global_code_range());
         if (!pub) return std::unexpected(pub.error());
         ex_ = std::make_unique<J3Executable>(std::move(*pub));
@@ -153,6 +157,18 @@ public:
     const J2Code& code() const { return *code_; }
     uint64_t counter() const { return counter_member_; }
     const j2::J2Executable& core() const { return ex_->core; }
+    j2::J2Executable& core() { return ex_->core; }
+    /// The full 60-stage telemetry of the last compile (golden tests).
+    const J3Stats& j3_stats() const { return j3_stats_; }
+    /// The summary the published executable carries.
+    const ir::EscapeSummary& published_summary() const { return ex_->summary; }
+
+    /// Re-runs the PUBLISHED executable without recompiling: the Rule-43
+    /// entry-trap tests must exercise the PERSISTED region table (a fresh
+    /// run() rebuilds module, table and counters from scratch).
+    vm::Result<TaggedValue> rerun(const std::vector<TaggedValue>& args) {
+        return run_j3(*ex_, bindings_, args, *interp_);
+    }
 
 private:
     const char* src_;
@@ -164,6 +180,7 @@ private:
     j1::J1Bindings bindings_;
     std::unique_ptr<J2Code> code_;
     ir::EscapeSummary summary_;
+    J3Stats j3_stats_;
     std::unique_ptr<J3Executable> ex_;
     uint64_t* counter_ = nullptr;
     uint64_t counter_member_ = 0;
@@ -1067,6 +1084,136 @@ VORTEX_TEST(j3_poll_capture_resumes_instead_of_rerun) {
     }
 }
 
+// ---- Rule-43 consumption: the entry trap (docs/deopt-rbpd.md section 9) -----
+
+constexpr const char* kTrapProgram = R"(
+.method main(regs=6, args=0)
+  Const.I32 v0, 1
+  Call.Builtin v1, v0, 0, count
+  safepoint
+  Return v1
+.end
+)";
+
+VORTEX_TEST(j3_rule43_entry_trap_refuses_chronic_method_failure) {
+    // After the method crosses its failure threshold the published
+    // executable refuses re-entry with the NAMED SpeculationDisabled
+    // error; the healthy baseline run just before proves the trap is the
+    // counters' doing, and the verdict ladder + the entry trap agree.
+    J3Harness h(kTrapProgram, "main");
+    auto first = h.run({});
+    VORTEX_EXPECT(first.has_value());
+    if (!first) return;
+    VORTEX_EXPECT_EQ(first->as_smi(), 65);
+
+    deopt::ThrottlePolicy tiny;
+    tiny.site_threshold = 2;
+    tiny.region_threshold = 3;
+    tiny.method_threshold = 4;
+    h.core().throttle_policy = tiny;
+
+    auto& regions = *h.core().regions;
+    VORTEX_EXPECT(regions.size() >= 1);
+    VORTEX_EXPECT(regions.entry_check(tiny) == EntryDecision::Enter);
+    for (uint32_t i = 0; i < tiny.method_threshold; ++i) {
+        regions.on_guard_failure(0, tiny, /*site_id=*/0,
+                                 DeoptReason::GuardFailed, i);
+    }
+    VORTEX_EXPECT_EQ(regions.throttle_verdict(tiny), 3);
+    VORTEX_EXPECT(regions.entry_check(tiny) == EntryDecision::RefuseMethod);
+
+    auto refused = h.rerun({});
+    VORTEX_EXPECT(!refused.has_value());
+    if (refused) return;
+    VORTEX_EXPECT(refused.error().code ==
+                  support::ErrorCode::SpeculationDisabled);
+    VORTEX_EXPECT(refused.error().message.find("Rule-43 entry trap") !=
+                  std::string::npos);
+    VORTEX_EXPECT(refused.error().message.find("RefuseMethod") !=
+                  std::string::npos);
+    VORTEX_EXPECT(refused.error().message.find("4 method deopt failures") !=
+                  std::string::npos);
+}
+
+VORTEX_TEST(j3_rule43_entry_trap_downgrades_on_blacklisted_region) {
+    // One region past its threshold downgrades the method's entry even
+    // though the method-level counter is under its own threshold — the
+    // ladder is region-first, exactly like throttle_verdict.
+    J3Harness h(kTrapProgram, "main");
+    auto first = h.run({});
+    VORTEX_EXPECT(first.has_value());
+    if (!first) return;
+
+    deopt::ThrottlePolicy tiny;
+    tiny.site_threshold = UINT32_MAX;
+    tiny.region_threshold = 2;
+    tiny.method_threshold = UINT32_MAX;
+    h.core().throttle_policy = tiny;
+
+    auto& regions = *h.core().regions;
+    regions.on_guard_failure(0, tiny, 0, DeoptReason::GuardFailed, 0);
+    regions.on_guard_failure(0, tiny, 0, DeoptReason::GuardFailed, 1);
+    VORTEX_EXPECT_EQ(regions.throttle_verdict(tiny), 2);
+    VORTEX_EXPECT(regions.entry_check(tiny) == EntryDecision::DowngradeTier);
+
+    auto refused = h.rerun({});
+    VORTEX_EXPECT(!refused.has_value());
+    if (refused) return;
+    VORTEX_EXPECT(refused.error().code ==
+                  support::ErrorCode::SpeculationDisabled);
+    VORTEX_EXPECT(refused.error().message.find("DowngradeTier") !=
+                  std::string::npos);
+}
+
+VORTEX_TEST(j3_rule43_entry_trap_target_scope_and_healthy_enter) {
+    // Three scoping laws: (1) a dead TARGET refuses even when the whole
+    // method is clean — entering that region's code is exactly the
+    // re-entry the state machine forbids; (2) a below-threshold site only
+    // weakens assumptions — entering stays legal and the run WORKS;
+    // (3) an executable without region records always enters.
+    J3Harness h(kTrapProgram, "main");
+    auto first = h.run({});
+    VORTEX_EXPECT(first.has_value());
+    if (!first) return;
+
+    deopt::ThrottlePolicy tiny;
+    tiny.site_threshold = 1;
+    tiny.region_threshold = 8;
+    tiny.method_threshold = 8;
+    h.core().throttle_policy = tiny;
+
+    auto& regions = *h.core().regions;
+    // (1) supersede region 0 with ZERO failures: whole-method arm is
+    // clean, the target-scoped arm must still refuse the STALE target.
+    RegionDescriptor replacement;
+    replacement.kind = RegionKind::Hot;
+    replacement.tier = 3;
+    const uint32_t fresh = regions.replace_region(0, replacement);
+    VORTEX_EXPECT(fresh != UINT32_MAX);
+    VORTEX_EXPECT(regions.entry_check(tiny) == EntryDecision::Enter);
+    VORTEX_EXPECT(regions.entry_check(tiny, 0) ==
+                  EntryDecision::DowngradeTier);  // stale target
+    VORTEX_EXPECT(regions.entry_check(tiny, fresh) == EntryDecision::Enter);
+    VORTEX_EXPECT(regions.entry_check(tiny, 9999) ==
+                  EntryDecision::DowngradeTier);  // no such region
+
+    // (2) one site failure = WeakenAssumptions: enter, and the run works
+    // (the counter advances by exactly the J3 body's single builtin call).
+    regions.on_guard_failure(fresh, tiny, /*site_id=*/7,
+                             DeoptReason::GuardFailed, 0);
+    VORTEX_EXPECT_EQ(regions.throttle_verdict(tiny), 1);
+    VORTEX_EXPECT(regions.entry_check(tiny) ==
+                  EntryDecision::WeakenAssumptions);
+    auto second = h.rerun({});
+    VORTEX_EXPECT(second.has_value());
+    if (!second) return;
+    VORTEX_EXPECT_EQ(second->as_smi(), 66);
+
+    // (3) no records at all — the M0 legacy shape — always enters.
+    RegionTable bare;
+    VORTEX_EXPECT(bare.entry_check(tiny) == EntryDecision::Enter);
+}
+
 // ---- deopt over a scalar-replaced frame (Rule 39 remat, both blockers) --------
 
 VORTEX_TEST(j3_deopt_rebuilds_scalar_replaced_wrapper) {
@@ -1179,4 +1326,227 @@ VORTEX_TEST(escape_summary_monotonicity_and_identity) {
                          ? ir::ParamEscape::Unknown
                          : table.lookup(9)->param(99),
                      ir::ParamEscape::Unknown);
+}
+
+// ---- M4 follow-ups: golden stage telemetry, splice-stamp dominance,
+// ---- publish_j3 summary end-to-end (docs/roadmap.md M4).
+
+// Golden-IR telemetry (Rule 120/127): the per-stage transformation counts
+// ARE the per-pass TU contract. The module below deterministically locks
+// the behavior of four pass TUs at once:
+//   slot 6  PSE / store-to-load forwarding (pass_redundant_load_elim):
+//           Load -> Store -> Load -> Load forwards BOTH loads to their
+//           stores (the stored value, never a pre-store load).
+//   slot 18 deferred field init (pass_deferred_field_init): transformations
+//           == 0 — the loads stay live in the deopt FrameStates (Rule 42
+//           keeps every vreg observable), so neither store is dead here.
+//   slot 19 CIOG construction (pass_ciog): one CallNode + one InlineSite
+//           record per site; the counts below lock that shape.
+//   slot 15 scalar replacement (pass_scalar_replacement): transformations
+//           == 1 — once PSE forwards the loads, the object collapses into
+//           a single-store window and the replacement fires (the cascade
+//           PSE -> SR is the cross-pass behavior this golden locks).
+VORTEX_TEST(j3_golden_stage_telemetry_locks_pass_tus) {
+    constexpr const char* kSrc = R"(
+.class W
+.field a in W
+.method main(regs=8, args=0)
+  New.Object v0, W
+  Const.I32 v1, 1
+  SetField v0, v1, W.a
+  GetField v2, v0, W.a
+  Const.I32 v3, 2
+  SetField v0, v3, W.a
+  GetField v4, v0, W.a
+  Add.Any v5, v2, v4
+  Return v5
+.end
+)";
+    J3Harness h(kSrc, "main");
+    auto res = h.run({});
+    VORTEX_EXPECT(res.has_value());
+    if (!res) return;
+    // Parity first: the golden numbers describe CORRECT behavior.
+    VORTEX_EXPECT_EQ(res->as_smi(), 3);
+
+    const J3Stats& st = h.j3_stats();
+    const auto& pse = st.stages[6];
+    VORTEX_EXPECT_EQ(std::string_view(pse.name), "PSE");
+    VORTEX_EXPECT(pse.result.status == StageStatus::Ran);
+    VORTEX_EXPECT_EQ(pse.result.transformations, 2u);
+    VORTEX_EXPECT_EQ(st.loads_forwarded, 2u);
+
+    // Locked goldens (harness path: warm-adapted bytecode + profile slots):
+    // - PSE forwarded both loads to their stores;
+    // - deferred field init killed NOTHING here: the loads stay live in
+    //   the deopt FrameStates (Rule 42 keeps every vreg observable), so
+    //   both stores remain observed;
+    // - CIOG recorded the shape (calls + sites + outlines);
+    // - scalar replacement DID fire once the forwarded loads collapsed the
+    //   object into a single-store window (the cascade PSE -> SR is the
+    //   cross-pass behavior this golden locks).
+    const auto& dfi = st.stages[18];
+    VORTEX_EXPECT_EQ(std::string_view(dfi.name), "DeferredFieldInit");
+    VORTEX_EXPECT(dfi.result.status == StageStatus::Ran);
+    VORTEX_EXPECT_EQ(dfi.result.transformations, 0u);
+
+    const auto& ciog = st.stages[19];
+    VORTEX_EXPECT_EQ(std::string_view(ciog.name), "CIOGConstruction");
+    VORTEX_EXPECT(ciog.result.status == StageStatus::Ran);
+    VORTEX_EXPECT_EQ(ciog.result.transformations, 3u);
+
+    const auto& sr = st.stages[15];
+    VORTEX_EXPECT_EQ(std::string_view(sr.name), "ScalarReplacement");
+    VORTEX_EXPECT(sr.result.status == StageStatus::Ran);
+    VORTEX_EXPECT_EQ(sr.result.transformations, 1u);
+    VORTEX_EXPECT_EQ(st.scalar_replaced, 1u);
+}
+
+// Golden-IR telemetry, LICM + BCE arms: a sum loop over an array with a
+// loop-invariant multiply. LICM hoists the invariant; BCE kills the bound
+// check whose range the loop proves.
+VORTEX_TEST(j3_golden_stage_telemetry_licm_bce) {
+    // The invariant Mul consumes the ARGUMENT (not foldable) and its result
+    // is consumed by the accumulator (DCE cannot kill it); the array access
+    // uses a constant index against a constant length so the stage-10
+    // ranges prove the guard (3 < 16).
+    constexpr const char* kSrc = R"(
+.method main(regs=12, args=1)
+  Const.I64 v1, 16
+  New.Array v2, v1
+  Const.I64 v3, 3
+  Const.I64 v7, 3
+  Array.Set v2, v3, v7
+  Array.Get v4, v2, v3
+  Const.I64 v5, 0
+  Const.I64 v6, 1
+  Const.I64 v8, 8
+  Const.I64 v11, 0
+  Add.I64 v5, v4, v5
+loop:
+  Eq.I64 v9, v8, v11
+  JumpTrue v9, done
+  Mul.I64 v10, v0, v7
+  Add.I64 v5, v5, v10
+  Sub.I64 v8, v8, v6
+  Jump loop
+done:
+  Return v5
+.end
+)";
+    J3Harness h(kSrc, "main");
+    auto res = h.run({TaggedValue::smi(16)});
+    VORTEX_EXPECT(res.has_value());
+    if (!res) return;
+    // 3 + 8 * (16 * 3)
+    VORTEX_EXPECT_EQ(res->as_smi(), 387);
+
+    const J3Stats& st = h.j3_stats();
+    // Golden: the CONSERVATIVE contract of LICM and BCE on this shape.
+    //
+    // LICM: the loop-invariant Mul's operands are wrapped in UNTAG
+    // coercions the builder materializes at the use site — and an Untag
+    // can trap on a non-Smi (its FrameState input marks it a deopt point).
+    // Hoisting it would move a trap out of its loop domain — the exact
+    // Rule-110 concern that already keeps Div/Rem in place. The pass
+    // therefore refuses (0 hoists) until value proofs (Smi guards) or
+    // untag-ifcation lands with the J4 range machinery.
+    const auto& licm = st.stages[30];
+    VORTEX_EXPECT_EQ(std::string_view(licm.name), "LICM");
+    VORTEX_EXPECT(licm.result.status == StageStatus::Ran);
+    VORTEX_EXPECT_EQ(licm.result.transformations, 0u);
+    VORTEX_EXPECT_EQ(st.hoisted_loops, 0u);
+    //
+    // BCE: the CHECK_BOUNDS guard's index/length travel through smi_guard
+    // TypeGuards, and the stage-10 ranges do not yet flow through guards —
+    // the proof (3 < 16) is not derivable, so nothing is killed. The range
+    // flow extension is tracked for J4 (docs/tier-j3.md stage 37 note).
+    const auto& bce = st.stages[35];
+    VORTEX_EXPECT_EQ(std::string_view(bce.name), "BoundsCheckElimination");
+    VORTEX_EXPECT(bce.result.status == StageStatus::Ran);
+    VORTEX_EXPECT_EQ(bce.result.transformations, 0u);
+    VORTEX_EXPECT_EQ(st.bounds_killed, 0u);
+}
+
+// Cross-origin (splice-stamp) guard dominance through the J3 arm: the
+// inlined helper's null guard on the SAME value the caller already guarded
+// is genuinely redundant — but the proof must come from CFG dominance, not
+// from id-order reasoning ACROSS the splice line (built.spliced stamps;
+// the M3 review's regression scenario). A wrong elimination shows up as a
+// second deopt/parities mismatch; a missed one as a survivor guard.
+VORTEX_TEST(j3_splice_stamp_guard_dominance_cross_origin) {
+    constexpr const char* kSrc = R"(
+.class W
+.field a in W
+.method helper(regs=4, args=1)
+  GetField v2, v0, W.a
+  Return v2
+.end
+.method main(regs=8, args=0)
+  New.Object v0, W
+  Const.I32 v1, 1
+  SetField v0, v1, W.a
+  GetField v2, v0, W.a
+  Call.Direct v3, v0, 1, helper
+  GetField v4, v0, W.a
+  Add.Any v5, v2, v4
+  Return v5
+.end
+)";
+    J3Harness h(kSrc, "main");
+    auto res = h.run({});
+    VORTEX_EXPECT(res.has_value());
+    if (!res) return;
+    VORTEX_EXPECT_EQ(res->as_smi(), 2);
+
+    // The helper WAS inlined (its guard is now a spliced node).
+    const J3Stats& st = h.j3_stats();
+    VORTEX_EXPECT(st.j2_core.inlined_calls >= 1);
+    // The caller's guards were consolidated: dominance (not id order)
+    // decides, and the result stays parity-exact either way. Locked
+    // golden: exactly one guard redundancy kill on this shape.
+    const auto& grd = st.stages[40];
+    VORTEX_EXPECT_EQ(std::string_view(grd.name), "GuardRedundancy");
+    VORTEX_EXPECT(grd.result.status == StageStatus::Ran);
+    VORTEX_EXPECT_EQ(grd.result.transformations, 1u);
+    VORTEX_EXPECT_EQ(st.guards_dominated, 1u);
+}
+
+// publish_j3 summary end-to-end: the stage-29 output rides the published
+// executable with the identity binding intact (docs/xlea.md section 4.1).
+VORTEX_TEST(j3_publish_summary_end_to_end) {
+    constexpr const char* kSrc = R"(
+.class W
+.field a in W
+.method callee(regs=4, args=1)
+  GetField v2, v0, W.a
+  Return v2
+.end
+.method main(regs=8, args=0)
+  New.Object v0, W
+  Const.I32 v1, 5
+  SetField v0, v1, W.a
+  Call.Direct v3, v0, 1, callee
+  Return v3
+.end
+)";
+    J3Harness h(kSrc, "main");
+    auto res = h.run({});
+    VORTEX_EXPECT(res.has_value());
+    if (!res) return;
+    VORTEX_EXPECT_EQ(res->as_smi(), 5);
+
+    // The compile artifact carries a bound summary...
+    VORTEX_EXPECT(h.code().has_summary);
+    const uint64_t hash = h.code().summary.graph_hash;
+    VORTEX_EXPECT(hash != 0);
+    // ...and publish_j3 attached the SAME summary to the executable: the
+    // identity hash names the exact graph the summary was computed on
+    // (the run path consumed it through run_j3 -> run_j2 already).
+    const ir::EscapeSummary& published = h.published_summary();
+    VORTEX_EXPECT_EQ(published.graph_hash, hash);
+    VORTEX_EXPECT_EQ(h.j3_stats().published_summaries, 1u);
+    // Stage-29 status is spelled, never faked.
+    const auto& es = h.j3_stats().stages[28];
+    VORTEX_EXPECT_EQ(std::string_view(es.name), "InterproceduralEA");
 }

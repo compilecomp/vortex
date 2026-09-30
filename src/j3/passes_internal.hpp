@@ -8,20 +8,20 @@
 #pragma once
 
 #include <cstdint>
-#include <unordered_map>
 #include <vector>
 
 #include "../j2/passes_internal.hpp"
 #include "vortex/ir/ciog.hpp"
 #include "vortex/ir/escape_summary.hpp"
+#include "vortex/support/containers.hpp"
 
 namespace vortex::j3 {
 
-// The Smi domain bounds (the int63 payload range, T0-verbatim).
-inline constexpr int64_t kSmiMin =
-    static_cast<int64_t>(0xFFFFFFFFFFFFFFFFull / 4 + 1);
-inline constexpr int64_t kSmiMax =
-    static_cast<int64_t>(0xFFFFFFFFFFFFFFFFull / 4);
+// The Smi domain bounds (the int63 payload range, T0-verbatim): ONE
+// spelling — the canonical TaggedValue bounds (M4 unification; the old
+// local formula had a sign-broken min, which neutered range clamping).
+inline constexpr int64_t kSmiMin = TaggedValue::smi_min();
+inline constexpr int64_t kSmiMax = TaggedValue::smi_max();
 
 /// The (base, key) alias key of a field access node: true for Field and
 /// RawOffset accesses, with the key tagged by domain (Field keys are
@@ -78,11 +78,18 @@ uint32_t build_ciog(ir::Graph& g, j2::BuiltGraph& built,
 ir::EscapeSummary summarize(const ir::Graph& g, const j2::BuiltGraph& built,
                             uint64_t graph_hash);
 
-// Effect-chain rank of every live effectful node in one block: nodes
+// Effect-chain order of every live effectful node in one block: nodes
 // earlier on the chain get smaller ranks (the chain is the program-order
-// truth after splices — Rule 55). Defined in pass_scalar_replacement.cpp;
-// shared with the chain-walking passes (RLE, deferred field init).
+// truth after splices — Rule 55). `chain` is the rank-ascending order (a
+// deterministic total order — unique ranks after normalization); `rank`
+// answers point lookups for the passes that need them. Defined in
+// pass_scalar_replacement.cpp; shared with the chain-walking passes (RLE,
+// deferred field init). Flat containers only (Rule 50).
+struct ChainOrder {
+    support::FlatHashMap<ir::NodeId, uint32_t> rank;
+    std::vector<ir::NodeId> chain;
+};
 void chain_order(const ir::Graph& g, const j2::BuiltGraph& built,
-                 uint32_t block, std::unordered_map<ir::NodeId, uint32_t>& rank);
+                 uint32_t block, ChainOrder& out);
 
 }  // namespace vortex::j3

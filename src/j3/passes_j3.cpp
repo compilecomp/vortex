@@ -23,12 +23,12 @@
 
 #include <algorithm>
 #include <functional>
-#include <unordered_map>
 
 #include "../j2/passes_internal.hpp"
 #include "vortex/ir/ciog.hpp"
 #include "vortex/runtime/object_model.hpp"
 #include "vortex/support/containers.hpp"
+#include "vortex/support/hash.hpp"
 
 namespace vortex::j3 {
 
@@ -257,6 +257,21 @@ ir::EscapeSummary run_j3_pipeline(Graph& graph, BuiltGraph& built,
         summarize(graph, built, 0);  // graph_hash set by the driver caller
     stats.published_summaries = 1;
     return summary;
+}
+
+uint64_t graph_hash(const ir::Graph& g) {
+    uint64_t h = support::kFnv1aBasis;
+    for (const ir::Node& n : g.nodes()) {
+        if (n.dead) continue;
+        h = support::fnv1a_mix(h, static_cast<uint64_t>(n.kind));
+        h = support::fnv1a_mix(h, n.aux);
+        h = support::fnv1a_mix(h, static_cast<uint64_t>(n.const_value));
+        h = support::fnv1a_mix(h, n.data_inputs.size());
+        for (const ir::NodeId in : n.data_inputs) {
+            h = support::fnv1a_mix(h, in);
+        }
+    }
+    return h;
 }
 
 }  // namespace vortex::j3

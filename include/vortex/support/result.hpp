@@ -28,6 +28,10 @@ enum class ErrorCode : uint8_t {
     // A mutation is legal only before dependent state exists (e.g. an
     // interop port-kind rebind after JIT code speculated on the binding).
     InvalidState,
+    // M4 addition (appended: ordinals above are serialized — never reorder).
+    // Rule-43 entry trap: the region table refused optimized entry for a
+    // method/region past its deopt thresholds (docs/deopt-rbpd.md 9).
+    SpeculationDisabled,
 };
 
 const char* error_code_name(ErrorCode code) noexcept;

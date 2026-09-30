@@ -47,6 +47,10 @@ if(VORTEX_BUILD_TOOLS)
     add_executable(vx tools/vx/main.cpp)
     target_link_libraries(vx PRIVATE vortex_core)
     target_compile_options(vx PRIVATE ${VORTEX_WARNINGS} ${VORTEX_HOT_FLAGS})
+
+    add_executable(vortex_bench tools/bench/bench_tiers.cpp)
+    target_link_libraries(vortex_bench PRIVATE vortex_core)
+    target_compile_options(vortex_bench PRIVATE ${VORTEX_WARNINGS})
 endif()
 
 # ---- tests ---------------------------------------------------------------------
