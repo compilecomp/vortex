@@ -1,7 +1,7 @@
 # Vortex
 
 four optimizing tiers, a speculative register interpreter, and the
-full runtime infrastructure around them — in C++26.**
+full runtime infrastructure around them in C++26.
 
 > **Vortex is an engine, not a language.** It ships no source language, no syntax,
 > no standard library of its own. Any guest language — static, dynamic, class-
