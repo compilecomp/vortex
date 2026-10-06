@@ -1,6 +1,6 @@
 # Vortex
 
-**The ultimate JIT: four optimizing tiers, a speculative register interpreter, and the
+four optimizing tiers, a speculative register interpreter, and the
 full runtime infrastructure around them — in C++26.**
 
 > **Vortex is an engine, not a language.** It ships no source language, no syntax,
@@ -16,26 +16,6 @@ J2  fast optimizing JIT (light SoN)       [remove the first cliff]
 J3  adaptive full optimizing JIT          [SoN + CIOG + RBPD, budgeted]
 J4  max deterministic optimizing JIT      [no budget, no search, fixed point]
 ```
-
-Vortex is a production-grade just-in-time compilation stack for a managed guest
-language. It is built around the **Universal Guest Bytecode (UGB)** — a register,
-capability-based bytecode with speculative typed forms — and every layer of a real
-virtual machine: adaptive interpretation, four JIT tiers, region-based partial
-deoptimization (**RBPD**), an incremental concurrent generational garbage collector
-(**ICGGC**), and the nine infrastructure systems that make a JIT shippable
-(dependency invalidation, W^X security, snapshots/AOT, M:N threading, FFI,
-observability, CPU dispatch, I-cache/code-cache management, power awareness).
-
-> **Status: M2 — J2 fast optimizing JIT.** In place: the full design
-> specification, the C++26 API surface, the UGB toolchain (text assembler,
-> encoder/decoder, disassembler), the reference frontend, the working T0
-> interpreter, the test harness, and CI. **M1** shipped the J1 stencil corpus
-> baseline JIT + LDPT patch trampolines over a reserved code range.
-> **M2** ships the J2 optimizing tier — light Sea-of-Nodes graph, pass
-> pipeline with budget degradation, linear scan, state-exact deopt, OSR, and
-> direct-call inlining with a cliff-removal DoD. The concurrent GC engine,
-> J3/J4, and the heavyweight infra backends remain scheduled on the
-> [roadmap](docs/roadmap.md).
 
 ---
 
@@ -114,76 +94,4 @@ examples/                .ugb assembly and .mini reference-frontend demo program
 | 9 | Power & thermal management | `include/vortex/infra/power.hpp` |
 
 Each system has a dedicated chapter under `docs/infrastructure/`.
-
-## Design rules (the "rules to the letter")
-
-1. **Four JIT tiers**, T0 is an interpreter and never counted as a tier.
-2. **J4 has no artificial compile budget and no search-based compilation.** It runs a
-   deterministic pipeline to fixed point or legal completion — never a superoptimizer.
-3. **Every tier is enterable and exitable.** OSR up, RBPD down; deopt never discards
-   the whole method, only the failing region.
-4. **Speculation is always profile-directed and always repairable.** Guards are
-   recorded, regions are scoped, fallbacks are close.
-5. **UGB is a register bytecode** with speculative typed forms and generic fallback
-   forms; the interpreter rewrites bytecode adaptively and atomically.
-6. **W^X is absolute**: code memory is never writable and executable at the same time.
-7. **The GC is incremental, concurrent, and generational**, with SATB barriers, Brooks
-   forwarding, TLABs, and card marking integrated into every tier including deopt.
-
-## Compiler laws & compliance
-
-The repository is governed by the **UGB/VORTEX Compiler Laws & Architecture
-Specification** (137 rules). Compliance is not narrative — it is mapped,
-enforced and tested:
-
-- `docs/compliance_matrix.md` — every rule mapped to its enforcement
-  mechanism and status (Rule 134).
-- `tools/lint/compliance.sh` + the CI `compliance` job — mechanical checks
-  for the structural laws: no native exceptions (R65), no node-based
-  containers on hot paths (R50), no raw-pointer IR edges (R48), no RTTI
-  (R68), no shared_ptr/function in hot IR (R69).
-- `docs/exception-register.md` — every deviation is registered with an
-  expiry (Rule 132). Silent bypasses are violations.
-- `docs/adr/` — architecture decision records for the dispatch design, the
-  error-propagation policy, IR index edges, capability negotiation and the
-  numeric semantics contract (Rule 135).
-- `docs/guest-semantics.md` — the registered semantic oracle for the
-  reference language, including the exact numeric behavior (Rule 106/110):
-  overflow traps, IEEE-exact float ops, saturating float-to-int conversion.
-
-## CEM-26 performance standard
-
-Hot code additionally follows **CEM-26 Rev 1.1** (Cycle-Exact Maintainable
-C++26). Performance is treated as a semantic property: every hot function
-carries a `PERF_CONTRACT` (budget/cycles, memory traffic, branches, cache
-behavior) plus a `PERF_OBSERVATION` record; hot/warm/cold classification is
-explicit; every hot struct asserts its layout; exceptions from the standard
-are `PERF_PERMIT`-granted and registered.
-
-- `docs/ldpt.md` — Lazy-Devirtualized Patch Trampolines: skeleton
-  trampolines, the M:N safe-point patch protocol, mono/poly/mega
-  escalation over W^X patch arenas
-- `docs/interop-protocol.md` — the capability-gated interop message
-  surface (POLY_* opcodes, per-language vtables, tier progression)
-- `docs/xlea.md` — Cross-Language Escape Analysis: merged-graph EA,
-  speculative scalar replacement, escape summaries, guard rules G1-G5
-- CEP&CC 0.1 (github.com/axiomzero0/CEP-CC) — the backbone standard
-  (cycle-exact performance + clean code); `tools/lint/cep_lint.sh` runs
-  its `cep_lint` tool against this tree, and `.cep/` carries the
-  adoption baseline and the dated waiver for the ongoing migration.
-- `include/vortex/support/cem.hpp` + `include/vortex/ugb/encoding.hpp` —
-  the semantic-domain constant registries (magic-number ban, section 2).
-- `tools/lint/compliance.sh` — mechanical CEM-26 subset: no seq_cst in hot
-  trees (s14), no mutexes (s7/14), `@hot` files must carry cost blocks
-  (s3/4), permits must be registered against the embedded register (s17).
-
-Build with compliance checks:
-
-```sh
-cmake --build build/release --target compliance_lint   # structural laws + CEM-26
-ctest --test-dir build/release                          # 73-test suite
-```
-
-## License
-
-MIT — see [LICENSE](LICENSE).
+.
