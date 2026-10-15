@@ -233,11 +233,35 @@ Findings:
 
 ## M5 — ICGGC concurrent engine
 
-- [ ] Concurrent SATB marker with incremental pacing
-- [ ] Concurrent sweep + evacuation with Brooks forwarding
-- [ ] GC-map-driven precise stack scanning for JIT frames
-- [ ] DoD: mutator pause p99 under budget on allocation-stress suite; no missed
-      SATB logs (assertion mode); compaction correctness under FFI pinning
+- [x] Concurrent SATB marker with incremental pacing (driver-stepped
+      slices; assertion-mode SATB closure verification — the negative
+      test proves a barrier-bypassed store is DETECTED by name)
+- [x] Concurrent sweep + evacuation with Brooks forwarding (24-byte
+      header, region-granularity slice atomicity, remembered sets with
+      epoch validation, humongous runs, CSet selection excluding the
+      bump region and pinned regions; failed evacuation reverts)
+- [x] GC-map-driven precise stack scanning for JIT frames (the
+      published-code registry; J1 all-vregs tag-validated, J2/J4
+      per-safepoint maps; the anchor frame identified by the helper's
+      return address — gc_frame_rbp/gc_frame_pc)
+- [x] DoD: mutator pause p99 under budget on the allocation-stress suite
+      (T0 AND published-JIT batches; the pause ring covers young GCs,
+      STW phases, and slices); no missed SATB logs (assertion mode,
+      both polarities); compaction correctness under FFI pinning
+      (pinned immobile, unpinned evacuate, weak handles clear)
+- [x] REAL BUGS fixed en route: the M2-era emit_card_barrier marked the
+      VALUE's card (owner's card required — latent until young collection
+      existed); the J2/J4 SATB diversion clobbered R11 (regalloc treats
+      the barrier stores as safepoints); the JIT TLAB handoff moved tops
+      backward (entry publishes, exit adopts, collections adopt-then-
+      rewind; the survivor-chain integrity is a test assertion)
+- [x] Review round: two independent reviewers (GC core, JIT integration)
+      + a verification pass; every finding fixed with a regression test
+      (stale young marks across consecutive cycles, weak handles,
+      evacuation-failure reverts, humongous index-adjacency, T0 IC-hit
+      resolution); CEP&CC batch 2: the gc tree + tests/test_gc.cpp ship
+      SEV1-clean, touched-legacy-file deltas zero; 187 tests green on
+      Release and ASan/UBSan
 
 ## M6 — Infrastructure completion
 
