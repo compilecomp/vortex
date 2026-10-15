@@ -81,6 +81,14 @@ using J1SetFieldSlowFn = uint32_t (*)(J1Context*, uint64_t obj_bits,
                                       uint32_t field_token);
 using J1ThrowFn = uint32_t (*)(J1Context*, uint32_t error_id);
 
+/// Full barriered store behind the JIT marking-active diversion (docs/
+/// gc-icggc.md 8.3): logs the overwritten value when marking is live,
+/// stores, marks the card, refines the target region's remembered set.
+/// `owner` and `slot` must already be Brooks-resolved (the stencil resolves
+/// before computing the slot) — the helper never relocates them.
+using J1BarrierStoreFn = void (*)(J1Context*, TaggedValue* slot,
+                                  uint64_t value_bits, void* owner_resolved);
+
 /// Canonical-arithmetic fallback shared by typed stencil failure paths.
 /// Implements exactly T0's generic_add/sub/mul/compare/bit semantics; a
 /// return of kUndefinedRawBits means "T0 would raise a runtime error here".
@@ -148,7 +156,22 @@ struct J1Context {
     void* klass_table;             // 0x30  Klass* per class token
     void* interpreter;             // 0x38  vm::Interpreter* (T0 fallback)
     void* safepoint_word;          // 0x40  uint32_t* global poll flag
-    uint8_t reserved_0x48[0x38];   // reserved for M2+ hot fields (IC slots)
+    uint8_t marking_active;        // 0x48  SATB flag mirror (docs/gc-icggc.md
+                                   //        8.3 — the stencil marking-active
+                                   //        test reads this byte)
+    uint8_t reserved_0x49[0x7];
+    void* gc_frame_rbp;            // 0x50  innermost JIT frame anchor (the
+                                   //        precise stack walk consumes it;
+                                   //        stored by GC-capable slow paths)
+    void* j2_deopt_hook;           // 0x58  the J2/J3/J4 captured-deopt hook
+                                   //        (run_j2 installs/restores; moved
+                                   //        out of 0x48 by M5 — the marking
+                                   //        byte owns that byte now)
+    void* gc_frame_pc;             // 0x60  the anchor frame's identity pc —
+                                   //        the GC-capable helper's return
+                                   //        address (the walk needs the
+                                   //        ANCHOR frame's own code record)
+    uint8_t reserved_0x68[0x18];   // reserved for M2+ hot fields (IC slots)
 
     // ---- helper functions (>= 0x80: uniform disp32 indirect calls) --------
     void* alloc_slow;              // 0x80  J1AllocSlowFn
@@ -164,6 +187,8 @@ struct J1Context {
     uint64_t poll_count;           // 0xD0  safepoint polls executed
     uint32_t last_error;           // 0xD8  error id of the last exit
     uint32_t last_deopt_pc;        // 0xDC  failing bytecode pc (deopt/RBPD)
+    void* barrier_store;           // 0xE0  J1BarrierStoreFn (docs/gc-icggc.md
+                                   //        8.3 outlined barrier)
 };
 
 // ABI pins (the stencil corpus emits these offsets as immediates).
@@ -174,6 +199,10 @@ static_assert(offsetof(J1Context, heap_base) == 0x20);
 static_assert(offsetof(J1Context, constants) == 0x28);
 static_assert(offsetof(J1Context, klass_table) == 0x30);
 static_assert(offsetof(J1Context, safepoint_word) == 0x40);
+static_assert(offsetof(J1Context, marking_active) == 0x48);
+static_assert(offsetof(J1Context, gc_frame_rbp) == 0x50);
+static_assert(offsetof(J1Context, j2_deopt_hook) == 0x58);
+static_assert(offsetof(J1Context, gc_frame_pc) == 0x60);
 static_assert(offsetof(J1Context, alloc_slow) == 0x80);
 static_assert(offsetof(J1Context, write_barrier) == 0x88);
 static_assert(offsetof(J1Context, deopt) == 0x90);
@@ -187,6 +216,7 @@ static_assert(offsetof(J1Context, module) == 0xC8);
 static_assert(offsetof(J1Context, poll_count) == 0xD0);
 static_assert(offsetof(J1Context, last_error) == 0xD8);
 static_assert(offsetof(J1Context, last_deopt_pc) == 0xDC);
+static_assert(offsetof(J1Context, barrier_store) == 0xE0);
 
 /// Raw tagged bits of `undefined` — the canonical-binop helper returns this
 /// to mean "T0 raises a runtime error here" (0x7 is not a legal Smi or

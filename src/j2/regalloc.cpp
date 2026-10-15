@@ -86,7 +86,14 @@ struct Allocator {
             return true;
         }
         if (n.kind == NodeKind::Load || n.kind == NodeKind::Store) {
-            return static_cast<AccessKind>(n.aux) == AccessKind::Field;
+            // Field stores lower to the context-indirect set_field helper;
+            // M5 adds the SATB outlined barrier to RawOffset/ArrayElement
+            // stores — also a call, so intervals crossing them must be
+            // homed/callee-saved exactly like Field (Rule 78; the 14b-B
+            // review's probe-proven R11 clobber).
+            const auto kind = static_cast<AccessKind>(n.aux);
+            return kind == AccessKind::Field || kind == AccessKind::RawOffset ||
+                   kind == AccessKind::ArrayElement;
         }
         return false;
     }

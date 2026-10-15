@@ -16,16 +16,25 @@ namespace vortex {
 
 class Klass;
 
-/// Header word shared by every heap object. Kept GC-tracing-friendly: the klass
-/// word is a raw pointer in M0 and becomes a compressed, tagged word when the
-/// ICGGC concurrent engine lands (docs/roadmap.md, M5).
+/// Header shared by every heap object (docs/gc-icggc.md section 8.2).
+/// The third word is the Brooks pointer: every allocation initializes it to
+/// SELF; evacuation installs the new body's address, and every mutator data
+/// access resolves through it (reads AND writes — docs/gc-icggc.md 4/5).
+/// `klass` and `size` are immutable: reads may use either body. All data
+/// (fields, elements, payloads) moves with the body.
 struct ObjectHeader {
     Klass* klass = nullptr;
     uint32_t size = 0;
-    uint32_t mark : 1 = 0;      // used by future concurrent marking
-    uint32_t forwarded : 1 = 0; // Brooks forwarding flag (docs/gc-icggc.md 4)
-    uint32_t reserved : 30 = 0;
+    uint32_t mark : 1 = 0;      // SATB marking (docs/gc-icggc.md 8.4)
+    uint32_t forwarded : 1 = 0; // brooks != self (diagnostics; the resolved
+                                // pointer is authoritative)
+    uint32_t pinned : 1 = 0;    // FFI pin region (docs/gc-icggc.md 8.6)
+    uint32_t reserved : 29 = 0;
+    HeapObject* brooks = nullptr;  // +16: self, or the post-evacuation body
 };
+static_assert(sizeof(ObjectHeader) == 24,
+              "the Brooks header is 24 bytes (docs/gc-icggc.md 8.2); every "
+              "layout offset derives from sizeof(ObjectHeader)");
 
 class HeapObject {
 public:
@@ -34,6 +43,29 @@ public:
 protected:
     ~HeapObject() = default;
 };
+
+/// Brooks resolution — the mutator read/write barrier entry (docs/
+/// gc-icggc.md 8.2). Steady state (brooks == self): 1 load + cmp, the
+/// branch predicts taken. After an evacuation of the target the first
+/// access takes the forward once; forwarded bodies are immutable.
+/// @hot — every field/element/payload access in T0 and the runtime helpers.
+// PERF_CONTRACT:
+// BUDGET: <= 2 cycles steady state (load + cmp + predicted-taken jcc)
+// READS: 8 (the brooks word; same line as the header the caller already
+//        touches for klass/size)
+// WRITES: 0  BRANCHES: 1 (self check, predicted taken)
+// CACHE: the object's own line — no additional traffic
+// CEP:WHAT: Brooks resolution: returns the object's current body.
+// CEP:WHY: docs/gc-icggc.md 8.2 — data moves with the body; every data access resolves first.
+// CEP:STATUS: complete
+// CEP:FAILURE: none (noexcept).
+// CEP:ASSUMES: o is a valid body; brooks is always a valid body (self or forwarded).
+// CEP:COST: @hot: <= 2 cycles steady state (load + cmp + predicted-taken jcc).
+// CEP:EVIDENCE: gc_brooks_self_after_allocation; the whole M5 suite executes it.
+inline HeapObject* gc_resolve(HeapObject* o) noexcept {
+    HeapObject* fwd = o->header.brooks;
+    return fwd == o ? o : fwd;
+}
 
 /// A field slot descriptor inside a klass layout.
 struct FieldSlot {

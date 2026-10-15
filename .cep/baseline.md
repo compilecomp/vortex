@@ -103,3 +103,72 @@ shapes are bit-identical). Final closure count: 1003 SEV1 across 132
 files — the batch-1 scope is still severity-1 clean, net -1 versus the
 2026-09-28 record (SEV2 1907 -> 1908: one magic-number note in the new
 cycle test's warmup constant — SEV2 does not gate).
+
+## Batch 2 (M5, 2026-10-16): the GC tree ships CEP&CC-complete
+
+The ICGGC milestone adopts the standard at birth for its own tree and
+drives the touched-file delta to zero on the legacy files it modified:
+
+- `include/vortex/gc/{icggc,collector}.hpp`, `src/gc/{icggc,collector,
+  stack_scan}.cpp`: nine-field file headers + seven-field function blocks
+  with real cost answers (the barrier legs' steady-state cycles, the pause
+  bounds, the slice budgets).
+- `tests/test_gc.cpp`: the M5 evidence base annotated per test.
+- The M5-added functions in touched legacy files carry blocks:
+  `gc_resolve` (object_model.hpp), `for_each_root_slot` (interpreter.hpp),
+  `for_each_entry` (ffi.hpp), `resolve_brooks`/`store_frame_anchor`
+  (stencil_corpus.cpp), `helper_barrier_store` (baseline_jit.cpp), the
+  Interpreter ctor (interpreter.cpp).
+
+Batch result: the gc tree + tests/test_gc.cpp are severity-1 clean (the
+linter reports 0 SEV1 findings for every path under `/gc/` and
+`tests/test_gc.cpp`). Per-file severity-1 deltas on the touched legacy
+files (src/j2/fast_jit.cpp 84->84, src/j1/stencil_corpus.cpp 66->66,
+src/vm/interpreter.cpp 25->25, src/j1/baseline_jit.cpp 21->21,
+include/vortex/runtime/object_model.hpp 7->7, src/infra/ffi.cpp 6->6,
+include/vortex/vm/interpreter.hpp 3->3, include/vortex/j1/
+baseline_jit.hpp 2->2, include/vortex/infra/ffi.hpp 1->1): ZERO — the
+M5-added functions were annotated, the pre-existing findings stay under
+the waiver for their batches. The remaining severity-2 findings in the
+new gc/test files are naming notes on the suite-wide `VORTEX_TEST`
+macro and the fixture knob names — the same shape batch 1 recorded for
+the j4 tree.
+
+Re-recorded totals (2026-10-16, M5 closure):
+
+```text
+136 files scanned, 2968 issues
+  severity-0 (EXTERMINATE):        0
+  severity-1 (EXTERMINATE-UNLESS):  991  (M4: 1003 -> 991; -6 from the
+                                        icggc.cpp migration + the GC-tree
+                                        batch netting the new code to 0)
+  severity-2 (REJECT-AND-REPAIR):  1977  (M4: 1908; +69 from the new gc/
+                                        test code's naming notes, tracked
+                                        for the SEV2 backlog)
+  severity-3 (WARN-AND-EDUCATE):      0
+```
+
+## Batch 2 amendment (2026-10-16, post-review closure)
+
+The 14b review round's fixes (stale-mark clearing, weak-handle upkeep, the
+JIT TLAB handoff protocol, the regalloc safepoint treatment for the SATB
+diversion stores) touched the same trees; the counts re-recorded at
+closure:
+
+```text
+136 files scanned, 2975 issues
+  severity-0 (EXTERMINATE):        0
+  severity-1 (EXTERMINATE-UNLESS):  991
+  severity-2 (REJECT-AND-REPAIR):  1984
+  severity-3 (WARN-AND-EDUCATE):      0
+
+(An interim 2979/0/992/1987 record was taken mid-fix-round; the 14d
+verification pass's final counts are the ones above. The gc tree +
+tests/test_gc.cpp: zero SEV1 findings at every record.)
+```
+
+The gc tree + tests/test_gc.cpp remain severity-1 CLEAN (0 findings). The
+per-file SEV1 deltas on the touched legacy files stay ZERO against
+dab39d5: fast_jit.cpp 84, stencil_corpus.cpp 66, interpreter.cpp 25,
+baseline_jit.cpp 21, object_model.hpp 7, ffi.cpp 6, interpreter.hpp 3,
+baseline_jit.hpp 2, ffi.hpp 1, context.hpp 2.

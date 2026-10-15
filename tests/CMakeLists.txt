@@ -9,6 +9,7 @@ add_executable(vortex_tests
     test_compliance.cpp
     test_codegen_infra.cpp
     test_ir_deopt_infra.cpp
+    test_gc.cpp
     test_j1.cpp
     test_j2.cpp
     test_ldpt.cpp

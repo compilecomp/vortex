@@ -85,6 +85,8 @@ constexpr int32_t kCtxTlabEnd = 0x10;
 constexpr int32_t kCtxCardBase = 0x18;
 constexpr int32_t kCtxHeapBase = 0x20;
 constexpr int32_t kCtxConstants = 0x28;
+constexpr int32_t kCtxMarking = 0x48;      // SATB flag mirror (docs/gc-icggc.md 8.3)
+constexpr int32_t kCtxFrameRbp = 0x50;     // JIT frame anchor for the GC walk
 constexpr int32_t kCtxAllocSlow = 0x80;
 constexpr int32_t kCtxGetFieldSlow = 0xA8;
 constexpr int32_t kCtxSetFieldSlow = 0xB0;
@@ -92,6 +94,7 @@ constexpr int32_t kCtxInvokeMethod = 0x98;
 constexpr int32_t kCtxInvokeBuiltin = 0xA0;
 constexpr int32_t kCtxGenericBinop = 0xC0;
 constexpr int32_t kCtxLastError = 0xD8;
+constexpr int32_t kCtxBarrierStore = 0xE0; // outlined barrier (docs/gc-icggc.md 8.3)
 
 // Tagged-value encoding immediates (support/tagged_value.hpp).
 constexpr int32_t kTagMask = 0xF;
@@ -110,6 +113,9 @@ constexpr int32_t kBoxedDoubleBytes = kObjectHeaderBytes + 8;
 constexpr int32_t kBoxedDoubleAllocBytes = (kBoxedDoubleBytes + 15) & ~15;
 constexpr int32_t kArrayHeaderBytes =
     kObjectHeaderBytes + static_cast<int32_t>(ArrayObject::kLengthPadBytes);
+// Brooks-pointer word offset (docs/gc-icggc.md 8.2): header word 3.
+constexpr int32_t kBrooksOffset =
+    static_cast<int32_t>(offsetof(ObjectHeader, brooks));
 
 // alloc_slow kinds (j1/context.hpp J1AllocSlowFn contract).
 constexpr uint32_t kAllocObject = 0;
@@ -299,6 +305,43 @@ size_t extract_heap_obj(TemplateBuilder& b) {
     return jcc;
 }
 
+/// Brooks resolution (docs/gc-icggc.md 8.2): base (untagged) -> the CURRENT
+/// body. Data (fields/elements/payloads) moves with the body; klass/size/
+/// length are immutable and read fine from either body, so every resolution
+/// sits AFTER the header guards and BEFORE the first data access.
+/// PERF (barrier contract): 1 load + cmp + predicted-taken je in steady
+/// state (brooks == self until an evacuation forwards the object); the
+/// forward path is one move, taken once per moved object.
+// CEP:WHAT: Emits the Brooks-resolution sequence for one object base register.
+// CEP:WHY: docs/gc-icggc.md 8.2 — data accesses compute against the current body.
+// CEP:STATUS: complete
+// CEP:FAILURE: none (a compile-time emission helper).
+// CEP:ASSUMES: base holds an untagged object base; scratch is dead at the call site.
+// CEP:COST: @cold (template build). 4 instructions per emission.
+// CEP:EVIDENCE: the SET_FIELD/GET_FIELD/ARRAY_* stencil pins + parity tests.
+void resolve_brooks(TemplateBuilder& b, Reg base, Reg scratch) {
+    b.asm_.mov_reg_mem(scratch, Mem{base, Reg::RSP, 0, kBrooksOffset});
+    b.asm_.cmp_reg_reg(scratch, base);
+    const size_t done = b.asm_.placeholder_jcc(CC_E);
+    b.asm_.mov_reg_reg(base, scratch);
+    b.bind(done);
+}
+
+/// Stores the innermost JIT frame's rbp into the context anchor before any
+/// helper call that can collect (allocation, token calls — the young GC's
+/// precise stack walk starts there, docs/gc-icggc.md 8.6). @cold-side only:
+/// every store sits in a TLAB-miss or helper-call sequence.
+// CEP:WHAT: Emits the JIT frame-anchor store for GC-capable slow paths.
+// CEP:WHY: docs/gc-icggc.md 8.6 — the young GC's walk starts at the innermost JIT frame.
+// CEP:STATUS: complete
+// CEP:FAILURE: none (a compile-time emission helper).
+// CEP:ASSUMES: emitted only inside TLAB-miss / helper-call sequences (@cold side).
+// CEP:COST: @cold (template build). 1 store per emission.
+// CEP:EVIDENCE: gc_young_gc_inside_jit_allocation_keeps_parity.
+void store_frame_anchor(TemplateBuilder& b) {
+    b.asm_.mov_mem_reg(Mem{kCtx, Reg::RSP, 0, kCtxFrameRbp}, Reg::RBP);
+}
+
 /// Guard: kA is a boxed double. Untangles kA to the object base and compares
 /// header.klass against the PA_KlassAddr imm64 site. Returns both failure
 /// placeholders (tag + klass) for one shared bind point.
@@ -333,11 +376,13 @@ size_t emit_alloc_double(TemplateBuilder& b) {
     // allocation strides, not logical payload sizes).
     b.asm_.mov_mem_imm32(Mem{kC, Reg::RSP, 0, 8}, kBoxedDoubleAllocBytes);
     b.asm_.mov_mem_imm32(Mem{kC, Reg::RSP, 0, 12}, 0);  // size + flags word
+    b.asm_.mov_mem_reg(Mem{kC, Reg::RSP, 0, kBrooksOffset}, kC);  // brooks=self
     b.asm_.movsd_mem_xmm(Mem{kC, Reg::RSP, 0, kObjectHeaderBytes}, Xmm::XMM0);
     b.asm_.mov_reg_reg(kA, kC);
     b.asm_.or_reg_imm8(kA, 1);
     const size_t join = b.asm_.placeholder_jmp();
     b.bind(slow);
+    store_frame_anchor(b);
     b.asm_.mov_reg_reg(Reg::RDI, kCtx);
     b.asm_.mov_reg_imm32sx(Reg::RSI, static_cast<int32_t>(kAllocDouble));
     b.asm_.movq_gpr_xmm(Reg::RDX, Xmm::XMM0);  // payload bits as arg a
@@ -848,6 +893,9 @@ Stencil t_call(ugb::Op op) {
     b.imm32sx_site(Reg::RSI, PatchKind::ConstantIndex, PA_CallToken);
     b.asm_.mov_reg_reg(Reg::RDI, kCtx);
     b.lea_vreg(Reg::R8, VR_Dst);  // out = &dst vreg
+    // The callee (and T0 fallbacks beneath it) may collect: publish the
+    // frame anchor so the young GC's walk finds this frame (8.6).
+    store_frame_anchor(b);
     b.asm_.call_mem(Mem{kCtx, Reg::RSP, 0,
                         builtin ? kCtxInvokeBuiltin : kCtxInvokeMethod});
     b.asm_.test_reg_imm32(kA, -1);
@@ -880,6 +928,7 @@ Stencil t_new_object() {
     b.imm64_site(kB, PatchKind::ConstantIndex, PA_KlassAddr);
     b.asm_.mov_mem_reg(Mem{kA, Reg::RSP, 0, 0}, kB);      // header.klass
     b.asm_.mov_mem_reg(Mem{kA, Reg::RSP, 0, 8}, kD);      // size + zero flags
+    b.asm_.mov_mem_reg(Mem{kA, Reg::RSP, 0, kBrooksOffset}, kA);  // brooks=self
     b.asm_.mov_reg_reg(kD, kA);
     b.asm_.add_reg_imm32(kD, kObjectHeaderBytes);         // fields walk
     b.asm_.cmp_reg_imm32(kC, 0);
@@ -898,6 +947,7 @@ Stencil t_new_object() {
     b.store_vreg(kA, VR_Dst);
     b.tail(BT_Next);
     b.bind(slow);
+    store_frame_anchor(b);  // alloc_slow may collect (young GC, 8.6)
     b.asm_.mov_reg_reg(Reg::RDI, kCtx);
     b.asm_.mov_reg_imm32sx(Reg::RSI, static_cast<int32_t>(kAllocObject));
     b.imm32sx_site(Reg::RDX, PatchKind::ConstantIndex, PA_KlassToken);
@@ -941,7 +991,8 @@ Stencil t_new_array() {
     b.asm_.mov_mem_reg(Mem{kCtx, Reg::RSP, 0, kCtxTlabTop}, kF);
     b.asm_.mov_mem_imm32sx(Mem{kE, Reg::RSP, 0, 0}, 0);  // klass = 0 (array)
     b.asm_.mov_mem_reg(Mem{kE, Reg::RSP, 0, 8}, kD);     // size + zero flags
-    b.asm_.mov_mem_reg(Mem{kE, Reg::RSP, 0, 16}, kB);    // length + zero pad
+    b.asm_.mov_mem_reg(Mem{kE, Reg::RSP, 0, kBrooksOffset}, kE);  // brooks=self
+    b.asm_.mov_mem_reg(Mem{kE, Reg::RSP, 0, kObjectHeaderBytes}, kB);  // length
     b.asm_.mov_reg_reg(kC, kE);
     b.asm_.add_reg_imm32(kC, kArrayHeaderBytes);         // elements walk
     b.asm_.cmp_reg_imm32(kB, 0);
@@ -958,6 +1009,7 @@ Stencil t_new_array() {
     b.store_vreg(kA, VR_Dst);
     b.tail(BT_Next);
     b.bind(slow);
+    store_frame_anchor(b);  // alloc_slow may collect (young GC, 8.6)
     b.asm_.mov_reg_reg(Reg::RDI, kCtx);
     b.asm_.mov_reg_imm32sx(Reg::RSI, static_cast<int32_t>(kAllocArray));
     b.load_vreg(Reg::RDX, VR_Src0);
@@ -999,11 +1051,14 @@ Stencil t_get_field(uint16_t op) {
     const size_t slow_rel = b.here() + 1;
     b.asm_.jmp_rel32(0);
     b.mark(PatchKind::IcSlot, 1, slow_rel);
-    // Hit path: direct slot load (offset = 16 + 8*slot, patchable). The
-    // displacement is a PATCH SITE (PA_FieldByteOff writes 4 bytes at +3),
-    // so the template must reserve a full disp32: a disp8 encoding here
-    // would let the patch overrun 2 bytes into the following instruction.
+    // Hit path: Brooks resolution (the field DATA moves with the body —
+    // docs/gc-icggc.md 8.2), then the direct slot load (offset =
+    // sizeof(ObjectHeader) + 8*slot, patchable). The displacement is a
+    // PATCH SITE (PA_FieldByteOff writes 4 bytes at +3), so the template
+    // must reserve a full disp32: a disp8 encoding here would let the
+    // patch overrun 2 bytes into the following instruction.
     // kFieldDispPatchDummy exceeds the disp8 range to force mod=10.
+    resolve_brooks(b, kA, kB);
     const size_t field_off = b.here() + 3;
     b.asm_.mov_reg_mem(kC, Mem{kA, Reg::RSP, 0, kFieldDispPatchDummy});
     b.mark(PatchKind::ConstantIndex, PA_FieldByteOff, field_off);
@@ -1030,10 +1085,14 @@ Stencil t_get_field(uint16_t op) {
     return b.finish();
 }
 
-// SET_FIELD: slot store + ICGGC card-marking barrier (docs/ldpt.md 4B uses
-// the same inline shape). Only reference values mark the card.
-// PERF (barrier contract): tag test (predicted not-reference for primitive
-// stores) + heap-base fold + byte store; two predictable branches.
+// SET_FIELD: Brooks-resolved slot store + the full ICGGC barrier
+// (docs/gc-icggc.md 8.3): the card mark stays inline; when the concurrent
+// marker is live the store diverts to the outlined barrier helper, which
+// logs the overwritten value (SATB leg) before re-storing.
+// PERF (barrier contract): Brooks resolve (1 load + cmp, predicted self)
+// + marking byte test (predicted not-taken) + slot store + tag test
+// (predicted not-reference for primitive stores) + heap-base fold + byte
+// store; three predictable branches.
 Stencil t_set_field(uint16_t op) {
     TemplateBuilder b(op, false);
     b.load_vreg(kD, VR_Src0);            // receiver bits
@@ -1047,6 +1106,17 @@ Stencil t_set_field(uint16_t op) {
     const size_t slow_rel = b.here() + 1;
     b.asm_.jmp_rel32(0);
     b.mark(PatchKind::IcSlot, 1, slow_rel);
+    // Brooks resolution BEFORE the store: the slot address computes
+    // against the current body (an evacuated owner would freeze the store
+    // into its old body otherwise).
+    resolve_brooks(b, kA, kC);
+    // ---- SATB marking-active check (outlined barrier when live) ----
+    // 32-bit load of the flag byte + zeroed reserved bytes (J1Context
+    // value-initialization zeroes the reservation) — the assembler has no
+    // movzx form; the flag is 0/1 so any nonzero test discriminates.
+    b.asm_.mov_reg32_mem(kB, Mem{kCtx, Reg::RSP, 0, kCtxMarking});
+    b.asm_.test_reg_imm32(kB, 0xFF);
+    const size_t satb_slow = b.asm_.placeholder_jcc(CC_NE);
     // Same disp32 patch-site discipline as GET_FIELD above: the dummy
     // displacement forces the mod=10 encoding the 4-byte patch expects.
     const size_t field_off = b.here() + 3;
@@ -1063,6 +1133,22 @@ Stencil t_set_field(uint16_t op) {
     b.asm_.mov_reg_mem(kC, Mem{kCtx, Reg::RSP, 0, kCtxCardBase});
     b.asm_.mov_mem_imm8(Mem{kC, kA, 0, 0}, 1);  // card = DIRTY
     b.bind(done);
+    const size_t fin = b.asm_.placeholder_jmp();
+    // ---- outlined barrier (marking live): the helper does the full
+    // barriered store against the RESOLVED slot (logs the old value, then
+    // stores — the SATB order is the correctness order, Rule 79).
+    b.bind(satb_slow);
+    {
+        const size_t slot_off = b.here() + 3;
+        b.asm_.lea_reg_mem(Reg::RSI,
+                           Mem{kA, Reg::RSP, 0, kFieldDispPatchDummy});
+        b.mark(PatchKind::ConstantIndex, PA_FieldByteOff, slot_off);
+        b.asm_.mov_reg_reg(Reg::RDX, kE);
+        b.asm_.mov_reg_reg(Reg::RCX, kA);  // the resolved owner
+        b.asm_.mov_reg_reg(Reg::RDI, kCtx);
+        b.asm_.call_mem(Mem{kCtx, Reg::RSP, 0, kCtxBarrierStore});
+    }
+    b.bind(fin);
     b.tail(BT_Next);
     // Slow body (helper) — target of the always-slow jmp + tag failure.
     const size_t slow_off = b.here();
@@ -1090,7 +1176,7 @@ Stencil t_array_length() {
     b.asm_.mov_reg_mem(kB, Mem{kA, Reg::RSP, 0, 0});
     b.asm_.test_reg_imm32(kB, -1);
     const size_t not_array = b.asm_.placeholder_jcc(CC_NE);  // klass != 0
-    b.asm_.mov_reg32_mem(kA, Mem{kA, Reg::RSP, 0, 16});
+    b.asm_.mov_reg32_mem(kA, Mem{kA, Reg::RSP, 0, kObjectHeaderBytes});
     b.asm_.shl_reg_imm8(kA, 1);  // u32 length -> Smi
     b.store_vreg(kA, VR_Dst);
     b.tail(BT_Next);
@@ -1115,9 +1201,13 @@ ArrayGuards array_guards(TemplateBuilder& b) {
     b.asm_.test_reg_imm8(kB, 1);
     g.not_smi = b.asm_.placeholder_jcc(CC_NE);
     b.asm_.sar_reg_imm8(kB, 1);
-    b.asm_.mov_reg32_mem(kC, Mem{kA, Reg::RSP, 0, 16});  // length
+    b.asm_.mov_reg32_mem(kC, Mem{kA, Reg::RSP, 0, kObjectHeaderBytes});
     b.asm_.cmp_reg_reg(kB, kC);
     g.bounds = b.asm_.placeholder_jcc(CC_AE);  // unsigned >= len
+    // Brooks resolution BEFORE the element address: elements are data —
+    // they move with the body (docs/gc-icggc.md 8.2). klass/length are
+    // immutable, so the guards above read fine from either body.
+    resolve_brooks(b, kA, kC);
     b.asm_.lea_reg_mem(kC, Mem{kA, kB, 3, kArrayHeaderBytes});
     return g;
 }
@@ -1152,10 +1242,15 @@ Stencil t_array_set() {
     b.asm_.test_reg_imm8(kB, 1);
     const size_t not_smi = b.asm_.placeholder_jcc(CC_NE);
     b.asm_.sar_reg_imm8(kB, 1);
-    b.asm_.mov_reg32_mem(kC, Mem{kA, Reg::RSP, 0, 16});
+    b.asm_.mov_reg32_mem(kC, Mem{kA, Reg::RSP, 0, kObjectHeaderBytes});
     b.asm_.cmp_reg_reg(kB, kC);
     const size_t bounds = b.asm_.placeholder_jcc(CC_AE);
+    // array_guards resolved kA to the current body; kC = &element.
     b.asm_.lea_reg_mem(kC, Mem{kA, kB, 3, kArrayHeaderBytes});
+    // ---- SATB marking-active check (outlined barrier when live) ----
+    b.asm_.mov_reg32_mem(kF, Mem{kCtx, Reg::RSP, 0, kCtxMarking});
+    b.asm_.test_reg_imm32(kF, 0xFF);
+    const size_t satb_slow = b.asm_.placeholder_jcc(CC_NE);
     b.asm_.mov_mem_reg(Mem{kC, Reg::RSP, 0, 0}, kE);
     // Card barrier: only reference values mark (owner = the array).
     b.asm_.mov_reg_reg(kC, kE);
@@ -1168,6 +1263,15 @@ Stencil t_array_set() {
     b.asm_.mov_reg_mem(kC, Mem{kCtx, Reg::RSP, 0, kCtxCardBase});
     b.asm_.mov_mem_imm8(Mem{kC, kA, 0, 0}, 1);
     b.bind(done);
+    const size_t fin = b.asm_.placeholder_jmp();
+    // ---- outlined barrier (marking live) ----
+    b.bind(satb_slow);
+    b.asm_.mov_reg_reg(Reg::RSI, kC);   // the resolved element slot
+    b.asm_.mov_reg_reg(Reg::RDX, kE);   // value
+    b.asm_.mov_reg_reg(Reg::RCX, kA);   // the resolved owner (the array)
+    b.asm_.mov_reg_reg(Reg::RDI, kCtx);
+    b.asm_.call_mem(Mem{kCtx, Reg::RSP, 0, kCtxBarrierStore});
+    b.bind(fin);
     b.tail(BT_Next);
     b.bind(tag);
     b.bind(not_array);

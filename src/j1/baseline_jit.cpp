@@ -26,6 +26,7 @@
 #include <cstring>
 #include <unordered_map>
 
+#include "vortex/gc/collector.hpp"
 #include "vortex/j1/stencil_corpus.hpp"
 #include "vortex/ugb/encoding.hpp"
 
@@ -83,6 +84,10 @@ void tlab_publish(J1Context* ctx) noexcept {
 uint64_t helper_alloc_slow(J1Context* ctx, uint32_t kind, uint64_t a,
                            uint64_t b) noexcept {
     auto* heap = static_cast<gc::Heap*>(ctx->heap);
+    // The anchor frame's identity: THIS helper's return address points
+    // into the calling JIT frame (docs/gc-icggc.md 8.6 — the walk scans
+    // the anchor frame FIRST, then follows the saved-RBP chain up).
+    ctx->gc_frame_pc = __builtin_return_address(0);
     tlab_adopt(ctx);
     void* raw = nullptr;
     switch (kind) {
@@ -134,8 +139,12 @@ uint64_t helper_generic_binop(J1Context* ctx, uint32_t op, uint64_t a,
     const auto opid = static_cast<ugb::Op>(op);
     if (opid == ugb::Op::F64_TO_I64) {
         if ((a & 0xF) != 0x1) return kUndefinedRawBits;
+        // Brooks resolution: the payload moves with the body (docs/
+        // gc-icggc.md 8.2); the klass word is immutable and reads from
+        // either body.
         auto* obj = reinterpret_cast<HeapObject*>(a & ~uint64_t{0xF});
         auto* heap = static_cast<gc::Heap*>(ctx->heap);
+        obj = gc_resolve(obj);
         if (obj->header.klass != heap->double_klass()) {
             return kUndefinedRawBits;
         }
@@ -218,14 +227,13 @@ uint64_t helper_generic_binop(J1Context* ctx, uint32_t op, uint64_t a,
     }
 }
 
-// @cold — unresolved-field slow path: name-based resolution through the
-// klass (the cold string compare the IC system exists to avoid; Rule 5).
+// @cold — unresolved-field load. Resolves the receiver through Brooks
+// first: field DATA moves with the body (docs/gc-icggc.md 8.2).
 uint32_t helper_get_field_slow(J1Context* ctx, uint64_t obj_bits,
-                               uint32_t field_token,
-                               TaggedValue* out) noexcept {
+                               uint32_t field_token, TaggedValue* out) noexcept {
     const TaggedValue obj = TaggedValue::from_raw(obj_bits);
     if (!obj.is_heap_object()) return 0;
-    auto* o = obj.as_heap_object();
+    auto* o = static_cast<Object*>(gc_resolve(obj.as_heap_object()));
     if (o->header.klass == nullptr) return 0;
     const auto* module = static_cast<const ugb::UGBModule*>(ctx->module);
     if (field_token >= module->fields.size()) return 0;
@@ -234,12 +242,14 @@ uint32_t helper_get_field_slow(J1Context* ctx, uint64_t obj_bits,
     if (idx < 0) return 0;
     // ADR-005: success/failure rides the return code only; the field value
     // (which may legally be raw bits 0 = Smi 0) goes through `out`.
-    *out = static_cast<Object*>(o)->field(static_cast<uint32_t>(idx));
+    *out = o->field(static_cast<uint32_t>(idx));
     return 1;
 }
 
-// @cold — unresolved-field store + ICGGC card marking. Returns 1 on
-// success, 0 on failure (the template exits through kErrSetField).
+// @cold — unresolved-field store: the FULL barrier (docs/gc-icggc.md 8.3)
+// through the heap's barriered_store (Brooks resolution, SATB leg, store,
+// card leg, remembered-set leg). Returns 1 on success, 0 on failure (the
+// template exits through kErrSetField).
 uint32_t helper_set_field_slow(J1Context* ctx, uint64_t obj_bits,
                                uint64_t value_bits, uint32_t field_token) noexcept {
     const TaggedValue obj = TaggedValue::from_raw(obj_bits);
@@ -253,11 +263,28 @@ uint32_t helper_set_field_slow(J1Context* ctx, uint64_t obj_bits,
         o->header.klass->find_field(module->fields[field_token].name);
     if (idx < 0) return 0;
     auto* objp = static_cast<Object*>(o);
-    objp->field(static_cast<uint32_t>(idx)) = value;
-    if (value.is_heap_object()) {
-        static_cast<gc::Heap*>(ctx->heap)->card_table().mark_dirty(objp);
-    }
+    auto* heap = static_cast<gc::Heap*>(ctx->heap);
+    heap->barriered_store(objp, &objp->field(static_cast<uint32_t>(idx)),
+                          value);
     return 1;
+}
+
+// The outlined JIT barrier (docs/gc-icggc.md 8.3): the stencil resolved the
+// owner and computed the slot against the current body; this helper runs
+// legs 2-5 (SATB log, store, card, remembered-set refinement).
+// @warm — reached only while the concurrent marker is live.
+// CEP:WHAT: The outlined JIT barrier: SATB log, store, card, remset on a pre-resolved slot.
+// CEP:WHY: docs/gc-icggc.md 8.3 — the stencil's marking-active diversion lands here.
+// CEP:STATUS: complete
+// CEP:FAILURE: none (noexcept; the barrier legs are infallible).
+// CEP:ASSUMES: the stencil resolved owner+slot before the call; the heap is bound in ctx.
+// CEP:COST: @warm (marking-live stores only): one SATB push + store + card + region test.
+// CEP:EVIDENCE: gc_satb_closure_holds_with_jit_stores_during_marking.
+void helper_barrier_store(J1Context* ctx, TaggedValue* slot,
+                          uint64_t value_bits, void* owner_resolved) noexcept {
+    auto* heap = static_cast<gc::Heap*>(ctx->heap);
+    heap->barriered_store_resolved(static_cast<HeapObject*>(owner_resolved),
+                                   slot, TaggedValue::from_raw(value_bits));
 }
 
 // @cold — token-driven call: runs the callee through the attached T0
@@ -266,6 +293,7 @@ uint32_t helper_set_field_slow(J1Context* ctx, uint64_t obj_bits,
 int64_t helper_invoke_token(J1Context* ctx, uint32_t token,
                             const TaggedValue* args, uint32_t argc,
                             TaggedValue* out) noexcept {
+    ctx->gc_frame_pc = __builtin_return_address(0);  // the anchor frame (8.6)
     auto* module = static_cast<ugb::UGBModule*>(const_cast<void*>(ctx->module));
     auto* interp = static_cast<vm::Interpreter*>(ctx->interpreter);
     if (module == nullptr || interp == nullptr || token == 0 ||
@@ -307,6 +335,7 @@ int64_t helper_invoke_token(J1Context* ctx, uint32_t token,
 int64_t helper_invoke_builtin(J1Context* ctx, uint32_t token,
                               const TaggedValue* args, uint32_t argc,
                               TaggedValue* out) noexcept {
+    ctx->gc_frame_pc = __builtin_return_address(0);  // the anchor frame (8.6)
     auto* module = static_cast<ugb::UGBModule*>(const_cast<void*>(ctx->module));
     auto* interp = static_cast<vm::Interpreter*>(ctx->interpreter);
     if (module == nullptr || interp == nullptr) {
@@ -543,7 +572,15 @@ Result<void> make_j1_bindings(gc::Heap& heap, ugb::UGBModule& module,
     ctx.set_field_slow = reinterpret_cast<void*>(&helper_set_field_slow);
     ctx.throw_error = reinterpret_cast<void*>(&helper_throw);
     ctx.generic_binop = reinterpret_cast<void*>(&helper_generic_binop);
+    ctx.barrier_store = reinterpret_cast<void*>(&helper_barrier_store);
     ctx.module = &module;
+    ctx.marking_active = heap.marking_active() ? 1 : 0;
+    ctx.gc_frame_rbp = nullptr;  // set by GC-capable slow paths only (8.6)
+    ctx.gc_frame_pc = nullptr;
+    // The GC's runtime state: this bindings' context is the JIT frame
+    // anchor source while it is the active binding (single mutator).
+    heap.gc_state().j1ctx = &bindings.context;
+    if (interpreter != nullptr) heap.gc_state().interpreter = interpreter;
     // In-place: the context's pointers reference THIS bindings object's
     // vectors; `out` is caller-owned and never moved from here on.
     bindings.context = ctx;
@@ -908,6 +945,7 @@ Result<BaselineCode> BaselineJit::compile(const BaselineJob& job) {
     }
 
     // ---- metadata: GC maps (per call site, conservative all-vregs) -------------
+    out.register_count = rc;  // the GC walk's J1 frame geometry (8.6)
     {
         const uint32_t map_bytes = (rc + 7) / 8;
         std::vector<uint8_t> ones(map_bytes, 0xFF);
@@ -970,19 +1008,36 @@ Result<BaselineExecutable> publish_baseline(const BaselineCode& code,
                                                  code.osr_entry_offset);
     }
     ex.method_id = code.method_id;
+    // GC integration (docs/gc-icggc.md 8.6): the code record drives the
+    // precise stack walk — J1 frames scan all vregs (tag-validated). The
+    // record lives as long as the executable holds its shared_ptr.
+    auto maps = std::make_shared<const std::vector<uint8_t>>(code.gc_maps);
+    ex.gc_record = gc::gc_code_registry().register_code(
+        ex.memory.data(), ex.memory.size(), gc::GcCodeRecord::Kind::J1,
+        code.register_count, std::move(maps));
     return ex;
 }
 
 Result<TaggedValue> run_baseline(BaselineExecutable& ex, J1Bindings& bindings,
                                  std::span<const TaggedValue> args) {
     TaggedValue ret;
-    // Adopt the heap's current TLAB view (intervening T0 allocations may
-    // have bumped it since the binding was made), then publish back after.
-    tlab_adopt(&bindings.context);
+    // TLAB handoff (docs/gc-icggc.md 8.1): ENTRY pushes the heap's current
+    // window into the context (the JIT continues where the heap is — the
+    // C++ allocations since the last run moved it); EXIT pulls the JIT's
+    // bump back into the heap (the heap learns the stencil fast paths'
+    // bump — the young chain walk must see the true top). The old code
+    // moved BOTH tops BACKWARD at entry and the churn's cells overwrote
+    // live C++ nodes (the stress suite caught it).
+    bindings.context.gc_frame_rbp = nullptr;
+    bindings.context.gc_frame_pc = nullptr;
+    tlab_publish(&bindings.context);
     const int64_t rc =
         ex.entry(&bindings.context, args.data(),
                  static_cast<uint32_t>(args.size()), &ret);
-    tlab_publish(&bindings.context);  // J1 bumped the snapshot natively
+    tlab_adopt(&bindings.context);
+    tlab_publish(&bindings.context);
+    bindings.context.gc_frame_rbp = nullptr;  // stale once the frame is gone
+    bindings.context.gc_frame_pc = nullptr;
     if (rc == static_cast<int64_t>(J1ErrorId::kErrDeopt)) {
         // M1 suspension contract (corpus SAFEPOINT_POLL): rerun the whole
         // method in the attached T0 with the original arguments. RBPD

@@ -11,7 +11,7 @@ support::Result<uint32_t> HandleTable::create(void* object, HandleScope scope) {
         id = static_cast<uint32_t>(entries_.size());
         entries_.emplace_back();
     }
-    entries_[id] = Entry{object, scope, true};
+    entries_[id] = HandleEntry{object, scope, true};
     ++live_;
     return id;
 }

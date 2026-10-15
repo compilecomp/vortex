@@ -201,6 +201,24 @@ public:
     /// BEFORE first execution — interop klass binding needs the handles.
     Result<void> build_module_runtime(ugb::UGBModule& module);
 
+    /// GC root walk (docs/gc-icggc.md 8.6): every live frame's register is
+    /// a root slot. The frame pool's buffers are stable across calls
+    /// (vector-of-vectors; growth only on new max depth), so the recorded
+    /// slot addresses stay valid for the collector's update passes.
+    // CEP:WHAT: Walks every live T0 frame register as a root slot.
+    // CEP:WHY: docs/gc-icggc.md 8.6 — the T0 leg of the precise root scan.
+    // CEP:STATUS: complete
+    // CEP:FAILURE: none (read-only walk).
+    // CEP:ASSUMES: called only at pauses (single mutator, no frames pushed mid-walk).
+    // CEP:COST: @warm. O(live registers); the frame pool's buffers are stable.
+    // CEP:EVIDENCE: gc_young_evacuation_promotes_and_updates_roots.
+    template <typename Fn>
+    void for_each_root_slot(Fn&& fn) {
+        for (size_t f = 0; f < frames_live_; ++f) {
+            for (auto& r : frames_[f].regs) fn(&r);
+        }
+    }
+
 private:
     // Arithmetic slow-path result: distinct overflow vs type-error statuses
     // so guest-visible error messages are precise (Rule 110: numeric
@@ -286,6 +304,7 @@ private:
                            const char* reason);
 
     gc::Heap& heap_;
+
     InterpreterConfig config_;
     TieringPolicy tiering_;
     InterpStats stats_;

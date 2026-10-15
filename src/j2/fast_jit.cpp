@@ -87,7 +87,11 @@ constexpr int32_t kCtxCardBase = 0x18;
 constexpr int32_t kCtxHeapBase = 0x20;
 constexpr int32_t kCtxConstants = 0x28;
 constexpr int32_t kCtxSafepointWord = 0x40;
-constexpr int32_t kCtxJ2Deopt = 0x48;
+constexpr int32_t kCtxMarking = 0x48;       // SATB flag mirror (8.3)
+constexpr int32_t kCtxFrameRbp = 0x50;      // JIT frame anchor (8.6)
+constexpr int32_t kCtxJ2Deopt = 0x58;       // J2 captured-deopt hook (8.3 note:
+                                            // moved out of 0x48 — the marking
+                                            // byte owns that byte now)
 constexpr int32_t kCtxAllocSlow = 0x80;
 constexpr int32_t kCtxInvokeMethod = 0x98;
 constexpr int32_t kCtxInvokeBuiltin = 0xA0;
@@ -112,6 +116,10 @@ constexpr int32_t kBoxedDoubleAllocBytes = (kBoxedDoubleBytes + 15) & ~15;
 constexpr int32_t kArrayHeaderBytes =
     kObjectHeaderBytes + static_cast<int32_t>(ArrayObject::kLengthPadBytes);
 constexpr int32_t kArrayLengthOffset = kObjectHeaderBytes;
+// Brooks-pointer word offset (docs/gc-icggc.md 8.2).
+constexpr int32_t kBrooksOffset =
+    static_cast<int32_t>(offsetof(ObjectHeader, brooks));
+constexpr int32_t kCtxBarrierStore = 0xE0;  // outlined barrier (8.3)
 
 // alloc_slow kinds (j1/context.hpp J1AllocSlowFn contract).
 constexpr uint32_t kAllocObject = 0;
@@ -366,6 +374,9 @@ public:
     /// base must clear the save area — a J1-inherited -24 here would alias
     /// slot 0 with the saved r13.
     static constexpr int32_t kSpillBase = -48;  // slot 0 at [rbp-48]
+    static_assert(kSpillBase == kJ2SpillBase,
+                  "the GC-map walker and the emitter must share ONE spill "
+                  "geometry (docs/gc-icggc.md 8.6)");
     /// Bytes below rbp the save area occupies (|kSpillBase|) — every frame
     /// reservation adds this so window writes never go below rsp.
     static constexpr int32_t kSaveAreaBytes = 48;
@@ -2226,8 +2237,30 @@ private:
             const int32_t off = static_cast<int32_t>(n.const_value);
             const auto lv = load_value(n.data_inputs[1], Reg::RCX);
             if (!lv) return lv;
+            // The outlined barrier (below) is a call: home live values and
+            // record the GC map first (Rule 78/86 — the Field-store shape).
+            if (auto r = emit_safepoint_state(id); !r) return r;
+            // SATB marking-active check: while the concurrent marker is
+            // live the store rides the outlined barrier (docs/gc-icggc.md
+            // 8.3) — the inline fast path cannot log the overwritten value.
+            // RDX is free here (base in RAX, value in RCX) — never touch
+            // R11: it is allocator-owned (14b-B B1).
+            asm_.mov_reg32_mem(Reg::RDX,
+                               Mem{Reg::R15, Reg::RSP, 0, kCtxMarking});
+            asm_.test_reg_imm32(Reg::RDX, 0xFF);
+            const size_t satb_slow = asm_.placeholder_jcc(CC_NE);
             asm_.mov_mem_reg(Mem{kScratch, Reg::RSP, 0, off}, Reg::RCX);
-            if (auto r = emit_card_barrier(n.data_inputs[1]); !r) return r;
+            if (auto r = emit_card_barrier(n.data_inputs[1],
+                                           n.data_inputs[0]); !r) return r;
+            const size_t fin = asm_.placeholder_jmp();
+            asm_.bind_placeholder(satb_slow);
+            asm_.lea_reg_mem(Reg::RSI,
+                             Mem{kScratch, Reg::RSP, 0, off});  // slot
+            asm_.mov_reg_reg(Reg::RDX, Reg::RCX);              // value
+            asm_.mov_reg_reg(Reg::RCX, kScratch);              // owner
+            asm_.mov_reg_reg(Reg::RDI, Reg::R15);
+            asm_.call_mem(Mem{Reg::R15, Reg::RSP, 0, kCtxBarrierStore});
+            asm_.bind_placeholder(fin);
             return support::ok();
         }
         case AccessKind::ArrayElement: {
@@ -2249,9 +2282,34 @@ private:
             const auto lv = load_value(n.data_inputs[2], Reg::RSI);
             if (!lv) return lv;
             asm_.shl_reg_imm8(Reg::RCX, 3);
+            // The outlined barrier (below) is a call: home live values and
+            // record the GC map first (Rule 78/86 — the Field-store shape).
+            if (auto r = emit_safepoint_state(id); !r) return r;
+            // SATB marking-active check: while the concurrent marker is
+            // live the store rides the outlined barrier (docs/gc-icggc.md
+            // 8.3) — the inline fast path cannot log the overwritten value.
+            asm_.mov_reg32_mem(Reg::RDX,
+                               Mem{Reg::R15, Reg::RSP, 0, kCtxMarking});
+            asm_.test_reg_imm32(Reg::RDX, 0xFF);
+            const size_t satb_slow = asm_.placeholder_jcc(CC_NE);
             asm_.mov_mem_reg(Mem{kScratch, Reg::RCX, 0, kArrayHeaderBytes},
                              Reg::RSI);
-            if (auto r = emit_card_barrier(n.data_inputs[2]); !r) return r;
+            if (auto r = emit_card_barrier(n.data_inputs[2],
+                                           n.data_inputs[0]); !r) return r;
+            const size_t fin = asm_.placeholder_jmp();
+            asm_.bind_placeholder(satb_slow);
+            // Barrier args (docs/gc-icggc.md 8.3): rdi=ctx, rsi=slot,
+            // rdx=value, rcx=owner — the helper logs, stores, cards,
+            // refines against the RESOLVED base.
+            asm_.lea_reg_mem(Reg::RDX,
+                             Mem{kScratch, Reg::RCX, 0, kArrayHeaderBytes});
+            asm_.mov_reg_reg(Reg::R8, Reg::RSI);   // value aside
+            asm_.mov_reg_reg(Reg::RSI, Reg::RDX);  // arg: slot
+            asm_.mov_reg_reg(Reg::RDX, Reg::R8);   // arg: value
+            asm_.mov_reg_reg(Reg::RCX, kScratch);  // arg: owner
+            asm_.mov_reg_reg(Reg::RDI, Reg::R15);
+            asm_.call_mem(Mem{Reg::R15, Reg::RSP, 0, kCtxBarrierStore});
+            asm_.bind_placeholder(fin);
             return support::ok();
         }
         default:
@@ -2265,8 +2323,12 @@ private:
     /// ICGGC card-marking barrier for a reference store (the J1 shape:
     /// tag test, heap-base fold, >>kCardShift byte store). Skipped only
     /// when the type lattice PROVES the value is not a reference
-    /// (Rule 80: elision requires proof).
-    support::Result<void> emit_card_barrier(NodeId value) {
+    /// (Rule 80: elision requires proof). The card covers the OWNER (the
+    /// object holding the slot) — the young GC's region walk finds the
+    /// old->young edge through the owner's body, never the value's
+    /// (M2 marked the value's card — latent until M5 made young
+    /// collection real; the region walk would have missed every edge).
+    support::Result<void> emit_card_barrier(NodeId value, NodeId owner) {
         const JType t = value < built_.types.size() ? built_.types[value]
                                                     : JType::Unknown;
         if (t == JType::Smi || t == JType::Bool || t == JType::Null) {
@@ -2277,8 +2339,8 @@ private:
         asm_.and_reg_imm32(Reg::RCX, static_cast<int32_t>(kTagMask));
         asm_.cmp_reg_imm32(Reg::RCX, static_cast<int32_t>(kTagHeapBits));
         const size_t done = asm_.placeholder_jcc(CC_NE);  // not a reference
-        const auto lo = load_untangled(value);
-        if (!lo) return lo;  // kScratch = untangled object base
+        const auto lo = load_untangled(owner);
+        if (!lo) return lo;  // kScratch = untangled owner base (resolved)
         asm_.mov_reg_mem(Reg::RCX,
                          Mem{Reg::R15, Reg::RSP, 0, kCtxHeapBase});
         asm_.sub_reg_reg(kScratch, Reg::RCX);  // offset from heap origin
@@ -2294,6 +2356,17 @@ private:
         const auto lv = load_value(v, kScratch);
         if (!lv) return lv;
         asm_.and_reg_imm32(kScratch, -16);
+        // Brooks resolution (docs/gc-icggc.md 8.2): every direct object
+        // access computes addresses against the CURRENT body — data moves
+        // with the body; header words are immutable and read fine from
+        // either. One choke point covers ArrayElement/RawOffset/
+        // DoublePayload/ArrayLength and the card barrier's owner fold.
+        // The self-compare + conditional self-load needs no scratch beyond
+        // kScratch (R11 is allocatable — never clobber it here).
+        asm_.cmp_reg_mem(kScratch, Mem{kScratch, Reg::RSP, 0, kBrooksOffset});
+        const size_t done = asm_.placeholder_jcc(CC_E);
+        asm_.mov_reg_mem(kScratch, Mem{kScratch, Reg::RSP, 0, kBrooksOffset});
+        asm_.bind_placeholder(done);
         return support::ok();
     }
 
@@ -2355,6 +2428,9 @@ private:
                              static_cast<int32_t>(n.aux & 0xFFFF));
         asm_.mov_reg_imm32sx(Reg::RCX, static_cast<int32_t>(argc));
         asm_.mov_reg_reg(Reg::RDI, Reg::R15);
+        // The callee (and T0 fallbacks beneath it) may collect: publish the
+        // frame anchor so the young GC's walk finds this frame (8.6).
+        asm_.mov_mem_reg(Mem{Reg::R15, Reg::RSP, 0, kCtxFrameRbp}, Reg::RBP);
         asm_.call_mem(Mem{Reg::R15, Reg::RSP, 0,
                           builtin ? kCtxInvokeBuiltin : kCtxInvokeMethod});
         asm_.test_reg_imm32(kScratch, -1);
@@ -2419,6 +2495,8 @@ private:
             asm_.mov_mem_imm32(Mem{Reg::RDX, Reg::RSP, 0, 8},
                                kBoxedDoubleAllocBytes);
             asm_.mov_mem_imm32(Mem{Reg::RDX, Reg::RSP, 0, 12}, 0);
+            asm_.mov_mem_reg(Mem{Reg::RDX, Reg::RSP, 0, kBrooksOffset},
+                             Reg::RDX);  // brooks = self (docs 8.2)
             asm_.movsd_mem_xmm(
                 Mem{Reg::RDX, Reg::RSP, 0, kObjectHeaderBytes}, Xmm::XMM0);
             asm_.mov_reg_reg(kScratch, Reg::RDX);
@@ -2465,7 +2543,10 @@ private:
                              Reg::RDI);
             asm_.mov_mem_imm32sx(Mem{Reg::RSI, Reg::RSP, 0, 0}, 0);
             asm_.mov_mem_reg(Mem{Reg::RSI, Reg::RSP, 0, 8}, Reg::RDX);
-            asm_.mov_mem_reg(Mem{Reg::RSI, Reg::RSP, 0, 16}, Reg::RCX);
+            asm_.mov_mem_reg(Mem{Reg::RSI, Reg::RSP, 0, kBrooksOffset},
+                             Reg::RSI);  // brooks = self (docs 8.2)
+            asm_.mov_mem_reg(Mem{Reg::RSI, Reg::RSP, 0, kObjectHeaderBytes},
+                             Reg::RCX);  // length + zero pad
             // Zero-fill elements to tagged null (T0 allocator parity).
             asm_.mov_reg_reg(Reg::R8, Reg::RSI);
             asm_.add_reg_imm32(Reg::R8, kArrayHeaderBytes);
@@ -2530,6 +2611,8 @@ private:
         asm_.mov_mem_reg(Mem{Reg::RDX, Reg::RSP, 0, 0}, Reg::RSI);
         asm_.mov_mem_imm32(Mem{Reg::RDX, Reg::RSP, 0, 8}, alloc_bytes);
         asm_.mov_mem_imm32(Mem{Reg::RDX, Reg::RSP, 0, 12}, 0);
+        asm_.mov_mem_reg(Mem{Reg::RDX, Reg::RSP, 0, kBrooksOffset},
+                         Reg::RDX);  // brooks = self (docs 8.2)
         // Zero fields to tagged null (T0 allocator parity).
         if (field_count > 0) {
             asm_.mov_reg_reg(Reg::RSI, Reg::RDX);
@@ -2566,6 +2649,11 @@ private:
     /// is only meaningful for kAllocDouble and is overwritten here — the
     /// fast-path header stores happen BEFORE this call.
     void emit_alloc_slow(uint32_t kind) {
+        // alloc_slow may collect (young GC inside the allocation slow
+        // path): publish the frame anchor for the precise walk (8.6). The
+        // anchor frame's identity pc is captured by the HELPER (its own
+        // return address points into this frame).
+        asm_.mov_mem_reg(Mem{Reg::R15, Reg::RSP, 0, kCtxFrameRbp}, Reg::RBP);
         asm_.mov_reg_reg(Reg::RDI, Reg::R15);
         asm_.mov_reg_imm32sx(Reg::RSI, static_cast<int32_t>(kind));
         if (kind == kAllocDouble) {
@@ -3163,6 +3251,13 @@ support::Result<J2Executable> publish_j2(const J2Code& code,
     ex.records = code.records;
     ex.regions =
         std::make_shared<deopt::RegionTable>(std::move(code.regions));
+    // GC integration (docs/gc-icggc.md 8.6): the code record drives the
+    // precise stack walk for J2/J3/J4 frames (per-safepoint maps; slot
+    // geometry from kJ2SpillBase). Lives with the executable.
+    auto maps = std::make_shared<const std::vector<uint8_t>>(code.gc_maps);
+    ex.gc_record = gc::gc_code_registry().register_code(
+        ex.memory.data(), ex.memory.size(),
+        gc::GcCodeRecord::Kind::J2Shape, 0, std::move(maps));
     return ex;
 }
 
@@ -3193,9 +3288,19 @@ support::Result<TaggedValue> run_j2(J2Executable& ex, j1::J1Bindings& bindings,
 
     TaggedValue ret;
     auto* heap = static_cast<gc::Heap*>(bindings.context.heap);
-    heap->sync_tlab_top(static_cast<uint8_t*>(bindings.context.tlab_top));
+    // TLAB handoff (docs/gc-icggc.md 8.1, the 14d NF-1 fix): ENTRY pushes
+    // the heap's current window into the context (the JIT continues where
+    // the heap is — T0/C++ allocations between runs moved it); EXIT adopts
+    // the JIT's bump back (below). An entry ADOPT here would rewind the
+    // heap top to the stale context copy and the next bump would overwrite
+    // live objects — the stress-bug shape, J2/J3/J4 flavor.
+    heap->publish_tlab_to_jit();
+    // The JIT frame anchor starts null (8.6): the entry frame registers it
+    // through a GC-capable slow path only, and it dies with this run.
+    bindings.context.gc_frame_rbp = nullptr;
+    bindings.context.gc_frame_pc = nullptr;
 
-    // Install the J2 deopt hook (ctx+0x48), run, restore.
+    // Install the J2 deopt hook (ctx+0x58), run, restore.
     void* prev_hook = nullptr;
     std::memcpy(&prev_hook,
                 reinterpret_cast<const uint8_t*>(&bindings.context) +
@@ -3209,8 +3314,12 @@ support::Result<TaggedValue> run_j2(J2Executable& ex, j1::J1Bindings& bindings,
                                 static_cast<uint32_t>(args.size()), &ret);
     std::memcpy(reinterpret_cast<uint8_t*>(&bindings.context) + kCtxJ2Deopt,
                 &prev_hook, sizeof(prev_hook));
+    // Adopt the JIT's bump first (see run_baseline — the same protocol).
+    heap->sync_tlab_top(static_cast<uint8_t*>(bindings.context.tlab_top));
     bindings.context.tlab_top = heap->tlab_top();
     bindings.context.tlab_end = heap->tlab_end();
+    bindings.context.gc_frame_rbp = nullptr;  // stale once the frame is gone
+    bindings.context.gc_frame_pc = nullptr;
     if (g_j2_trace) {
         fprintf(stderr, "[j2-run] rc=%lld last_error=%u osr=%d\n",
                 (long long)rc, bindings.context.last_error,

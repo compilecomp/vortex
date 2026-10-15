@@ -202,9 +202,19 @@ TaggedValue builtin_print(std::span<const TaggedValue> args, void*) {
 // Construction / registration
 // ---------------------------------------------------------------------------
 
+// CEP:WHAT: Constructs the interpreter against a heap and registers as the GC's root source.
+// CEP:WHY: docs/gc-icggc.md 8.6 — T0 frames are a precise root leg.
+// CEP:STATUS: complete
+// CEP:FAILURE: none.
+// CEP:ASSUMES: the heap outlives the interpreter.
+// CEP:COST: @cold. One policy init + one pointer store.
+// CEP:EVIDENCE: every collection test (the T0 leg).
 Interpreter::Interpreter(gc::Heap& heap, InterpreterConfig config)
     : heap_(heap), config_(config) {
     tiering_ = TieringPolicy(config_.tiering);
+    // GC runtime state (docs/gc-icggc.md 8.6): T0 frames are a precise root
+    // source; the interpreter registers itself on construction.
+    heap_.gc_state().interpreter = this;
 }
 
 void Interpreter::register_builtin(
@@ -460,14 +470,17 @@ bool Interpreter::get_field_cached(TaggedValue obj, uint32_t field_token,
     const uint64_t key = klass_token_key(k->id(), field_token);
     if (int32_t* slot = module.runtime.field_slot_cache.find(key)) {
         if (resolved_slot != nullptr) *resolved_slot = *slot;
-        out = objp->field(static_cast<uint32_t>(*slot));
+        out = static_cast<Object*>(
+                  gc_resolve(o))
+                  ->field(static_cast<uint32_t>(*slot));
         return true;
     }
     const int idx = k->find_field(module.fields[field_token].name);
     if (idx < 0) return false;
     module.runtime.field_slot_cache.insert(key, idx);
     if (resolved_slot != nullptr) *resolved_slot = idx;
-    out = objp->field(static_cast<uint32_t>(idx));
+    out = static_cast<Object*>(gc_resolve(o))->field(
+        static_cast<uint32_t>(idx));
     return true;
 }
 
@@ -494,16 +507,19 @@ bool Interpreter::set_field_cached(TaggedValue obj, TaggedValue value,
     const uint64_t key = klass_token_key(k->id(), field_token);
     if (int32_t* slot = module.runtime.field_slot_cache.find(key)) {
         if (resolved_slot != nullptr) *resolved_slot = *slot;
-        store_field(&objp->field(static_cast<uint32_t>(*slot)), value);
-        if (value.is_heap_object()) heap_.card_table().mark_dirty(o);
+        // The full write barrier (docs/gc-icggc.md 8.3): the Brooks
+        // resolution inside targets the current body — a store into an
+        // evacuated owner would freeze into the old body otherwise.
+        heap_.barriered_store(o, &objp->field(static_cast<uint32_t>(*slot)),
+                              value);
         return true;
     }
     const int idx = k->find_field(module.fields[field_token].name);
     if (idx < 0) return false;
     module.runtime.field_slot_cache.insert(key, idx);
     if (resolved_slot != nullptr) *resolved_slot = idx;
-    store_field(&objp->field(static_cast<uint32_t>(idx)), value);
-    if (value.is_heap_object()) heap_.card_table().mark_dirty(o);
+    heap_.barriered_store(o, &objp->field(static_cast<uint32_t>(idx)),
+                          value);
     return true;
 }
 
@@ -1550,7 +1566,9 @@ L_GET_FIELD: {
         IcSlot& ic = method.ics[idx];
         if (const ugb::IcEntry* e = ic.lookup(klass_id)) {
             stats_.ic_hits++;
-            R[ins.dst] = static_cast<Object*>(o)->field(e->target);
+            // Brooks resolution: field DATA moves with the body (docs/
+            // gc-icggc.md 8.2) — the IC hit path is a data access too.
+            R[ins.dst] = static_cast<Object*>(gc_resolve(o))->field(e->target);
             VORTEX_NEXT();
         }
         stats_.ic_misses++;
@@ -1579,8 +1597,10 @@ L_GET_FIELD_SHAPE: {
         IcSlot& ic = method.ics[idx];
         if (const ugb::IcEntry* e = ic.lookup(klass_id)) {
             stats_.ic_hits++;
-            R[ins.dst] =
-                static_cast<Object*>(obj.as_heap_object())->field(e->target);
+            // Brooks resolution (docs/gc-icggc.md 8.2) — same contract as
+            // the canonical GET_FIELD path.
+            R[ins.dst] = static_cast<Object*>(gc_resolve(obj.as_heap_object()))
+                             ->field(e->target);
             VORTEX_NEXT();
         }
     }
@@ -1773,7 +1793,8 @@ L_ARRAY_GET: {
     if (!arr.is_heap_object() || !R[ins.s1].is_smi()) {
         VORTEX_RT_ERROR("Array.Get: bad array or index");
     }
-    auto* a = reinterpret_cast<ArrayObject*>(arr.as_heap_object());
+    auto* a = reinterpret_cast<ArrayObject*>(
+        gc_resolve(arr.as_heap_object()));
     if (a->header.klass != nullptr) VORTEX_RT_ERROR("Array.Get: not an array");
     const int64_t i = R[ins.s1].as_smi();
     if (i < 0 || i >= a->length()) {
@@ -1790,14 +1811,19 @@ L_ARRAY_SET: {
     if (!arr.is_heap_object() || !R[ins.s1].is_smi()) {
         VORTEX_RT_ERROR("Array.Set: bad array or index");
     }
-    auto* a = reinterpret_cast<ArrayObject*>(arr.as_heap_object());
+    auto* a = reinterpret_cast<ArrayObject*>(
+        gc_resolve(arr.as_heap_object()));
     if (a->header.klass != nullptr) VORTEX_RT_ERROR("Array.Set: not an array");
     const int64_t i = R[ins.s1].as_smi();
     if (i < 0 || i >= a->length()) {
         VORTEX_RT_ERROR("Array.Set: bounds check failed");
     }
-    store_field(&a->element(static_cast<uint32_t>(i)), R[ins.s2]);
-    if (R[ins.s2].is_heap_object()) heap_.card_table().mark_dirty(a);
+    // The full write barrier (docs/gc-icggc.md 8.3): SATB leg + store +
+    // card leg + remembered-set leg. The Brooks resolution inside the
+    // barrier targets the current body (an evacuated array would freeze
+    // the store into its old body otherwise).
+    heap_.barriered_store(a, &a->element(static_cast<uint32_t>(i)),
+                          R[ins.s2]);
     VORTEX_NEXT();
 }
 
@@ -2044,7 +2070,7 @@ bool Interpreter::as_double(TaggedValue v, double& out) const noexcept {
     if (!v.is_heap_object()) return false;
     auto* o = v.as_heap_object();
     if (!is_boxed_double(o, heap_.double_klass())) return false;
-    out = read_boxed_double(o);
+    out = read_boxed_double(gc_resolve(o));
     return true;
 }
 

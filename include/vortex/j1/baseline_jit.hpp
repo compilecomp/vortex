@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "vortex/codegen/x64/assembler.hpp"
+#include "vortex/gc/collector.hpp"
 #include "vortex/gc/icggc.hpp"
 #include "vortex/infra/security.hpp"
 #include "vortex/j1/context.hpp"
@@ -52,6 +53,9 @@ struct BaselineCode {
     std::vector<uint32_t> osr_entries;   // bytecode PCs with OSR stubs
     std::vector<uint8_t> gc_maps;        // [count]{pc u32, bytes u32, map...}
     std::vector<uint8_t> deopt_records;  // [count]{pc, frame_desc, map, ic}
+    /// The method's vreg count — the GC stack walk's J1 frame geometry
+    /// (docs/gc-icggc.md 8.6: vregs at [rbp + vreg_disp(rc, i)]).
+    uint32_t register_count = 0;
 };
 
 /// Engine binding: the runtime state a J1-compiled method executes against.
@@ -78,6 +82,9 @@ struct BaselineExecutable {
     J1EntryFn entry = nullptr;
     J1OsrFn osr_entry = nullptr;  // nullptr when the method has no loops
     uint32_t method_id = 0;
+    /// GC stack-walk record (docs/gc-icggc.md 8.6): the registry holds a
+    /// weak reference; this shared_ptr keeps it alive with the code.
+    std::shared_ptr<gc::GcCodeRecord> gc_record;
 };
 
 /// Builds the engine binding for `module` against `heap` (+ optional T0
@@ -112,7 +119,10 @@ support::Result<TaggedValue> run_baseline(BaselineExecutable& ex,
 /// promotion is exercised by promote_superstencils + fusion tests).
 class BaselineJit {
 public:
-    explicit BaselineJit(StencilTable& stencils) noexcept : stencils_(stencils) {}
+    explicit BaselineJit(StencilTable& stencils) noexcept
+        : stencils_(stencils) {
+        // The corpus is built once by the caller; the compiler only reads.
+    }
 
     support::Result<BaselineCode> compile(const BaselineJob& job);
 

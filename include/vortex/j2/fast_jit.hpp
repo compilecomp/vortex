@@ -33,6 +33,11 @@ namespace vortex::j2 {
 using j1::J1EntryFn;
 using j1::J1OsrFn;
 
+/// Spill-slot frame geometry (docs/gc-icggc.md 8.6): slot i lives at
+/// [rbp + kJ2SpillBase - 8*i]. The GC-map stack walker shares this single
+/// definition with the emitter (Rule 86 metadata: one source of truth).
+inline constexpr int32_t kJ2SpillBase = -48;
+
 /// Compilation task (the J2 mirror of j1::BaselineJob; tables are shared).
 struct J2Job {
     const ugb::UGBModule* module = nullptr;
@@ -167,6 +172,9 @@ struct J2Executable {
     /// failure accounting use the SAME policy so the two never disagree).
     /// The tiering driver may tighten it per method (docs/deopt-rbpd.md 7).
     deopt::ThrottlePolicy throttle_policy;
+    /// GC stack-walk record (docs/gc-icggc.md 8.6): the registry holds a
+    /// weak reference; this shared_ptr keeps it alive with the code.
+    std::shared_ptr<gc::GcCodeRecord> gc_record;
 };
 
 /// Deopt chain depth bound (the pipeline's inline_depth_cap + root,
