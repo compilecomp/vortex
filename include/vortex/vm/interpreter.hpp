@@ -131,6 +131,20 @@ public:
     const InterpStats& stats() const noexcept { return stats_; }
     const InterpreterConfig& config() const noexcept { return config_; }
     InterpreterConfig& config_mutable() noexcept { return config_; }
+
+    /// CEP:WHAT: The klass registry this interpreter builds module class
+    /// tokens against (line 311's registry_ — NEW_OBJECT klasses live here).
+    /// CEP:WHY: Heap-snapshot tooling must capture the registry that OWNS
+    /// the klasses the interpreter's objects point at (infra 3, M6-a);
+    /// without it the object walk sees foreign klass pointers.
+    /// CEP:STATUS: complete
+    /// CEP:FAILURE: none (reference return; the registry outlives the run).
+    /// CEP:ASSUMES: the caller does not mutate klass layouts while guest
+    /// code runs (Rule 24 quiescence).
+    /// CEP:COST: @cold. One reference return; no hot-path presence.
+    /// CEP:EVIDENCE: tests/test_snapshot.cpp heap round-trip parity.
+    KlassRegistry& klass_registry() noexcept { return registry_; }
+
     void set_tiering_observer(TieringObserver* observer) {
         tiering_.set_observer(observer);
     }

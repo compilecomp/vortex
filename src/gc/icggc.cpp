@@ -326,6 +326,15 @@ Result<Object*> Heap::allocate_object(Klass* klass, uint32_t field_count) {
         for (uint32_t i = 0; i < field_count; ++i) {
             obj->field(i) = TaggedValue::null();
         }
+        // Zero the alignment pad after the last field too: recycled memory
+        // is not zeroed, and a stale heap-tagged pad word would be a ghost
+        // reference for the snapshot walk and the card scanner (M6-a
+        // review 15-e-a/5).
+        const size_t used = sizeof(ObjectHeader) + sizeof(TaggedValue) * field_count;
+        if (bytes > used) {
+            std::memset(reinterpret_cast<uint8_t*>(raw) + used, 0,
+                        bytes - used);
+        }
         stats_.objects_allocated++;
         stats_.bytes_allocated += bytes;
         return obj;
@@ -344,6 +353,13 @@ Result<Object*> Heap::allocate_object(Klass* klass, uint32_t field_count) {
     init_header(obj, bytes);
     // Zero fields so GC maps and interpreter reads observe well-defined nulls.
     for (uint32_t i = 0; i < field_count; ++i) obj->field(i) = TaggedValue::null();
+    // Same pad contract as the humongous path above: no stale words in the
+    // body, ever (M6-a review 15-e-a/5).
+    const size_t used =
+        sizeof(ObjectHeader) + sizeof(TaggedValue) * static_cast<size_t>(field_count);
+    if (bytes > used) {
+        std::memset(reinterpret_cast<uint8_t*>(obj) + used, 0, bytes - used);
+    }
     stats_.objects_allocated++;
     stats_.bytes_allocated += bytes;
     return obj;

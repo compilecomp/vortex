@@ -76,7 +76,13 @@ WritableCodeMemory::~WritableCodeMemory() {
 }
 
 void WritableCodeMemory::write(std::span<const uint8_t> code, size_t at) {
-    if (base_ == nullptr || published_) return;  // W^X: no writes after flip
+    if (base_ == nullptr || published_ || code.empty()) return;  // W^X: no writes after flip
+    // Defensive bounds gate: every caller is trusted today, but a wild
+    // write here would corrupt executable memory silently (M6-a review
+    // 15-g-b: the reloc patch path is now validated upstream; this gate
+    // keeps the primitive itself fail-safe — and keeps the memcpy off
+    // null/empty spans).
+    if (at > bytes_ || code.size() > bytes_ - at) return;
     std::memcpy(base_ + at, code.data(), code.size());
 }
 

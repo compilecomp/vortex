@@ -15,6 +15,7 @@ add_executable(vortex_tests
     test_ldpt.cpp
     test_j3.cpp
     test_j4.cpp
+    test_snapshot.cpp
 )
 target_include_directories(vortex_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/harness)
 target_link_libraries(vortex_tests PRIVATE vortex_core)

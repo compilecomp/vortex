@@ -3398,17 +3398,30 @@ support::Result<TaggedValue> run_j2(J2Executable& ex, j1::J1Bindings& bindings,
                     return support::fail(support::ErrorCode::OutOfMemory,
                                          "J2 deopt: remat allocation failed");
                 }
+                size_t const_cursor = 0;  // per remat: parallel to CONST fields
                 for (size_t i = 0; i < rm.field_slots.size(); ++i) {
                     if (rm.field_keys[i] >= rm.field_count) {
                         return support::fail(
                             support::ErrorCode::InternalError,
                             "J2 deopt: remat field slot out of range");
                     }
-                    (*obj)->field(rm.field_keys[i]) =
-                        rm.field_slots[i] ==
-                                DeoptFrame::RematEntry::kConstSlot
-                            ? TaggedValue::from_raw(rm.const_words[i])
-                            : c.window[fr.vreg_base + rm.field_slots[i]];
+                    if (rm.field_slots[i] ==
+                        DeoptFrame::RematEntry::kConstSlot) {
+                        // const_words runs parallel to the CONST fields
+                        // only (the emitter appends one word per Const
+                        // field, in field order) — a cursor, never the
+                        // field index (Rule 76: no silent wrong rebuild).
+                        if (const_cursor >= rm.const_words.size()) {
+                            return support::fail(
+                                support::ErrorCode::InternalError,
+                                "J2 deopt: remat const word out of range");
+                        }
+                        (*obj)->field(rm.field_keys[i]) =
+                            TaggedValue::from_raw(rm.const_words[const_cursor++]);
+                    } else {
+                        (*obj)->field(rm.field_keys[i]) =
+                            c.window[fr.vreg_base + rm.field_slots[i]];
+                    }
                 }
                 c.window[rm.slot] = TaggedValue::heap_pointer(*obj);
             }

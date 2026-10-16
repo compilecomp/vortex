@@ -265,7 +265,27 @@ Findings:
 
 ## M6 — Infrastructure completion
 
-- [ ] Snapshots/AOT (M3): heap snapshot writer/reader, shared code cache, PGO-AOT
+- [ ] Snapshots/AOT (M3): heap snapshot writer/reader, shared code cache, PGO-AOT.
+      **Batch a (M6-a) landed**: the versioned container (Rule-9 integrity
+      protocol, Rule-97 nine-field manifests, Rule-98 ordered verification),
+      the heap snapshot writer/reader (pointer swizzling with a Smi-proof
+      tag, offset-deterministic restore, T0 continue-execution parity), the
+      shared code cache (address-free code bytes through the ONE publish
+      path, live deopt records incl. remats, klass-handle verification),
+      profile persistence (.ic/.branch, all-or-nothing ingest), and the
+      PGO-AOT pipeline (profile-licensed selection, J4 deterministic
+      compiles, byte-identical artifacts, verified load at execution
+      parity). Two independent review rounds + probe-based verification
+      (13 findings — swizzle/Smi collision, bounds overflows, a remat
+      serialization desync, a pre-existing deopt-consumer const-word
+      indexing bug — all fixed and pinned; 201 tests green on Release and
+      ASan/UBSan). Spec: docs/infrastructure/03-snapshots-aot.md.
+      Deferred within the item: real .so/.dll packaging (the container is
+      the deployable), cross-process klass re-binding (the handle table
+      becomes a relocation table), and the J1 stencil NEW_OBJECT fast
+      path's pad-zeroing (the C++ allocator paths zero it; the stencil
+      change would re-record the M1 golden machine-code pins — J1-scope
+      work, tracked here).
 - [ ] Threading (M4): M:N work-stealing scheduler, guard-page suspension,
       safepoint polling page
 - [ ] FFI (M5): trampoline generator, unified unwinding
