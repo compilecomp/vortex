@@ -1,28 +1,44 @@
 # CEP&CC adoption baseline
 
-Recorded: 2026-09-26 (milestone M3 push); re-baselined same day after the
-one-pass-per-file restructure of the J2/J3 pipelines (src/j2/pass_*.cpp,
-src/j3/pass_*.cpp) — the split itself added 17 translation units, so the
-per-file header and function-block findings rose mechanically.
+Recorded: 2026-09-26 (milestone M3 push); re-baselined at the M6-b push
+(threading/suspension). History: re-baselined same day after the
+one-pass-per-file restructure of the J2/J3 pipelines — the split added 17
+translation units, so the per-file header and function-block findings rose
+mechanically.
 Tool: `cep_lint` at CEP-CC `02dabbb7cd6b2087cc9e44121e8a97deef544048`
 Command: `tools/lint/cep_lint.sh` (scans `include/vortex src tests tools`)
 
 ## Result
 
 ```text
-132 files scanned, 2911 issues
-  severity-0 (EXTERMINATE):        0    (re-recorded 2026-09-30, M4
-  severity-1 (EXTERMINATE-UNLESS): 1003  closure; final post-review count)
-  severity-2 (REJECT-AND-REPAIR):  1908
+138 files scanned, 3317 issues   (re-recorded at the M6-b push)
+  severity-0 (EXTERMINATE):        0
+  severity-1 (EXTERMINATE-UNLESS):  977  (M6-b: the threading tree ships
+  severity-2 (REJECT-AND-REPAIR):  2340   SEV1-clean from birth; total
+                                           986 -> 977 = -9: -6 from the
+                                           pool-const stencil fixes
+                                           (t_const_pool rebuild + the
+                                           adjacent immediate-form
+                                           cleanups), -3 from the
+                                           rewritten threading
+                                           implementation retiring the
+                                           M0-era threading stub's
+                                           findings; the review fix
+                                           round's new functions and
+                                           tests are annotated, netting
+                                           zero)
   severity-3 (WARN-AND-EDUCATE):      0
 
-(M3 record: 125 files, 2808 issues — 0 / 993 / 1815 / 0;
-pre-split reference: 108 files, 2678 issues — 0 / 974 / 1704 / 0;
-post-split pre-review: 2794 — 0 / 991 / 1803; the M3 review fixes added
-the two Rule-121 regression tests and re-touched pass TUs)
+(M6-a record: 132 files — 0 / 986 / ...; M4 record: 132 files, 2911 —
+0 / 1003 / ...; M3 record: 125 files, 2808 — 0 / 993 / 1815 / 0;
+pre-split reference: 108 files, 2678 — 0 / 974 / 1704 / 0)
 ```
 
 ## Reading of the baseline
+
+(The severity figures below are the 2026-09-26 ADOPTION record —
+125 files, 0 / 993 / 1815 / 0; the per-batch re-recorded totals live in
+the Result block above and the batch sections below.)
 
 - **Severity-0 is already zero.** The banned-token rule for hot code
   (`new`/`delete`/`throw`/`try`/`catch`/`virtual`/`std::function`/...) is

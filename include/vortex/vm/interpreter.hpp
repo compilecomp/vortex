@@ -16,6 +16,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <span>
 #include <string>
@@ -190,13 +191,25 @@ public:
                                              uint32_t token,
                                              std::span<const TaggedValue> args);
 
-    /// Safepoint integration hook (Rule 81): invoked by SAFEPOINT_POLL.
-    /// The handshake manager installs the real poll in M2+; the default is a
-    /// no-op so the poll site itself is already correct.
+    /// Safepoint integration hook (Rule 81): invoked by SAFEPOINT_POLL only
+    /// when the bound poll word is ARMED (M6-b flag-first conversion — the
+    /// hook is the scheduler's slow path, never the unguarded fast path).
+    /// The default is a no-op so the poll site itself is already correct.
     void set_safepoint_hook(void (*hook)(void*), void* user) noexcept {
         safepoint_hook_ = hook;
         safepoint_hook_user_ = user;
     }
+
+    /// Bind the safepoint poll word (M6-b): the SAFEPOINT_POLL fast path is
+    /// one relaxed load of this word; nullptr resets to the global
+    /// polling-page word (infra::SafepointPollingPage::poll_word()).
+    void bind_safepoint_word(std::atomic<uint32_t>* word) noexcept {
+        safepoint_word_ = word;
+    }
+
+    /// The word SAFEPOINT_POLL tests: the explicit binding, else the global
+    /// polling-page word, else nullptr (no fast path — hook-only polls).
+    std::atomic<uint32_t>* effective_safepoint_word() const noexcept;
 
     /// Interop message registry (docs/interop-protocol.md): POLY_* dispatch
     /// resolves receivers through it. Null = no interop runtime installed;
@@ -357,6 +370,7 @@ private:
 
     void (*safepoint_hook_)(void*) = nullptr;
     void* safepoint_hook_user_ = nullptr;
+    std::atomic<uint32_t>* safepoint_word_ = nullptr;  // M6-b: flag-first
 
     runtime::interop::InteropRegistry* interop_registry_ = nullptr;
 

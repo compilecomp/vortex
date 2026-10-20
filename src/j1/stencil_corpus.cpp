@@ -417,11 +417,16 @@ Stencil t_const_i32() {
 
 Stencil t_const_pool(uint16_t op) {
     // Load the materialized constant: rax = ctx->constants[8 * meta].
+    // The old template encoded the indexed load as [rax] (mod=0 — NO disp32
+    // bytes) but marked a disp32 patch site, so the pool offset landed four
+    // bytes into the NEXT instruction — latent since M1 (the pool form
+    // never ran in the M1 tests; the SAFEPOINT_POLL loop was its first
+    // execution and the corrupted store segfaulted). The index now lives in
+    // a patched imm32 and the load scales it: rax = [rax + rdx*8].
     TemplateBuilder b(op, false);
     b.asm_.mov_reg_mem(kA, Mem{kCtx, Reg::RSP, 0, kCtxConstants});
-    const size_t off = b.here() + 3;  // REX + 8B + modrm, then disp32
-    b.asm_.mov_reg_mem(kA, Mem{kA, Reg::RSP, 0, 0});
-    b.mark(PatchKind::ConstantIndex, PA_ConstPoolOff, off);
+    b.imm32sx_site(kC, PatchKind::ConstantIndex, PA_ConstPoolOff);
+    b.asm_.mov_reg_mem(kA, Mem{kA, kC, 3, 0});
     b.store_vreg(kA, VR_Dst);
     b.tail(BT_Next);
     return b.finish();
@@ -1322,9 +1327,11 @@ Stencil t_safepoint_poll() {
     const size_t raise = b.asm_.placeholder_jcc(CC_NE);
     b.tail(BT_Next);
     b.bind(raise);
-    // Armed: exit with the deopt id — the driver reruns the method in T0
-    // from the entry with the original arguments (M1 suspension contract).
-    b.error_exit(static_cast<uint32_t>(E::kErrDeopt));
+    // Armed: exit with the dedicated safepoint-request id (M6-b review: the
+    // id, not the word state, is the contract — a speculation deopt that
+    // races an armed word keeps the rerun-in-T0 semantics; only the poll
+    // raises this, and the arming caller owns freeze/thaw choreography).
+    b.error_exit(static_cast<uint32_t>(E::kErrSafepointRequest));
     return b.finish();
 }
 

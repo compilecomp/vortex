@@ -141,6 +141,10 @@ enum J1ErrorId : uint32_t {
     kErrCheckBounds = 40,
     kErrUnreachable = 41,
     kErrNoStencil = 42,
+    kErrSafepointRequest = 43,  // SAFEPOINT_POLL with an armed word: the
+                                // arming caller owns the choreography (M6-b
+                                // review split: speculation deopts keep the
+                                // rerun contract; only the poll raises this)
 };
 
 /// The generated-code view of the runtime. Field offsets are ABI:

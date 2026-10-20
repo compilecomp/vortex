@@ -23,10 +23,13 @@
 //           through the corpus's documented call sites.
 #include "vortex/j1/baseline_jit.hpp"
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <unordered_map>
 
 #include "vortex/gc/collector.hpp"
+#include "vortex/infra/threading.hpp"
 #include "vortex/j1/stencil_corpus.hpp"
 #include "vortex/ugb/encoding.hpp"
 
@@ -562,7 +565,20 @@ Result<void> make_j1_bindings(gc::Heap& heap, ugb::UGBModule& module,
     ctx.constants = bindings.constants.data();
     ctx.klass_table = bindings.klass_addr_table.data();
     ctx.interpreter = interpreter;
-    ctx.safepoint_word = &bindings.safepoint_word;
+    // M6-b (docs/infrastructure/04-threading-suspension.md section 7):
+    // default the stencil's poll word to the GLOBAL polling-page word when
+    // the page is reserved (all J1 executables observe the same arm state);
+    // the per-executable binding word remains the fallback when the page
+    // was never reserved. The stencil dereferences this as a plain u32 with
+    // hand-written asm — no C++ access happens through this view (see the
+    // threading header CEP:ASSUMES; C++ readers must go through
+    // std::atomic_ref or the atomic view). Armed word -> kErrSafepointRequest
+    // raised by the stencil itself; the arming caller owns the choreography
+    // (M6-b review split — speculation deopts keep the rerun contract).
+    ctx.safepoint_word = infra::SafepointPollingPage::poll_word_raw();
+    if (ctx.safepoint_word == nullptr) {
+        ctx.safepoint_word = &bindings.safepoint_word;
+    }
     ctx.alloc_slow = reinterpret_cast<void*>(&helper_alloc_slow);
     ctx.write_barrier = reinterpret_cast<void*>(&helper_write_barrier);
     ctx.deopt = reinterpret_cast<void*>(&helper_deopt);
@@ -713,8 +729,19 @@ Result<BaselineCode> BaselineJit::compile(const BaselineJob& job) {
         const size_t next_native =
             i + 1 < seq.size() ? native_of[seq[i + 1].pc] : epilogue_off;
 
+        static const bool patch_debug =
+            std::getenv("VORTEX_J1_PATCH_DEBUG") != nullptr;
         for (const PatchSite& ps : st.patch_sites) {
             uint8_t* at = buf.code().data() + inst_base + ps.offset;
+            if (patch_debug) {
+                std::printf(
+                    "[patch] pc=%zu kind=%u op=%u off=%u base=%zx v=%d\n",
+                    d.pc, static_cast<unsigned>(ps.kind), ps.operand,
+                    ps.offset, inst_base,
+                    ps.kind == PatchKind::VirtualRegister
+                        ? vreg_for_operand(d.ins, ps.operand)
+                        : -1);
+            }
             switch (ps.kind) {
             case PatchKind::VirtualRegister: {
                 const int32_t v = vreg_for_operand(d.ins, ps.operand);
@@ -729,8 +756,15 @@ Result<BaselineCode> BaselineJit::compile(const BaselineJob& job) {
                     patch_imm64(at, static_cast<uint64_t>(v) << 1);
                     break;
                 }
-                case 1:  // PA_ConstPoolOff: 8 * constant index
-                    patch_imm32(at, static_cast<int32_t>(8u * d.ins.meta));
+                case 1:  // PA_ConstPoolOff: the RAW pool index — the
+                         // template's load scales it by 8
+                         // (rax = ctx->constants[rdx*8]). The M0-era form
+                         // patched a BYTE offset into an unscaled disp32;
+                         // the scaled-index rewrite made 8*meta double-scale
+                         // (index 1 read constants[8] — out-of-pool heap
+                         // garbage), which the SAFEPOINT_POLL loop was the
+                         // first execution to expose.
+                    patch_imm32(at, static_cast<int32_t>(d.ins.meta));
                     break;
                 case 3: {  // PA_KlassAddr
                     // F64-family templates guard against the heap's boxed-
@@ -1039,12 +1073,15 @@ Result<TaggedValue> run_baseline(BaselineExecutable& ex, J1Bindings& bindings,
     bindings.context.gc_frame_rbp = nullptr;  // stale once the frame is gone
     bindings.context.gc_frame_pc = nullptr;
     if (rc == static_cast<int64_t>(J1ErrorId::kErrDeopt)) {
-        // M1 suspension contract (corpus SAFEPOINT_POLL): rerun the whole
-        // method in the attached T0 with the original arguments. RBPD
-        // region continuations replace this in M3.
-        auto* module =
-            static_cast<ugb::UGBModule*>(const_cast<void*>(bindings.context.module));
-        auto* interp = static_cast<vm::Interpreter*>(bindings.context.interpreter);
+        // M1 suspension contract (corpus SAFEPOINT_POLL era, kept by the
+        // M6-b review split): a speculation deopt reruns the whole method
+        // in the attached T0 with the original arguments. RBPD region
+        // continuations replace this in M3. This arm no longer inspects
+        // the poll word — the armed-word case carries its own error id.
+        auto* module = static_cast<ugb::UGBModule*>(
+            const_cast<void*>(bindings.context.module));
+        auto* interp = static_cast<vm::Interpreter*>(
+            bindings.context.interpreter);
         if (interp != nullptr && module != nullptr &&
             ex.method_id < module->method_table.size()) {
             tlab_adopt(&bindings.context);
@@ -1053,6 +1090,13 @@ Result<TaggedValue> run_baseline(BaselineExecutable& ex, J1Bindings& bindings,
             tlab_publish(&bindings.context);
             if (run) return run->value;
         }
+    }
+    if (rc == static_cast<int64_t>(J1ErrorId::kErrSafepointRequest)) {
+        // M6-b: the poll stencil tested an ARMED word. The caller that
+        // armed the word owns the choreography (freeze/thaw or
+        // rerun-after-disarm). Rerunning T0 now would spin its no-hook
+        // cooperative poll on the still-armed word: a self-deadlock.
+        // Surface the named error (fall through to the diagnostic).
     }
     if (rc != 0) {
         return fail(support::ErrorCode::RuntimeError,
@@ -1065,6 +1109,8 @@ Result<TaggedValue> run_baseline(BaselineExecutable& ex, J1Bindings& bindings,
 const char* diagnose_j1_error(uint32_t id) noexcept {
     switch (static_cast<J1ErrorId>(id)) {
     case J1ErrorId::kErrDeopt: return "safepoint request (deopt to T0)";
+    case J1ErrorId::kErrSafepointRequest:
+        return "safepoint request (poll word armed)";
     case J1ErrorId::kErrAddUnsupported:
         return "Add.Any: unsupported operand types";
     case J1ErrorId::kErrAddTyped: return "Add.I32: speculation failed";

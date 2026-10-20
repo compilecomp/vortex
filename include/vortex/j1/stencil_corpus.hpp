@@ -15,7 +15,8 @@
 //         5 = PA_VregBase  (lea &vreg[0]: whole frame, deopt/OSR)
 //   PatchKind::ConstantIndex    — the site's bytes are immediates:
 //         0 = PA_ConstSmi     (8 bytes, imm64 = (int64)(int32)meta << 1)
-//         1 = PA_ConstPoolOff (4 bytes, imm32 = 8 * meta)
+//         1 = PA_ConstPoolOff (4 bytes, imm32 = the raw pool
+//         index; the template load scales it by 8)
 //         2 = PA_KlassOff     (4 bytes, imm32 = 8 * klass_token)
 //         3 = PA_KlassAddr    (8 bytes, imm64 = double-box klass pointer)
 //         4 = PA_FieldByteOff (4 bytes, imm32 = 16 + 8 * ic_slot target)

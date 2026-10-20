@@ -164,6 +164,65 @@ VORTEX_TEST(j1_golden_jump_tail) {
     VORTEX_EXPECT_EQ(j->patch_sites[0].operand, static_cast<uint8_t>(0));
 }
 
+/// CEP:WHAT: DoD (M6-b review F10): the rebuilt const-pool stencil's golden pin.
+/// CEP:WHY: The M1-era template's patch site pointed into the NEXT
+///           instruction; the pin makes that encoding regression loud.
+/// CEP:STATUS: complete
+/// CEP:FAILURE: assertion failures count through the harness.
+/// CEP:ASSUMES: The file-level block covers the shared contracts.
+/// CEP:COST: @cold. Test-only.
+/// CEP:EVIDENCE: this test is the evidence (M6-b review round).
+VORTEX_TEST(j1_golden_const_pool) {
+    StencilTable t = make_corpus();
+    const Stencil* s = t.select(static_cast<uint16_t>(Op::CONST_I64), false);
+    VORTEX_EXPECT(s != nullptr);
+    if (!s) return;
+    // The M6-b rebuild: rax = ctx->constants[imm32] via a scaled-index load
+    // [rax + rdx*8]. The M1-era template encoded the indexed load as [rax]
+    // (mod=0, NO disp32 bytes) while marking a disp32 patch site, so the
+    // pool offset landed four bytes into the NEXT instruction — latent
+    // until the SAFEPOINT_POLL loop executed the pool form (M6-b review
+    // F10: this pin makes the encoding regression loud again).
+    const uint8_t golden[] = {
+        0x49, 0x8b, 0x47, 0x28,              // mov rax, [r15 + 0x28]
+        0x48, 0xc7, 0xc2, 0x00, 0x00, 0x00, 0x00,  // mov rdx, imm32 (site)
+        0x48, 0x8b, 0x04, 0xd0,              // mov rax, [rax + rdx*8]
+        0x48, 0x89, 0x85, 0x60, 0xff, 0xff, 0xff,  // mov [rbp-160], rax
+        0xe9, 0x00, 0x00, 0x00, 0x00};       // jmp rel32 (tail)
+    VORTEX_EXPECT_EQ(s->bytes.size(), sizeof(golden));
+    VORTEX_EXPECT(std::memcmp(s->bytes.data(), golden, sizeof(golden)) == 0);
+    VORTEX_EXPECT_EQ(s->patch_sites.size(), static_cast<size_t>(3));
+    // The ConstantIndex site points INSIDE its own instruction: the imm32
+    // field of the mov (instruction at 4, field at 4 + 3). Operand 1 is
+    // PA_ConstPoolOff (stencil_corpus.hpp documents the numbering).
+    VORTEX_EXPECT_EQ(s->patch_sites[0].offset, static_cast<uint8_t>(7));
+    VORTEX_EXPECT_EQ(s->patch_sites[0].kind, PatchKind::ConstantIndex);
+    VORTEX_EXPECT_EQ(s->patch_sites[0].operand, static_cast<uint8_t>(1));
+}
+
+/// CEP:WHAT: DoD (M6-b review F10): a high-index pool constant end to end.
+/// CEP:WHY: The double-scale bug read constants[8 * meta] — high indices
+///           are where that corruption was loudest; the pin covers them.
+/// CEP:STATUS: complete
+/// CEP:FAILURE: assertion failures count through the harness.
+/// CEP:ASSUMES: The file-level block covers the shared contracts.
+/// CEP:COST: @cold. Test-only (70 stencil instantiations).
+/// CEP:EVIDENCE: this test is the evidence (M6-b review round).
+VORTEX_TEST(j1_const_pool_high_index) {
+    // A pool past one SIB page of entries: index 69 loads through the
+    // rebuilt pool form (the double-scale bug read constants[8 * meta] —
+    // high indices are where the corruption was loudest).
+    std::string src = ".method f(regs=4, args=0)\n";
+    for (int i = 0; i < 70; ++i) {
+        src += "    Const.I64 v1, " + std::to_string(1000 + i) + "\n";
+    }
+    src += "    Return v1\n.end\n";
+    StencilTable corpus = make_corpus();
+    auto j1 = run_j1(src.c_str(), "f", {}, corpus);
+    VORTEX_EXPECT(j1.has_value());
+    if (j1) VORTEX_EXPECT_EQ(j1->as_smi(), 1000 + 69);
+}
+
 // ---- parity (M1 DoD) --------------------------------------------------------------
 
 VORTEX_TEST(j1_parity_fib_recursive_entry) {

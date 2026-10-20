@@ -112,7 +112,6 @@ permit_register() {
     cat <<'EOF'
 PERF-001: computed-goto threaded dispatch (execute, src/vm/interpreter.cpp)
 PERF-002: CALL_BUILTIN host-function pointer (src/vm/interpreter.cpp)
-PERF-003: SAFEPOINT_POLL hook pointer (src/vm/interpreter.cpp)
 PERF-004: per-instruction bigram probe (record_bigram, src/vm/interpreter.cpp)
 PERF-005: mprotect pair per patch session (PatchArena, src/infra/patch_arena.cpp; LdptManager::patch_session, src/runtime/ldpt.cpp)
 PERF-006: allocation on the compile/bind path (make_j1_bindings, src/j1/baseline_jit.cpp)

@@ -9,6 +9,7 @@
 
 #include "vortex/support/cem.hpp"
 #include "vortex/support/log.hpp"
+#include "vortex/infra/threading.hpp"
 #include "vortex/ugb/encoding.hpp"
 #include "vortex/ugb/verifier.hpp"
 
@@ -215,6 +216,29 @@ Interpreter::Interpreter(gc::Heap& heap, InterpreterConfig config)
     // GC runtime state (docs/gc-icggc.md 8.6): T0 frames are a precise root
     // source; the interpreter registers itself on construction.
     heap_.gc_state().interpreter = this;
+}
+
+// CEP:WHAT: Resolves the word SAFEPOINT_POLL tests (M6-b flag-first
+//           conversion): the explicit bind_safepoint_word binding, else the
+//           global polling-page word, else nullptr.
+// CEP:WHY: One relaxed load must be the common case at every executed poll
+//           (Rule 81). The resolution itself re-runs per poll but is a pure
+//           pointer select off cached fields — the hot path is the load of
+//           the word it returns, not this select.
+// CEP:CLASS: CEP-1
+// CEP:STATUS: complete
+// CEP:FAILURE: none (nullptr is the documented "no fast path" state and the
+//           poll site handles it as hook-only).
+// CEP:ASSUMES: The global polling page is never reserved from this call
+//           (poll_word() does not allocate — reservation is the embedder's
+//           explicit step).
+// CEP:COST: @hot-adjacent. Two pointer compares per SAFEPOINT_POLL; the
+//           loads themselves are the poll fast path.
+// CEP:EVIDENCE: tests/test_threading.cpp — default/override/nullptr binding
+//           behavior and the armed-word slow path.
+std::atomic<uint32_t>* Interpreter::effective_safepoint_word() const noexcept {
+    if (safepoint_word_ != nullptr) return safepoint_word_;
+    return infra::SafepointPollingPage::poll_word();
 }
 
 void Interpreter::register_builtin(
@@ -1867,19 +1891,28 @@ L_CHECK_BOUNDS: {
 L_SAFEPOINT_POLL:
     VORTEX_PROFILE();
     stats_.safepoint_polls++;
-    // Rule 81: safepoints must be reachable within bounded time. The hook is
-    // installed by the suspension infra in M2+; the poll site itself is
-    // already correct.
-    // PERF_PERMIT PERF-003 (indirect call through a function pointer,
-    // CEM-26 section 7/10):
-    // REASON: the suspension handshake must be replaceable without
-    //         recompiling the engine (Rule 81); a data-oriented alternative
-    //         (flag + atomic poll word) lands with the M2 threading infra
-    //         and this site converts to it then.
-    // COST: one null test + (rare) indirect call per SAFEPOINT_POLL
-    //       execution; the null test is the common case in M0 (no hook).
-    // OWNER: @vortex/rt (registered in tools/lint/compliance.sh; expiry M2)
-    if (safepoint_hook_ != nullptr) safepoint_hook_(safepoint_hook_user_);
+    // M6-b flag-first poll (docs/infrastructure/04-threading-suspension.md
+    // section 7): one relaxed load of the bound word; zero = continue. The
+    // hook is the scheduler's SLOW path (fired only on an armed word), and
+    // with no hook the poll spins out a cooperative freeze. The M0/M1
+    // indirect-call permit for this site is retired: the data-oriented
+    // replacement it promised IS this word test.
+    {
+        std::atomic<uint32_t>* const word = effective_safepoint_word();
+        if (word == nullptr || word->load(std::memory_order_relaxed) == 0) {
+            VORTEX_NEXT();
+        }
+        if (safepoint_hook_ != nullptr) {
+            safepoint_hook_(safepoint_hook_user_);
+            if (word->load(std::memory_order_relaxed) == 0) VORTEX_NEXT();
+        }
+        // No hook: cooperative freeze — block until the word clears (the
+        // polling page clears the word BEFORE the trap page turns readable,
+        // so an unblocked poll never races the disarm flip).
+        while (word->load(std::memory_order_relaxed) != 0) {
+            std::this_thread::yield();
+        }
+    }
     VORTEX_NEXT();
 L_NOP:
     VORTEX_NEXT();

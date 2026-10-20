@@ -287,7 +287,62 @@ Findings:
       change would re-record the M1 golden machine-code pins — J1-scope
       work, tracked here).
 - [ ] Threading (M4): M:N work-stealing scheduler, guard-page suspension,
-      safepoint polling page
+      safepoint polling page. **Batch b (M6-b) landed**: the safepoint
+      polling page pair (a flag page holding the global poll word all tiers
+      read + a protection-flipped trap page for future emitted polls), the
+      real HandshakeManager (bounded thread table, post-only request,
+      bounded waits, freeze_all/thaw_all stop-the-world with rollback on
+      timeout, CAS-gated freeze entry, registration/spawn rejected inside
+      the freeze window, one shared deadline, a thread that exits satisfies
+      the freeze), the M:N work-stealing pool (ucontext fibers on mmap'd
+      guard-page stacks, pthread workers, per-worker deques with randomized
+      stealing, cooperative safepoint integration — fibers REGISTER with
+      the handshake at spawn/bind and acknowledge freezes for real; fibers
+      wait out freezes, rotate every quantum; pool(0) is a driver-only
+      mode), and the GuardPageSuspender (a chaining SIGSEGV disposition
+      over per-thread altstacks: guard-region traps capture the
+      interrupted context and preemptively suspend never-polling fibers;
+      a fault on a fiber's LIFETIME low guard FAILS the fiber by name
+      instead of suspending — disarming a lifetime guard would turn a
+      bounded overflow into silent corruption; foreign faults chain to the
+      previous handler so sanitizer reports keep working). The suspension
+      basis is the fiber's LAST-PARK RSP (re-based at every yield — a
+      started, deep, never-polling fiber is catchable). T0's SAFEPOINT_POLL
+      converted to flag-first (one relaxed load; the indirect-call permit
+      on that site retired), J1's stencil defaults to the global poll
+      word, and the LDPT freeze protocol runs on the real handshake.
+      Four M1-era latent bugs the new consumers exposed and fixed: the
+      constant-pool stencil's patch site pointed past its own instruction
+      (the SAFEPOINT_POLL loop was the pool form's first execution), the
+      pool-offset patch double-scaled the index, helper_invoke_token
+      resolved callees positionally although the token pool is
+      first-reference ordered (forward-referenced callees — mutual
+      recursion — silently called the WRONG method; now resolves by name
+      like T0, Rule 18), and J1's run_baseline skipped the T0 rerun on ANY
+      deopt racing an armed word (the poll now raises its own
+      kErrSafepointRequest; speculation deopts keep the rerun contract).
+      Two independent reviewers audited the batch (threading core;
+      integration/tests/spec surface) — 3 blockers and 11 majors fixed
+      with regression tests: the spawn deque push now takes the worker's
+      mutex; fiber activation is a CAS claim and the yield requeue lands
+      only after the context save (two threads on one stack made
+      impossible); freeze entry is a CAS gate; the guard registry
+      publishes before the protect; ensure_installed is serialized and
+      never chains to itself; the trap handler is async-signal-safe (no
+      stdio); spawn's out-params actually reach the caller (GreenThread&
+      — the by-value signature silently dropped them); patch regions are
+      reclaimed at retire (disarm_record); the doc contract was synced to
+      the shipped semantics (pool(0), chaining, altstacks, probe recipe,
+      DoD list). Capacity bounds are now EXERCISED at their bounds (1024
+      guard regions, 4095 handshake slots), the frozen-window rejects are
+      pinned, and the t_const_pool encoding has its golden pin back.
+      221 tests green on Release and ASan/UBSan. Spec:
+      docs/infrastructure/04-threading-suspension.md. Deferred within the
+      item: lock-free Chase-Lev deques (v1 uses mutex deques), J3/J4
+      emitted poll sites (the trap page is their reserved consumer
+      interface), polling-page degradation fault-injection coverage
+      (tracked with the emitted-poll batch), and moving the ICGGC driver
+      slices to a background thread (freeze_all is its substrate).
 - [ ] FFI (M5): trampoline generator, unified unwinding
 - [ ] Observability (M6): jitdump, GDB JIT interface, managed sanitizers,
       deterministic replay
