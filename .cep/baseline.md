@@ -188,3 +188,33 @@ per-file SEV1 deltas on the touched legacy files stay ZERO against
 dab39d5: fast_jit.cpp 84, stencil_corpus.cpp 66, interpreter.cpp 25,
 baseline_jit.cpp 21, object_model.hpp 7, ffi.cpp 6, interpreter.hpp 3,
 baseline_jit.hpp 2, ffi.hpp 1, context.hpp 2.
+
+## Batch 4 (M6-c, ffi tree migration)
+
+The M6-c FFI batch migrates the ffi tree to CEP&CC-complete — the M0-era
+surface (ffi.hpp, ffi.cpp) plus the new implementation (ffi_trampoline.cpp,
+ffi_unwind.cpp) and its test file — every function carrying the seven-field
+block, both file headers nine-field. Counts at the gates (run_gates_m6c.sh):
+
+```text
+141 files scanned, 3522 issues
+  severity-0 (EXTERMINATE):        0
+  severity-1 (EXTERMINATE-UNLESS):  970   (batch 2: 991; M6-b: 977; net -7)
+  severity-2 (REJECT-AND-REPAIR):  2552   (+31: naming notes on the new
+                                        review-round test pins — tracked
+                                        for the SEV2 backlog)
+  severity-3 (WARN-AND-EDUCATE):      0
+```
+
+(An interim 3524/972 record was taken mid-fix-round before the two new
+review-round tests carried their CEP blocks; the post-fix numbers above
+are the ones at closure.)
+
+The ffi tree + tests/test_ffi.cpp: ZERO severity-1 findings. The per-file
+SEV1 deltas recorded in batch 2 (ffi.cpp 6, ffi.hpp 1) and carried through
+batch 3 as "6->6, 1->1 — pre-existing findings stay under the waiver for
+their batches" are retired by THIS batch: ffi.cpp 6 -> 0, ffi.hpp 1 -> 0
+(the numbers were the pre-migration backlog of the M0 surface, and the ffi
+batch is their batch). The WorkStealingPool fiber-table fix (M6-c
+gates caught the spawn-vs-fiber_thunk publish race) is annotated in place;
+the threading tree stays SEV1-clean.

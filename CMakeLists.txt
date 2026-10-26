@@ -30,7 +30,13 @@ endif()
 # Rule 68: no RTTI in hot compiler/runtime code. RTTI-free builds are the
 # default for every vortex target; the frontend dispatches on explicit kind
 # enums instead of dynamic_cast.
-set(VORTEX_HOT_FLAGS -fno-rtti)
+# -fno-omit-frame-pointer: the unified unwinder (M6-c,
+# docs/infrastructure/05-ffi.md) walks mixed stacks over the RBP chain; JIT
+# and trampoline frames chain by construction, so EVERY C++ frame in every
+# target (core, tools, tests) must keep its frame pointer — a frameless
+# frame anywhere below the capture site truncates/corrupts the walk.
+set(VORTEX_HOT_FLAGS -fno-rtti -fno-omit-frame-pointer)
+add_compile_options(-fno-omit-frame-pointer)
 
 # ---- core library --------------------------------------------------------------
 

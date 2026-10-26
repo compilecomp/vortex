@@ -32,6 +32,10 @@ enum class ErrorCode : uint8_t {
     // Rule-43 entry trap: the region table refused optimized entry for a
     // method/region past its deopt thresholds (docs/deopt-rbpd.md 9).
     SpeculationDisabled,
+    // M6-c addition (appended: ordinals above are serialized — never reorder).
+    // Rule-132 boundary: a C++ exception escaping a foreign call was
+    // translated at the FFI boundary (docs/infrastructure/05-ffi.md).
+    ForeignBoundary,
 };
 
 const char* error_code_name(ErrorCode code) noexcept;

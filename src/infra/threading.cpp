@@ -1459,7 +1459,16 @@ struct WorkStealingPool::Impl {
     std::mutex mu;
     std::condition_variable cv;
     std::deque<uint64_t> global_ready;
+    // Ownership table (mu-protected writers only — spawn push_back may
+    // reallocate; every vector ACCESS is under impl->mu).
     std::vector<std::unique_ptr<Fiber>> fibers;
+    // Stable publish table for the LOCK-FREE readers (fiber() from
+    // fiber_thunk runs on worker threads without mu): fixed capacity
+    // (kMaxFibers), allocated once at pool construction, slots published
+    // with release stores — a reallocation can never invalidate a reader
+    // (the M6-c gates caught the vector-read UAF: spawn's push_back
+    // reallocating while fiber_thunk indexed the old array).
+    std::unique_ptr<std::atomic<Fiber*>[]> fiber_slots;
     bool stop = false;
     bool degraded = false;
     bool shutdown_done = false;
@@ -1484,8 +1493,11 @@ struct WorkStealingPool::Impl {
 // CEP:EVIDENCE: tests/test_threading.cpp (the DoD list, docs/
 //           infrastructure/04 section 10).
     Fiber* fiber(uint64_t fid) const noexcept {
-        if (fid == 0 || fid - 1 >= fibers.size()) return nullptr;
-        return fibers[fid - 1].get();
+        if (fid == 0 || fid - 1 >= kMaxFibers) return nullptr;
+        // Acquire-load of the publish slot: a spawned fiber's fields are
+        // written-before-publish (release in spawn), so a reader that sees
+        // the slot sees the fiber ready. Unpublished slots read nullptr.
+        return fiber_slots[fid - 1].load(std::memory_order_acquire);
     }
 
 // CEP:WHAT: True when no queued fiber remains (shutdown drain predicate).
@@ -1850,6 +1862,15 @@ WorkStealingPool::WorkStealingPool(uint32_t os_threads) : impl_(nullptr) {
     impl_ = new (std::nothrow) Impl();
     if (impl_ == nullptr) return;  // host OOM: destructor and spawn reject
     Impl& impl = *impl_;
+    // The publish slot table is a 512 KiB fixed allocation (M6-c review
+    // R2-8): a throwing new[] inside a nothrow-new-constructed Impl would
+    // escape the pool constructor (the file's Rule 65 posture: error-code
+    // API, no exceptions). Nothrow + the existing degraded route.
+    impl.fiber_slots.reset(new (std::nothrow) std::atomic<Fiber*>[kMaxFibers]{});
+    if (impl.fiber_slots == nullptr) {
+        impl.degraded = true;
+        return;
+    }
     if (os_threads == 0) {
         // Driver-only mode: a VALID pool with no workers — fibers are run
         // by the embedder through resume_fiber (deterministic driving; the
@@ -1997,6 +2018,11 @@ support::Result<uint64_t> WorkStealingPool::spawn(GreenThread& thread) {
                             : impl->s_spawned.load(std::memory_order_relaxed) %
                                     static_cast<uint32_t>(impl->workers.size());
     impl->fibers.push_back(std::move(f));
+    // Publish for the lock-free readers (release: the vector move into the
+    // slot is the last write; fiber() acquires). Under impl->mu, so slot
+    // writes are serialized.
+    impl->fiber_slots[fid - 1].store(impl->fibers[fid - 1].get(),
+                                     std::memory_order_release);
     if (!impl->workers.empty()) {
         // Under the worker's own mutex (M6-b review B1): workers pop the
         // front and stealers pop the back of this same deque — a push
@@ -2267,7 +2293,11 @@ support::Result<void> WorkStealingPool::bind_suspension(
     // Register fibers that already exist (M6-b review M6): their polls
     // acknowledge a freeze for real. A full table stops the registrations
     // — unregistered fibers keep hs_id 0 and the freeze does not wait on
-    // them (documented degrade).
+    // them (documented degrade). Under impl->mu (M6-c review R2-1): the
+    // ownership vector's reallocation discipline is "every vector access
+    // under mu", and bind_suspension can run concurrently with spawn.
+    // Lock order impl->mu -> hs matches spawn's established order.
+    std::lock_guard<std::mutex> lk(impl->mu);
     for (auto& f : impl->fibers) {
         if (f->hs_id != 0) continue;
         auto id = handshake->register_thread();
@@ -2408,9 +2438,13 @@ uint32_t WorkStealingPool::os_thread_count() const noexcept {
 // CEP:EVIDENCE: tests/test_threading.cpp (the DoD list, docs/
 //           infrastructure/04 section 10).
 uint64_t WorkStealingPool::fiber_count() const noexcept {
-    return impl_ != nullptr
-               ? static_cast<uint64_t>(impl_->fibers.size())
-               : 0;
+    // s_spawned, NOT fibers.size() (M6-c review R2-1): the counter is a
+    // relaxed atomic readable from any thread; the vector's size() is
+    // mu-protected (spawn push_back may reallocate). The table is
+    // append-only (records are kept for join), so the counter and size()
+    // are equal at every point size() is legally readable.
+    return impl_ != nullptr ? impl_->s_spawned.load(std::memory_order_relaxed)
+                            : 0;
 }
 
 // CEP:WHAT: The safepoint slow path: acknowledge, wait out freezes, rotate quanta.

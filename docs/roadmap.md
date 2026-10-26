@@ -343,7 +343,47 @@ Findings:
       interface), polling-page degradation fault-injection coverage
       (tracked with the emitted-poll batch), and moving the ICGGC driver
       slices to a background thread (freeze_all is its substrate).
-- [ ] FFI (M5): trampoline generator, unified unwinding
+- [ ] FFI (M5): trampoline generator, unified unwinding. **Batch c (M6-c)
+      landed**: the trampoline generator — synthesized SysV x86-64 stubs
+      through the ONE W^X publish path with the M1 assembler (guest→native
+      call-out: Smi unbox, boxed-double payload load into XMM, pointer-like
+      unbox, canonical bools, boundary safepoint poll BEFORE translation
+      because the hook call clobbers caller-saved registers, foreign call,
+      box-on-return with the int63 roundtrip overflow check; native→guest
+      callback: register spill, tagged re-box, rip-relative context island
+      whose displacement is layout-only, boundary poll, C++ shim re-entry,
+      unbox-on-return) — emission is a pure function of the signature
+      (byte-identical stubs, golden-pinned in both directions; no baked
+      addresses — callees/poll word ride context fields, slow-path helpers
+      ride context slots); the FfiTrampolineRegistry + the UnifiedUnwinder
+      (one RBP-chain walk naming JIT frames through the M5 published-code
+      registry, trampoline frames through the FFI registry, native frames
+      through dladdr — with plausibility bounds (monotonicity + an 8 MiB
+      stack-adjacency step) that make following a frameless frame's garbage
+      slot unlikely, not impossible — a corrupt chain is already UB and the
+      walker is a diagnostics path) + the Rule-132 exception bridge
+      (ForeignBoundary named failures; exceptions never cross into guest
+      frames); emit refusals are named (arity caps, F64/Ptr callback args,
+      Null call-out args, non-SysV). En-route fixes: the M1 assembler's
+      emit_mem_operand never forced SIB for R12 bases (rm=100 escape — the
+      trampolines are its first consumer) and leaked bit 3 of R8-R15
+      index/base ordinals into the neighboring SIB fields, both
+      golden-pinned; the callback arena originally grew upward over the
+      return address and the caller's frame (the corruption class the
+      suite caught, pinned by the re-entry parity test); the build keeps
+      native frame pointers in EVERY target (-fno-omit-frame-pointer — the
+      walker's RBP-chain contract); the M6-c gates surfaced and fixed a
+      latent M6-b race — spawn's fiber-vector reallocation vs the
+      lock-free fiber_thunk reader (now a fixed-capacity release-published
+      slot table). CEP&CC batch 4: the ffi tree (M0 surface included) +
+      tests/test_ffi.cpp ship SEV1-clean; SEV1 977 -> 970. 243 tests green
+      on Release and ASan/UBSan. Spec: docs/infrastructure/05-ffi.md.
+      Deferred within the item: F64 returns (allocation-integrated form,
+      emitted-poll/J4 batch), AAPCS64 + native stack-arg spill (ARM64
+      backend batch), JIT-tier call-out lowering (the stubs' consumer
+      contract is the driver-level entry; tier call-sites ship with the
+      interop/J4 batches), PinningRegion integration into the stub arg
+      path (Ptr args are handles-or-pins by discipline today).
 - [ ] Observability (M6): jitdump, GDB JIT interface, managed sanitizers,
       deterministic replay
 - [ ] CPU dispatch (M7): multi-versioning stubs, hardware extension lowering

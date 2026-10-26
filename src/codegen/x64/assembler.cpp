@@ -39,9 +39,13 @@ void Assembler::modrm(uint8_t mod, Reg reg, Reg rm) {
 void Assembler::imm32(int32_t v) { out_.emit32(static_cast<uint32_t>(v)); }
 
 void Assembler::emit_mem_operand(Reg reg, const Mem& m) {
-    // SIB is required when index != no-index marker or base is RSP/RBP-mod-0.
+    // SIB is required when index != no-index marker, or the base is RSP/R12:
+    // both encode rm=100 in ModRM (the SIB escape). R12's low 3 bits are 100,
+    // so a ModRM without SIB silently reinterprets [r12+d] as a SIB form
+    // (M6-c FFI trampolines are the first consumer; golden-pinned in
+    // tests/test_ffi.cpp).
     const bool no_index = reg_id(m.index) == 4 && m.scale == 0;
-    const bool base_needs_sib = reg_id(m.base) == 4;   // RSP base
+    const bool base_needs_sib = reg_id(m.base) == 4 || reg_id(m.base) == 12;
     // RBP (5) and R13 (13) both encode mod-0 rm as RIP-relative on real x86-64;
     // both must force a displacement (the M1 stencil corpus relies on this for
     // rbp-based vreg addressing).
@@ -49,7 +53,12 @@ void Assembler::emit_mem_operand(Reg reg, const Mem& m) {
         reg_id(m.base) == 5 || reg_id(m.base) == 13;
 
     uint8_t mod;
-    if (m.disp == 0 && !special_base) {
+    if (m.disp == 0 && !special_base && !base_needs_sib) {
+        // RSP/R12 bases take the SIB path and force a displacement (the
+        // mod=01 disp8=0 form) so the mod=00 special cases stay
+        // unreachable: SIB base=101 in mod=00 is the no-base disp32 form,
+        // and rm=101 in mod=00 is RIP-relative (M6-c review R1-4 — the
+        // canonical [rsp+disp32] form is SIB base=100 WITH mod != 00).
         mod = 0x0;
     } else if (m.disp >= -128 && m.disp <= 127) {
         mod = 0x1;
@@ -67,11 +76,20 @@ void Assembler::emit_mem_operand(Reg reg, const Mem& m) {
         return;
     }
 
-    // SIB byte: scale | index | base
+    // SIB byte: scale | index | base. The index and base fields are 3 bits —
+    // bit 3 of R8-R15 rides REX.X/REX.B (set by the caller's rex helpers), so
+    // the ordinals must be masked or bit 3 leaks into the neighboring field.
     const uint8_t scale_bits = static_cast<uint8_t>(m.scale & 0x3);
+    // RSP cannot BE an index: SIB index=100 always decodes as "no index".
+    // A caller asking for [base + RSP*scale] would silently get [base] —
+    // refused loudly instead (Rule 76, the setcc precedent).
+    if (!(reg_id(m.index) == 4 && m.scale == 0) && reg_id(m.index) == 4) {
+        std::abort();
+    }
     modrm(mod, reg, Reg::RSP);  // rm = 100 escapes to SIB
-    out_.emit8(static_cast<uint8_t>((scale_bits << 6) | (reg_id(m.index) << 3) |
-                                    reg_id(m.base)));
+    out_.emit8(static_cast<uint8_t>((scale_bits << 6) |
+                                    ((reg_id(m.index) & 7) << 3) |
+                                    (reg_id(m.base) & 7)));
     if (mod == 0x0 && special_base) {
         out_.emit8(0);  // RBP/R13 base with no displacement still needs disp8=0
     } else if (mod == 0x1) {
@@ -119,6 +137,8 @@ void Assembler::movsd_xmm_mem(Xmm dst, const Mem& src) {
     uint8_t rex = 0x40;
     if (needs_rex_xmm(dst)) rex |= 0x4;
     if (needs_rex(src.base)) rex |= 0x1;
+    if (!(reg_id(src.index) == 4 && src.scale == 0) && needs_rex(src.index))
+        rex |= 0x2;  // X: real index >= R8 (M6-c review R1-2)
     rex_raw(rex);
     out_.emit8(0x0F);
     out_.emit8(0x10);
@@ -130,6 +150,8 @@ void Assembler::movsd_mem_xmm(const Mem& dst, Xmm src) {
     uint8_t rex = 0x40;
     if (needs_rex_xmm(src)) rex |= 0x4;
     if (needs_rex(dst.base)) rex |= 0x1;
+    if (!(reg_id(dst.index) == 4 && dst.scale == 0) && needs_rex(dst.index))
+        rex |= 0x2;  // X: real index >= R8 (M6-c review R1-2)
     rex_raw(rex);
     out_.emit8(0x0F);
     out_.emit8(0x11);
@@ -232,6 +254,12 @@ uint8_t Assembler::mem_rex(bool rex_w_set, uint8_t reg_field,
     uint8_t rex = static_cast<uint8_t>(rex_w_set ? 0x48 : 0x40);
     if (reg_field >= 8) rex |= 0x4;
     if (needs_rex(m.base)) rex |= 0x1;
+    // REX.X for a REAL index register (RSP with scale 0 is the no-index
+    // marker) — bit 3 of R8-R15 rides REX.X in the SIB index field (M6-c
+    // review R1-2; without this, a high index silently decodes as its
+    // low-3-bit alias, and index R12 decodes as NO index).
+    const bool no_index = reg_id(m.index) == 4 && m.scale == 0;
+    if (!no_index && needs_rex(m.index)) rex |= 0x2;
     return rex;
 }
 
@@ -266,19 +294,19 @@ void Assembler::mov_mem_imm32sx(const Mem& dst, int32_t imm) {
 }
 
 void Assembler::mov_mem_reg(const Mem& dst, Reg src) {
-    rex_w(src, dst.base);
+    rex_raw(mem_rex(true, reg_id(src), dst));  // R=src B=base X=index (R1-2)
     out_.emit8(0x89);
     emit_mem_operand(src, dst);
 }
 
 void Assembler::mov_reg_mem(Reg dst, const Mem& src) {
-    rex_w(dst, src.base);
+    rex_raw(mem_rex(true, reg_id(dst), src));  // R=dst B=base X=index (R1-2)
     out_.emit8(0x8B);
     emit_mem_operand(dst, src);
 }
 
 void Assembler::lea_reg_mem(Reg dst, const Mem& src) {
-    rex_w(dst, src.base);
+    rex_raw(mem_rex(true, reg_id(dst), src));  // R=dst B=base X=index (R1-2)
     out_.emit8(0x8D);
     emit_mem_operand(dst, src);
 }
@@ -288,9 +316,12 @@ void Assembler::lea_reg_scaled_disp(Reg dst, Reg index, uint8_t scale_log2,
     // mod=00, rm=100 (SIB follows); SIB base=101 in mod=00 = no base, so
     // the address is index*scale + disp. Flags are untouched, so this may
     // sit between a compare and its JCC.
+    // RSP cannot BE an index (same refusal as emit_mem_operand, R1-2).
+    if (reg_id(index) == 4) std::abort();
     uint8_t rex = 0x48;  // W set
     if (reg_id(dst) >= 8) rex |= 0x4;    // R
-    if (reg_id(index) >= 8) rex |= 0x1;  // X
+    if (reg_id(index) >= 8) rex |= 0x2;  // X (M6-c review R1-2: 0x1 is B,
+                                         // a no-op here — base=101 has no base)
     out_.emit8(rex);
     out_.emit8(0x8D);
     out_.emit8(static_cast<uint8_t>(((reg_id(dst) & 7) << 3) | 0x04));
@@ -387,13 +418,13 @@ void Assembler::cmp_reg_reg(Reg dst, Reg src) {
 }
 
 void Assembler::cmp_mem_reg(const Mem& m, Reg src) {
-    rex_w(src, m.base);
+    rex_raw(mem_rex(true, reg_id(src), m));  // R=src B=base X=index (R1-2)
     out_.emit8(0x39);
     emit_mem_operand(src, m);
 }
 
 void Assembler::cmp_reg_mem(Reg dst, const Mem& m) {
-    rex_w(dst, m.base);
+    rex_raw(mem_rex(true, reg_id(dst), m));  // R=dst B=base X=index (R1-2)
     out_.emit8(0x3B);
     emit_mem_operand(dst, m);
 }

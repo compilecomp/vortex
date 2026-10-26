@@ -18,6 +18,7 @@ const char* error_code_name(ErrorCode code) noexcept {
     case ErrorCode::Unsupported: return "Unsupported";
     case ErrorCode::InvalidState: return "InvalidState";
     case ErrorCode::SpeculationDisabled: return "SpeculationDisabled";
+    case ErrorCode::ForeignBoundary: return "ForeignBoundary";
     }
     return "?";
 }

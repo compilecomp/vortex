@@ -211,7 +211,12 @@ context while the first activation was still live).
   (named reject below — the guard page plus one frame must fit). Fibers
   vastly outnumber workers (the M of M:N); the table is a bounded deque
   of ready fibers plus a bounded map of live fibers (kMaxFibers = 65536,
-  Rule 28). Spawning during a freeze window rejects by name.
+  Rule 28). Live-fiber lookup is LOCK-FREE for the worker threads: a
+  fixed-capacity slot table published with release stores (allocated once,
+  never reallocated) sits beside the mu-protected ownership vector, so
+  spawn's table growth can never invalidate a concurrent reader (the
+  M6-c gates caught that exact use-after-free). Spawning during a freeze
+  window rejects by name.
 - `yield_current()` — cooperative: the RUNNING fiber on the calling OS
   thread swapcontexts back to its worker loop (the requeue happens in the
   scheduler after the save — see 5.2). Calling from a non-fiber thread →
