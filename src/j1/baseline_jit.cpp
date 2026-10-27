@@ -29,6 +29,7 @@
 #include <unordered_map>
 
 #include "vortex/gc/collector.hpp"
+#include "vortex/infra/observability.hpp"
 #include "vortex/infra/threading.hpp"
 #include "vortex/j1/stencil_corpus.hpp"
 #include "vortex/ugb/encoding.hpp"
@@ -1049,6 +1050,11 @@ Result<BaselineExecutable> publish_baseline(const BaselineCode& code,
     ex.gc_record = gc::gc_code_registry().register_code(
         ex.memory.data(), ex.memory.size(), gc::GcCodeRecord::Kind::J1,
         code.register_count, std::move(maps));
+    // Observability floor (docs/infrastructure/06-observability.md section
+    // 4): one CODE_LOAD + perf-map line per published range — best-effort,
+    // never fails the publish (the session stores the error).
+    infra::jit_session().record_code(ex.memory.data(), ex.memory.size(),
+                                     code.method_id, "j1");
     return ex;
 }
 

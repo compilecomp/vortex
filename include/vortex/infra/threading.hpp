@@ -55,6 +55,7 @@
 #include <signal.h>
 #include <ucontext.h>
 
+#include "vortex/infra/observability.hpp"
 #include "vortex/support/result.hpp"
 
 namespace vortex {
@@ -214,6 +215,16 @@ public:
     bool pending(uint64_t tid) const noexcept;
     bool frozen() const noexcept;
 
+    /// TTSP telemetry sink (docs/infrastructure/06 section 5): freezes and
+    /// single-thread handshakes record cause/TTSP/pause-body events. Raw
+    /// pointer, no ownership, null default (zero cost when unset); the log
+    /// is called under this manager's own serialization and never fails the
+    /// handshake. Guard-page (preemptive) events join with the emitted-poll
+    /// batch (R31).
+    void set_safepoint_log(SafepointLog* log) noexcept {
+        safepoint_log_ = log;
+    }
+
     struct Stats {
         uint64_t requests = 0;
         uint64_t freezes = 0;
@@ -226,6 +237,12 @@ private:
         std::atomic<uint32_t> pending{0};  // 0 none, else kind+1
         std::atomic<uint32_t> acked{0};
         std::atomic<uint32_t> alive{0};
+        /// TTSP telemetry (docs/infrastructure/06 section 5): request()
+        /// stamps the monotonic time and the kind; the waiter computes the
+        /// delta on ack. Stale values between requests are benign (restamped
+        /// per request).
+        std::atomic<uint64_t> requested_ns{0};
+        std::atomic<uint32_t> requested_kind{0};
     };
     // Slots indexed by id-1; slot 0 internal = the anonymous slot.
     support::Result<Slot*> slot_for(uint64_t tid) noexcept;
@@ -240,6 +257,22 @@ private:
     std::atomic<uint64_t> stat_requests_{0};
     std::atomic<uint64_t> stat_freezes_{0};
     std::atomic<uint64_t> stat_timeouts_{0};
+
+    // TTSP telemetry (mu_-guarded pending-freeze bookkeeping; docs/
+    // infrastructure/06 section 5). The Freeze event is recorded when the
+    // body completes (thaw_all) or the wait rolls back (timeout).
+    SafepointLog* safepoint_log_ = nullptr;
+    uint64_t freeze_ttsp_ns_ = 0;
+    uint64_t freeze_start_ns_ = 0;
+    uint32_t freeze_threads_ = 0;
+    uint8_t freeze_cause_ = 0;
+    bool freeze_event_pending_ = false;
+
+    // Emits the pending Freeze event under mu_ (or the given explicit
+    // fields for the rollback path); no-op without a sink.
+    void emit_freeze_locked(uint64_t ttsp_ns, uint64_t body_ns,
+                            uint32_t threads, uint8_t cause,
+                            bool timed_out, uint64_t generation);
 };
 
 // ---- GuardPageSuspender ------------------------------------------------------

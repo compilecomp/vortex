@@ -477,8 +477,12 @@ support::Result<void> HandshakeManager::request(SuspensionKind kind,
     if (!platform_supported()) return platform_fail();
     if (tid == kAllHandshakeThreads) {
         stat_requests_.fetch_add(1, std::memory_order_relaxed);
+        const uint64_t now = infra::mono_clock_ns();
         for (size_t i = 1; i < kMaxThreads; ++i) {
             if (slots_[i].alive.load(std::memory_order_acquire) != 0) {
+                slots_[i].requested_ns.store(now, std::memory_order_relaxed);
+                slots_[i].requested_kind.store(
+                    static_cast<uint32_t>(kind) + 1, std::memory_order_relaxed);
                 slots_[i].pending.store(static_cast<uint32_t>(kind) + 1,
                                         std::memory_order_release);
             }
@@ -498,6 +502,11 @@ support::Result<void> HandshakeManager::request(SuspensionKind kind,
     // Counted on acceptance, not on entry (M6-b review m1: rejected
     // requests must not inflate the counter — Rule 120 honesty).
     stat_requests_.fetch_add(1, std::memory_order_relaxed);
+    // TTSP stamp (docs/infrastructure/06 section 5): the waiter computes
+    // the request->ack delta from these fields.
+    slot->requested_ns.store(infra::mono_clock_ns(), std::memory_order_relaxed);
+    slot->requested_kind.store(static_cast<uint32_t>(kind) + 1,
+                               std::memory_order_relaxed);
     slot->pending.store(static_cast<uint32_t>(kind) + 1,
                         std::memory_order_release);
     cv_.notify_all();
@@ -589,6 +598,27 @@ support::Result<void> HandshakeManager::wait_acknowledged(
             "threading: handshake timeout waiting for thread " +
                 std::to_string(tid) + " (Rule 81: bounded, fails loudly)");
     }
+    // TTSP telemetry (docs/infrastructure/06 section 5): one Handshake
+    // event per successful bounded wait, recorded UNDER the wait's lock —
+    // the ring push is serialized by mu_ (multi-waiter safety) and no
+    // relock is needed (a second lock on the same non-recursive mutex
+    // would self-deadlock).
+    if (safepoint_log_ != nullptr) {
+        SafepointEvent event;
+        event.kind = SafepointEvent::Kind::Handshake;
+        const uint32_t kind_stamp =
+            slot->requested_kind.load(std::memory_order_relaxed);
+        event.cause = kind_stamp != 0 ? static_cast<uint8_t>(kind_stamp - 1)
+                                      : 0;
+        event.ttsp_ns =
+            infra::mono_clock_ns() -
+            slot->requested_ns.load(std::memory_order_relaxed);
+        event.body_ns = 0;
+        event.threads = 1;
+        event.timed_out = false;
+        event.generation = 0;
+        safepoint_log_->record(event);
+    }
     return support::ok();
 }
 
@@ -662,6 +692,10 @@ support::Result<uint64_t> HandshakeManager::freeze_all(
     }
     // One SHARED deadline for every wait (M6-b review m2): the worst case
     // is the caller's budget, never N x budget.
+    // TTSP clock start BEFORE the deadline: ttsp = freeze entry -> last
+    // acknowledge, so ttsp >= the caller's budget holds by construction
+    // (docs/infrastructure/06 section 5).
+    const uint64_t ttsp_t0 = infra::mono_clock_ns();
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     // Arm FIRST: a failure here means nothing was requested.
     if (auto r = SafepointPollingPage::arm(kind); !r) {
@@ -691,6 +725,19 @@ support::Result<uint64_t> HandshakeManager::freeze_all(
         lk.unlock();
         if (!done) {
             stat_timeouts_.fetch_add(1, std::memory_order_relaxed);
+            // The rolled-back freeze records its FULL window (docs/
+            // infrastructure/06 section 5) before the thaw: emitted
+            // directly with pending left false so thaw_all below does not
+            // double-emit. Generation = the would-be generation (the
+            // freeze never completed).
+            {
+                const uint64_t now = infra::mono_clock_ns();
+                std::lock_guard<std::mutex> emit_lk(mu_);
+                emit_freeze_locked(now - ttsp_t0, now - ttsp_t0,
+                                   static_cast<uint32_t>(alive_ids.size()),
+                                   static_cast<uint8_t>(kind), true,
+                                   freeze_generation_ + 1);
+            }
             // Roll the freeze back before failing loudly (Rule 81).
             (void)thaw_all();
             return support::fail(
@@ -702,6 +749,15 @@ support::Result<uint64_t> HandshakeManager::freeze_all(
     std::lock_guard<std::mutex> lk(mu_);
     ++freeze_generation_;
     stat_freezes_.fetch_add(1, std::memory_order_relaxed);
+    // TTSP telemetry (docs/infrastructure/06 section 5): the event is
+    // RECORDED when the body completes (thaw_all) — the pending fields
+    // carry the ttsp (arm -> last acknowledge) and the body's start.
+    const uint64_t now = infra::mono_clock_ns();
+    freeze_ttsp_ns_ = now - ttsp_t0;
+    freeze_start_ns_ = now;
+    freeze_threads_ = static_cast<uint32_t>(alive_ids.size());
+    freeze_cause_ = static_cast<uint8_t>(kind);
+    freeze_event_pending_ = true;
     return freeze_generation_;
 }
 
@@ -723,6 +779,15 @@ support::Result<void> HandshakeManager::thaw_all() {
     if (auto r = release(kAllHandshakeThreads); !r) return r;
     {
         std::lock_guard<std::mutex> lk(mu_);
+        // The Freeze event completes here: body = last acknowledge -> thaw
+        // (docs/infrastructure/06 section 5).
+        if (freeze_event_pending_) {
+            emit_freeze_locked(freeze_ttsp_ns_,
+                               infra::mono_clock_ns() - freeze_start_ns_,
+                               freeze_threads_, freeze_cause_, false,
+                               freeze_generation_);
+            freeze_event_pending_ = false;
+        }
         frozen_.store(false, std::memory_order_release);
     }
     cv_.notify_all();
@@ -783,6 +848,35 @@ HandshakeManager::Stats HandshakeManager::stats() const noexcept {
     s.freezes = stat_freezes_.load(std::memory_order_relaxed);
     s.timeouts = stat_timeouts_.load(std::memory_order_relaxed);
     return s;
+}
+
+// CEP:WHAT: Emits one Freeze safepoint event into the configured TTSP log
+//           (no-op without a sink). Called under mu_; the rollback path
+//           passes its explicit fields, the thaw path the pending ones.
+// CEP:WHY: docs/infrastructure/06-observability.md section 5 — the p99
+//           attribution source (cause, TTSP, pause body).
+// CEP:CLASS: CEP-1
+// CEP:STATUS: complete
+// CEP:FAILURE: none — the log never fails the handshake (telemetry
+//           degradation is the documented cost, never a runtime error).
+// CEP:ASSUMES: mu_ is held by the caller; the sink outlives the manager
+//           while set (the caller owns the pointer contract).
+// CEP:COST: @cold. One ring push.
+// CEP:EVIDENCE: tests/test_observability.cpp DoD 11-13.
+void HandshakeManager::emit_freeze_locked(uint64_t ttsp_ns, uint64_t body_ns,
+                                          uint32_t threads, uint8_t cause,
+                                          bool timed_out,
+                                          uint64_t generation) {
+    if (safepoint_log_ == nullptr) return;
+    SafepointEvent event;
+    event.kind = SafepointEvent::Kind::Freeze;
+    event.cause = cause;
+    event.ttsp_ns = ttsp_ns;
+    event.body_ns = body_ns;
+    event.threads = threads;
+    event.timed_out = timed_out;
+    event.generation = generation;
+    safepoint_log_->record(event);
 }
 
 // ---- GuardPageSuspender -----------------------------------------------------

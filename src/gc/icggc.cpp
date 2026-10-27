@@ -27,6 +27,7 @@
 
 #include "vortex/gc/collector.hpp"
 #include "vortex/infra/ffi.hpp"
+#include "vortex/infra/observability.hpp"
 #include "vortex/j1/context.hpp"
 #include "vortex/support/log.hpp"
 
@@ -468,11 +469,18 @@ Result<void> Heap::refill_tlab(size_t min_bytes) {
         }
         tlab_.reset(young_base(), std::min(young_bytes_, kYoungChunkBytes));
         stats_.tlab_refills++;
+        // Allocation-sampling hook (docs/infrastructure/06-observability.md
+        // section 6): the WARM refill path only — the hot bump never sees it.
+        infra::alloc_sampler().on_refill(
+            std::min<size_t>(young_bytes_, kYoungChunkBytes));
         return support::ok();
     }
     tlab_.reset(next, std::min<size_t>(static_cast<size_t>(heap_end - next),
                                        kYoungChunkBytes));
     stats_.tlab_refills++;
+    infra::alloc_sampler().on_refill(
+        std::min<size_t>(static_cast<size_t>(heap_end - next),
+                         kYoungChunkBytes));
     return support::ok();
 }
 
@@ -585,7 +593,8 @@ Result<void> Heap::collect_young() {
     // this: the TLAB view lagged and every JIT cell aliased).
     sync_tlab_from_jit();
 
-    PauseTimer pause(engine_->stats_mut(), PauseKind::YoungGc);
+    PauseTimer pause(engine_->stats_mut(), PauseKind::YoungGc,
+                     PauseCause::AllocationSlowPath);
     GcStats& gc_stats = engine_->stats_mut();
     gc_stats.young_collections++;
 

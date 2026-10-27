@@ -13,6 +13,8 @@
 #include <vector>
 
 #include "vortex/frontends/reference/emitter.hpp"
+#include "vortex/gc/icggc.hpp"
+#include "vortex/infra/observability.hpp"
 #include "vortex/support/tier.hpp"
 #include "vortex/ugb/assembler.hpp"
 #include "vortex/ugb/disassembler.hpp"
@@ -21,6 +23,9 @@
 #include "vortex/vortex.hpp"
 
 namespace {
+
+/// Length of the "--jitdump=" flag prefix (strncmp bound in main's parse).
+constexpr size_t kJitdumpFlagPrefixLen = 10;
 
 bool read_file(const std::string& path, std::string& out) {
     std::ifstream in(path, std::ios::binary);
@@ -67,7 +72,8 @@ bool load_module([[maybe_unused]] const std::string& path,
 }
 
 int cmd_run(const std::string& path, const std::string& entry,
-            const std::vector<std::string>& args) {
+            const std::vector<std::string>& args,
+            const std::string& jitdump_path, bool telemetry = false) {
     std::string source;
     if (!read_file(path, source)) {
         std::cerr << "vx: cannot read '" << path << "'\n";
@@ -116,8 +122,25 @@ int cmd_run(const std::string& path, const std::string& entry,
                                 return vortex::TaggedValue::undefined();
                             });
 
+    // Observability floor (docs/infrastructure/06-observability.md section
+    // 7): --jitdump opens the session (jitdump + perf-map) for the process
+    // lifetime; the publish hooks feed it, stats prints what a cold run can
+    // reach.
+    const bool jit = !jitdump_path.empty();
+    if (jit) {
+        auto started = jitdump_path == "default"
+                           ? vortex::infra::jit_session().start_default()
+                           : vortex::infra::jit_session().start(
+                                 jitdump_path + ".jitdump", jitdump_path + ".map");
+        if (!started) {
+            std::cerr << "vx: jitdump: " << started.error().format() << "\n";
+            return 1;
+        }
+    }
+
     auto result = interp.run(module, entry, call_args);
     if (!result) {
+        if (jit) (void)vortex::infra::jit_session().stop();
         std::cerr << "vx: runtime: " << result.error().format() << "\n";
         return 1;
     }
@@ -133,6 +156,37 @@ int cmd_run(const std::string& path, const std::string& entry,
               << " osr_requests=" << st.osr_requests
               << " safepoints=" << st.safepoint_polls
               << " max_depth=" << st.max_call_depth << "\n";
+    if (telemetry) {
+        const vortex::gc::HeapStats& hs = heap.stats();
+        std::cout << "heap: tlab_refills=" << hs.tlab_refills
+                  << " objects=" << hs.objects_allocated
+                  << " bytes=" << hs.bytes_allocated
+                  << " slow_path=" << hs.slow_path_allocations << "\n";
+        const vortex::infra::AllocSampler& sampler =
+            vortex::infra::alloc_sampler();
+        std::cout << "alloc_sampler: interval=" << sampler.interval_bytes()
+                  << " refills=" << sampler.refills_observed()
+                  << " samples=" << sampler.total_samples()
+                  << " total_refill_bytes=" << sampler.total_refill_bytes()
+                  << "\n";
+        std::cout << "safepoints: events=0 ttsp_p99_ns=0 ttsp_max_ns=0"
+                  << " (the driver's T0 run has no handshake manager - the"
+                  << " TTSP ring fills under freeze_all and handshake"
+                  << " consumers)\n";
+    }
+    if (jit) {
+        if (auto stopped = vortex::infra::jit_session().stop(); !stopped) {
+            std::cerr << "vx: jitdump stop: " << stopped.error().format()
+                      << "\n";
+        } else {
+            std::cout << "jitdump: "
+                      << (jitdump_path == "default"
+                              ? vortex::infra::JitSession::default_jitdump_path()
+                              : jitdump_path + ".jitdump")
+                      << " code_loads="
+                      << vortex::infra::jit_session().code_loads() << "\n";
+        }
+    }
     return 0;
 }
 
@@ -172,20 +226,22 @@ int cmd_asm(const std::string& in, const std::string& out_path) {
 }
 
 int cmd_stats(const std::string& path, const std::string& entry,
-              const std::vector<std::string>& args) {
+              const std::vector<std::string>& args,
+              const std::string& jitdump_path) {
     // stats = run with profile-focused output (the run command already prints
-    // the counter block; this command exists for tooling symmetry).
-    return cmd_run(path, entry, args);
+    // the counter block; this command adds the observability floor's
+    // telemetry summary).
+    return cmd_run(path, entry, args, jitdump_path, /*telemetry=*/true);
 }
 
 void usage() {
     std::cout
         << "vx — the Vortex engine driver (T0 in M0)\n\n"
         << "usage:\n"
-        << "  vx run <file.ugb|file.mini> --entry NAME [--args N ...]\n"
+        << "  vx run <file.ugb|file.mini> --entry NAME [--args N ...] [--jitdump[=PATH]]\n"
         << "  vx asm <in.ugb-text> <out.ugb>\n"
         << "  vx dis <file.ugb>\n"
-        << "  vx stats <file.ugb> --entry NAME [--args N ...]\n"
+        << "  vx stats <file.ugb> --entry NAME [--args N ...] [--jitdump[=PATH]]\n"
         << "  vx version\n";
 }
 
@@ -216,16 +272,27 @@ int main(int argc, char** argv) {
         }
         std::string entry = "main";
         std::vector<std::string> args;
+        std::string jitdump_path;
         for (int i = 3; i < argc; ++i) {
             if (std::strcmp(argv[i], "--entry") == 0 && i + 1 < argc) {
                 entry = argv[++i];
+            } else if (std::strcmp(argv[i], "--jitdump") == 0) {
+                jitdump_path = "default";
+            } else if (std::strncmp(argv[i], "--jitdump=",
+                                    kJitdumpFlagPrefixLen) == 0) {
+                jitdump_path = argv[i] + kJitdumpFlagPrefixLen;
+                if (jitdump_path.empty()) {
+                    std::cerr << "vx: --jitdump= requires a path"
+                              << " (or use bare --jitdump for the default)\n";
+                    return 2;
+                }
             } else if (std::strcmp(argv[i], "--args") == 0) {
                 for (int j = i + 1; j < argc; ++j) args.push_back(argv[j]);
                 break;
             }
         }
-        return cmd == "run" ? cmd_run(argv[2], entry, args)
-                            : cmd_stats(argv[2], entry, args);
+        return cmd == "run" ? cmd_run(argv[2], entry, args, jitdump_path)
+                            : cmd_stats(argv[2], entry, args, jitdump_path);
     }
     if (cmd == "dis" && argc == 3) return cmd_dis(argv[2]);
     if (cmd == "asm" && argc == 4) return cmd_asm(argv[2], argv[3]);

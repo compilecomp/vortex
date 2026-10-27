@@ -55,6 +55,28 @@ enum class PauseKind : uint8_t {
     SweepSlice,
 };
 
+/// WHY the pause happened (docs/infrastructure/06-observability.md section 6:
+/// p99 debugging starts from "what started it", not just "how long"). The
+/// engine carries one cycle-scoped cause; the young GC is always the
+/// allocation slow path.
+enum class PauseCause : uint8_t {
+    Unspecified = 0,
+    AllocationSlowPath,
+    OccupancyTrigger,
+    ExplicitRequest,
+};
+
+// CEP:WHAT: Maps a PauseCause to its stable observability name.
+// CEP:WHY: Rule 120: causes must be spellable, never guessed.
+// CEP:STATUS: complete
+// CEP:FAILURE: none (pure enum mapping).
+// CEP:ASSUMES: consumers keep the strings stable across releases.
+// CEP:COST: @cold. One switch, returns a static literal.
+// CEP:EVIDENCE: tests/test_observability.cpp DoD 15 (the cause labels are
+//          asserted there; the driver-facing breakdown rides batch e's
+//          stats work).
+const char* pause_cause_name(PauseCause cause) noexcept;
+
 // CEP:WHAT: Maps a PauseKind to its stable observability name.
 // CEP:WHY: Rule 120: pause events must be spellable, never guessed.
 // CEP:STATUS: complete
@@ -64,11 +86,14 @@ enum class PauseKind : uint8_t {
 // CEP:EVIDENCE: used by the pause ring's dump path and tests.
 const char* pause_kind_name(PauseKind kind) noexcept;
 
-/// One recorded pause (ns monotonic duration + kind). The ring is bounded
-/// (Rule 28: bounded telemetry buffers).
+/// One recorded pause (ns monotonic duration + kind + cause). The ring is
+/// bounded (Rule 28: bounded telemetry buffers). The defaulted cause keeps
+/// the M5 aggregate initialization and the two-argument record_pause
+/// compiling unchanged.
 struct PauseEvent {
     uint64_t duration_ns = 0;
     PauseKind kind = PauseKind::YoungGc;
+    PauseCause cause = PauseCause::Unspecified;
 };
 
 /// Rule-120 telemetry: every counter a driver/test can assert on.
@@ -96,7 +121,10 @@ struct GcStats {
     std::vector<PauseEvent> pauses;
     static constexpr size_t kMaxPauseEvents = 4096;
 
-    void record_pause(PauseKind kind, uint64_t duration_ns);
+    void record_pause(PauseKind kind, uint64_t duration_ns) {
+        record_pause(kind, duration_ns, PauseCause::Unspecified);
+    }
+    void record_pause(PauseKind kind, uint64_t duration_ns, PauseCause cause);
     /// Nearest-rank percentile over the recorded ring (0 <= pct <= 100).
     uint64_t pause_p99_ns() const { return pause_percentile_ns(99); }
     uint64_t pause_percentile_ns(unsigned pct) const;
@@ -112,7 +140,10 @@ struct GcStats {
 // CEP:EVIDENCE: the DoD p99 gate (gc_pause_p99_under_budget) is computed from its records.
 class PauseTimer {
 public:
+    /// The legacy shape (cause = Unspecified) — defined out-of-line so the
+    /// delegating body carries its CEP block (CEP&CC 10.5: no empty bodies).
     PauseTimer(GcStats& stats, PauseKind kind);
+    PauseTimer(GcStats& stats, PauseKind kind, PauseCause cause);
     ~PauseTimer();
     PauseTimer(const PauseTimer&) = delete;
     PauseTimer& operator=(const PauseTimer&) = delete;
@@ -120,6 +151,7 @@ public:
 private:
     GcStats& stats_;
     PauseKind kind_;
+    PauseCause cause_;
     uint64_t start_ns_;
 };
 
@@ -216,7 +248,9 @@ public:
 
     /// Trigger check (docs/gc-icggc.md 8.4): starts a cycle when old-space
     /// occupancy crosses config.old_gc_trigger_pct. Idempotent while a
-    /// cycle is running. Drivers call it between mutator executions.
+    /// cycle is running. Drivers call it between mutator executions. A
+    /// cycle IT starts is cause-tagged OccupancyTrigger (the pause ring's
+    /// cause label, docs/infrastructure/06 section 6).
     support::Result<void> maybe_start_cycle();
 
     /// Advances exactly one transition or slice (the stepwise contract).
@@ -225,7 +259,10 @@ public:
     support::Result<Phase> step();
 
     /// Runs the cycle to completion (driver convenience; the DoD stress
-    /// driver steps instead to interleave mutator work).
+    /// driver steps instead to interleave mutator work). Starts through the
+    /// occupancy trigger like any cycle — the pause-ring cause stays the
+    /// initiator's (ExplicitRequest is the adaptive-initiation batch's
+    /// reserved label).
     support::Result<void> run_cycle();
 
     Phase phase() const noexcept { return phase_; }
@@ -241,6 +278,12 @@ private:
     Heap& heap_;
     Phase phase_ = Phase::Idle;
     GcStats stats_;
+    /// The pause-ring cause label the running cycle's phases inherit
+    /// (docs/infrastructure/06-observability.md section 6): stamped by
+    /// maybe_start_cycle (OccupancyTrigger — the ONLY start mechanism
+    /// today; run_cycle routes through the trigger too). ExplicitRequest
+    /// is the adaptive-initiation batch's reserved label.
+    PauseCause cycle_cause_ = PauseCause::Unspecified;
 };
 
 /// GC-side JIT metadata record (docs/gc-icggc.md sections 7/8.6). Published

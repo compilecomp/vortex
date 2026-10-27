@@ -38,6 +38,7 @@
 #include <unordered_set>
 
 #include "vortex/codegen/x64/assembler.hpp"
+#include "vortex/infra/observability.hpp"
 #include "vortex/j2/graph_builder.hpp"
 #include "vortex/j2/passes.hpp"
 #include "vortex/j2/regalloc.hpp"
@@ -3258,6 +3259,12 @@ support::Result<J2Executable> publish_j2(const J2Code& code,
     ex.gc_record = gc::gc_code_registry().register_code(
         ex.memory.data(), ex.memory.size(),
         gc::GcCodeRecord::Kind::J2Shape, 0, std::move(maps));
+    // Observability floor (docs/infrastructure/06-observability.md section
+    // 4): the J2/J3/J4 family publishes through this path — one CODE_LOAD +
+    // perf-map line per published range, best-effort (never fails the
+    // publish; the session stores the error).
+    infra::jit_session().record_code(ex.memory.data(), ex.memory.size(),
+                                     code.method_id, "j2");
     return ex;
 }
 

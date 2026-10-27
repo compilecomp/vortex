@@ -385,11 +385,71 @@ Findings:
       interop/J4 batches), PinningRegion integration into the stub arg
       path (Ptr args are handles-or-pins by discipline today).
 - [ ] Observability (M6): jitdump, GDB JIT interface, managed sanitizers,
-      deterministic replay
+      deterministic replay. **Batch d (M6-d) is the observability floor**
+      (the external performance review's R40 — the item that makes every
+      other performance item measurable): the perf-jitdump v1 writer
+      (ELF-mach-correct header, CODE_LOAD/CLOSE records, CLOCK_MONOTONIC
+      timestamps, the PROT_EXEC self-mmap the format requires), the
+      perf-<pid>.map sidecar, code-load records emitted from the ONE
+      publish path (J1 + J2/J3/J4 shared), the safepoint TTSP log
+      (cause, time-to-safepoint, pause body — fed by the real handshake
+      manager's freezes and single-thread handshakes), GC pause-ring
+      cause labels, and the TLAB-refill allocation sampler (JEP-331
+      shape: interval-driven, zero hot-path cost; site attribution is
+      the emitted-poll batch's stack-walk upgrade). GDB JIT interface,
+      managed sanitizers, and deterministic replay stay for batch e.
 - [ ] CPU dispatch (M7): multi-versioning stubs, hardware extension lowering
-- [ ] Code cache (M8): background sweeper/compactor, NUMA placement, huge pages
+      (the performance review's R21 vector/memory capability pack rides the
+      post-M6 ISA work this milestone feeds)
+- [ ] Code cache (M8): background sweeper/compactor, NUMA placement, huge
+      pages (the review's R37 age-based cold-code flushing is the first
+      slice; R38 tier-segmented slabs and R39 PKU W^X follow)
 - [ ] Power (M9): thermal listener + governor wiring
 - [ ] Dependency engine (M1): native patching integration with code cache
+
+## Performance roadmap (external review intake, Oct 2026)
+
+A deep-research performance review (grounded in this tree at M6-c) produced
+42 prioritized recommendations (R1–R42) for memory-bound and enterprise
+workloads. The P0/P1/P2 waves below are the adopted sequencing; each wave
+ships as spec-first milestone batches with the review's measurement
+protocol (Part V: named kernels, Mann-Whitney A/B discipline, per-tier
+time share). The review's P0 set is intentionally protocol-neutral —
+nothing below leaves the M5/M6 test contracts.
+
+- **P0 wave 1 (M6-d)** — the observability floor (R40): jitdump +
+  perf-map, TTSP/safepoint logs, GC cause ring, TLAB-sampled allocation
+  profiling. Measurability first; the report's own measurement plan
+  depends on it.
+- **P0 wave 2 (M9)** — memory-path foundations: VA-reserved heap +
+  commit-on-touch subregions (R24 — the gating prerequisite for compressed
+  refs, colored pointers, THP, NUMA; snapshot restore is already
+  offset-deterministic), allocation-adjacent prefetchw in T0/J1 stencils
+  (R19, patchable distance constant), SATB/barrier fast-path filtering +
+  per-mutator log buffer (R6), barrier stores demoted from regalloc
+  safepoints (R7), Redundant Barrier Elimination (R8 — already specced in
+  xlea §7).
+- **P0 wave 3 (M10)** — young-gen and safepoint engineering: survivor
+  aging inside the region machinery (R14), slot-precise old→young roots
+  from the remset with card-precise fallback (R15), emitted safepoint
+  polls in J2/J3/J4 at backedges/returns (R31 — the trap page's reserved
+  consumer interface), phase-gated Brooks resolve + the proof-based
+  elision matrix (R1/R2), profile-carrying startup: persisted tier/
+  profiles, warm-started ICs from AOT (R34).
+- **P1 waves** — LRB migration plan (R3), compressed references behind
+  the TaggedValue seam (R11), fiber-local allocation chunks (R27),
+  per-fiber poll words with global escalation (R32), adaptive IHOP +
+  pacing (R16), age-based cold-code flushing (R37), PKU W^X (R39),
+  shape-aware tiering (R35), the vector/memory capability pack (R21),
+  indirect prefetch in J3/J4 loops (R20), asm context switch + stack
+  pools (R28), Chase-Lev deques (R29), region-size knob + humongous
+  reclamation (R17), field-layout policy (R13), cgroup v2 awareness
+  (R42), false-sharing hygiene contract (R25), lazy method decode (R36).
+- **P2** — concurrent young (R18), colored pointers/multi-mapping
+  (R4/R10), header shrink (R5), multi-mutator old-gen phases (R30), NUMA
+  placement (R26), J4 MLP scheduling + BCE hardening (R22/R23), Smi-width
+  policy (R12), security-mitigation cost budget (R41), AOT artifact
+  cache.
 
 ## Post-M6
 

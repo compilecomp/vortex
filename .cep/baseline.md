@@ -218,3 +218,33 @@ their batches" are retired by THIS batch: ffi.cpp 6 -> 0, ffi.hpp 1 -> 0
 batch is their batch). The WorkStealingPool fiber-table fix (M6-c
 gates caught the spawn-vs-fiber_thunk publish race) is annotated in place;
 the threading tree stays SEV1-clean.
+
+## Batch 5 (M6-d, observability floor)
+
+The M6-d observability batch ships the floor SEV1-clean from birth: the new
+implementation (src/infra/observability.cpp), the rewritten API surface
+(include/vortex/infra/observability.hpp), and its test file
+(tests/test_observability.cpp) carry the full nine-field/six-field CEP
+annotation from the first gate run. The batch also retires the OLD
+observability surface's stub findings (the M0-era contract stubs in the
+header were part of the batch-2 backlog): JitDumpWriter/PerfMap/JitSession/
+SafepointLog/AllocSampler are real, and the two batch-e contract stubs
+(GdbJitInterface register/unregister) declare CEP:STATUS: stub with OWNER
+and TICKET per CEP&CC 10.5. Counts at the gates (run_gates_m6d.sh):
+
+```text
+142 files scanned, 3694 issues
+  severity-0 (EXTERMINATE):        0
+  severity-1 (EXTERMINATE-UNLESS):  964   (batch 4: 970; net -6)
+  severity-2 (REJECT-AND-REPAIR):  2730   (+178: the LE pack helpers' shift/
+                                        mask naming notes + the test parse
+                                        helpers' literal constants — the
+                                        same class the shipped encoders
+                                        carry; tracked for the SEV2 backlog)
+  severity-3 (WARN-AND-EDUCATE):      0
+```
+
+The touched legacy trees (threading, gc collector/icggc, j1/j2 publish
+sites, vx driver) add ZERO severity-1 deltas — the pre-existing M0-era
+findings in tools/vx/main.cpp and the unmigrated j1/j2 headers stay under
+the report-only waiver for their batches.

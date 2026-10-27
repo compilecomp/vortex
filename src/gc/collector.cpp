@@ -55,6 +55,24 @@ const char* pause_kind_name(PauseKind kind) noexcept {
     return "unknown";
 }
 
+// CEP:WHAT: Maps a PauseCause to its stable observability name.
+// CEP:WHY: Rule 120: causes must be spellable, never guessed.
+// CEP:STATUS: complete
+// CEP:FAILURE: none (pure enum mapping).
+// CEP:ASSUMES: consumers keep the strings stable.
+// CEP:COST: @cold. One switch.
+// CEP:EVIDENCE: tests/test_observability.cpp DoD 15; the vx stats cause
+//          breakdown.
+const char* pause_cause_name(PauseCause cause) noexcept {
+    switch (cause) {
+    case PauseCause::Unspecified: return "unspecified";
+    case PauseCause::AllocationSlowPath: return "allocation_slow_path";
+    case PauseCause::OccupancyTrigger: return "occupancy_trigger";
+    case PauseCause::ExplicitRequest: return "explicit_request";
+    }
+    return "unknown";
+}
+
 namespace {
 uint64_t now_ns() noexcept {
     return static_cast<uint64_t>(
@@ -64,12 +82,34 @@ uint64_t now_ns() noexcept {
 }
 }  // namespace
 
+// CEP:WHAT: RAII pause accounting, legacy overload (cause = Unspecified).
+// CEP:WHY: The M5 call-shape stays compiling while the cause labels land
+//          (docs/infrastructure/06-observability.md section 6).
+// CEP:STATUS: complete
+// CEP:FAILURE: none (the destructor always records).
+// CEP:ASSUMES: one PauseTimer live per pause scope; GcStats outlives it.
+// CEP:COST: @cold. One steady_clock read at construct.
+// CEP:EVIDENCE: the legacy record_pause overload tests.
 PauseTimer::PauseTimer(GcStats& stats, PauseKind kind)
-    : stats_(stats), kind_(kind) {
+    : stats_(stats), kind_(kind), cause_(PauseCause::Unspecified) {
     start_ns_ = now_ns();
 }
 
-PauseTimer::~PauseTimer() { stats_.record_pause(kind_, now_ns() - start_ns_); }
+// CEP:WHAT: RAII pause accounting: records the scope's ns duration into the stats ring.
+// CEP:WHY: docs/gc-icggc.md 8.5 — slices and STW phases are both pause events.
+// CEP:STATUS: complete
+// CEP:FAILURE: none (the destructor always records).
+// CEP:ASSUMES: one PauseTimer live per pause scope; GcStats outlives it.
+// CEP:COST: @cold. One steady_clock read at construct + destruct.
+// CEP:EVIDENCE: the DoD p99 gate (gc_pause_p99_under_budget) is computed from its records.
+PauseTimer::PauseTimer(GcStats& stats, PauseKind kind, PauseCause cause)
+    : stats_(stats), kind_(kind), cause_(cause) {
+    start_ns_ = now_ns();
+}
+
+PauseTimer::~PauseTimer() {
+    stats_.record_pause(kind_, now_ns() - start_ns_, cause_);
+}
 
 // CEP:WHAT: Records one pause event into the bounded ring.
 // CEP:WHY: docs/gc-icggc.md 8.5 — the DoD p99 source (Rule 28: bounded buffers).
@@ -78,9 +118,10 @@ PauseTimer::~PauseTimer() { stats_.record_pause(kind_, now_ns() - start_ns_); }
 // CEP:ASSUMES: single mutator.
 // CEP:COST: @cold. One push.
 // CEP:EVIDENCE: gc_pause_p99_under_budget_on_allocation_stress.
-void GcStats::record_pause(PauseKind kind, uint64_t duration_ns) {
+void GcStats::record_pause(PauseKind kind, uint64_t duration_ns,
+                           PauseCause cause) {
     if (pauses.size() >= kMaxPauseEvents) pauses.clear();  // bounded ring
-    pauses.push_back(PauseEvent{duration_ns, kind});
+    pauses.push_back(PauseEvent{duration_ns, kind, cause});
 }
 
 // CEP:WHAT: Nearest-rank percentile over the recorded pause ring.
@@ -315,10 +356,15 @@ support::Result<void> IcggcEngine::maybe_start_cycle() {
     // the idle early-return path: the stale context copy would rewind the
     // heap's top and every allocation would reuse recycled addresses).
     heap_.sync_tlab_from_jit();
-    // Cycle start: the InitialMark pause (docs/gc-icggc.md 8.4).
+    // Cycle start: the InitialMark pause (docs/gc-icggc.md 8.4). The cycle's
+    // pause-ring cause: the ONLY start mechanism today is the occupancy
+    // trigger (run_cycle routes through this check too) — ExplicitRequest is
+    // the adaptive-initiation batch's reserved label
+    // (docs/infrastructure/06-observability.md section 6).
+    cycle_cause_ = PauseCause::OccupancyTrigger;
     Impl& im = *impl_;
     {
-        PauseTimer pause(stats_, PauseKind::InitialMark);
+        PauseTimer pause(stats_, PauseKind::InitialMark, cycle_cause_);
         heap_.set_marking_active(true);  // the SATB flip
         heap_.satb_buffer().clear();
         im.cycle_satb.clear();
@@ -413,7 +459,7 @@ support::Result<IcggcEngine::Phase> IcggcEngine::step() {
     case Phase::ConcurrentMark: {
         // One bounded slice (docs/gc-icggc.md 8.5): mark_queue pops.
         {
-            PauseTimer pause(stats_, PauseKind::MarkSlice);
+            PauseTimer pause(stats_, PauseKind::MarkSlice, cycle_cause_);
             uint32_t popped = 0;
             while (!im.mark_stack.empty() &&
                    popped < config.mark_slice_items) {
@@ -430,7 +476,7 @@ support::Result<IcggcEngine::Phase> IcggcEngine::step() {
     }
 
     case Phase::FinalMark: {
-        PauseTimer pause(stats_, PauseKind::FinalMark);
+        PauseTimer pause(stats_, PauseKind::FinalMark, cycle_cause_);
         // Drain the SATB log: every overwritten reference the mutator
         // captured during ConcurrentMark joins the trace (the tail).
         im.cycle_satb = std::move(heap_.satb_buffer());
@@ -549,7 +595,7 @@ support::Result<IcggcEngine::Phase> IcggcEngine::step() {
             return phase_;
         }
         {
-            PauseTimer pause(stats_, PauseKind::EvacuateSlice);
+            PauseTimer pause(stats_, PauseKind::EvacuateSlice, cycle_cause_);
             for (uint32_t n = 0;
                  n < config.evacuate_regions_per_slice &&
                  im.cset_cursor < im.cset.size();
@@ -571,7 +617,7 @@ support::Result<IcggcEngine::Phase> IcggcEngine::step() {
         // The stale-oop update pause: every root slot resolves through
         // Brooks (docs/gc-icggc.md 8.4/8.6). Handles update too; weak
         // entries cleared at FinalMark carry nullptr and stay cleared.
-        PauseTimer pause(stats_, PauseKind::UpdateRoots);
+        PauseTimer pause(stats_, PauseKind::UpdateRoots, cycle_cause_);
         RootSet roots;
         scan_runtime_roots(heap_.gc_state(), roots, &stats_);
         for (TaggedValue* s : roots.tagged_slots) {
@@ -599,7 +645,7 @@ support::Result<IcggcEngine::Phase> IcggcEngine::step() {
             return phase_;
         }
         {
-            PauseTimer pause(stats_, PauseKind::SweepSlice);
+            PauseTimer pause(stats_, PauseKind::SweepSlice, cycle_cause_);
             uint32_t done = 0;
             while (im.sweep_cursor < im.sweep_queue.size() &&
                    done < config.sweep_slice_regions) {
