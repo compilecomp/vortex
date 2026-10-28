@@ -391,6 +391,13 @@ public:
     support::Result<J2Code> emit() {
         J2Code out;
         out.method_id = job_.method_id;
+        // Batch-e metadata interchange: the real symbol (the family's line
+        // maps ride the R31 metadata batch — the documented deviation).
+        if (job_.module != nullptr &&
+            job_.method_id < job_.module->method_table.size()) {
+            out.symbol_name =
+                job_.module->method_table[job_.method_id].name;
+        }
 
         compute_positions();
         if (auto r = build_deopt_records(); !r) {
@@ -3259,12 +3266,25 @@ support::Result<J2Executable> publish_j2(const J2Code& code,
     ex.gc_record = gc::gc_code_registry().register_code(
         ex.memory.data(), ex.memory.size(),
         gc::GcCodeRecord::Kind::J2Shape, 0, std::move(maps));
-    // Observability floor (docs/infrastructure/06-observability.md section
-    // 4): the J2/J3/J4 family publishes through this path — one CODE_LOAD +
-    // perf-map line per published range, best-effort (never fails the
-    // publish; the session stores the error).
-    infra::jit_session().record_code(ex.memory.data(), ex.memory.size(),
-                                     code.method_id, "j2");
+    // Observability (batch e, docs/infrastructure/06): the family
+    // publishes with its real symbol (line maps ride the R31 metadata
+    // batch — the documented deviation); the GDB JIT registration rides
+    // the same final bytes under an owning token. Publish stays
+    // best-effort — telemetry never rejects correct code.
+    std::string sym = code.symbol_name;
+    if (sym.empty()) {
+        sym = "vx_j2_m" + std::to_string(code.method_id);
+        infra::jit_session().record_code(ex.memory.data(), ex.memory.size(),
+                                         code.method_id, "j2");
+    } else {
+        infra::jit_session().record_code(ex.memory.data(), ex.memory.size(),
+                                         sym, {});
+    }
+    infra::replay_recorder().record_event(
+        static_cast<uint32_t>(infra::ReplayKind::Publish), code.method_id,
+        2);
+    ex.gdb_token = infra::GdbJitInterface::register_code_owned(
+        ex.memory.data(), ex.memory.size(), sym.c_str());
     return ex;
 }
 

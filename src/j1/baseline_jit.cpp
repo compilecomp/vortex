@@ -644,6 +644,10 @@ Result<BaselineCode> BaselineJit::compile(const BaselineJob& job) {
     };
     std::vector<Decoded> seq;
     std::unordered_map<size_t, size_t> native_of;  // pc -> native offset
+    // Batch-e metadata interchange: the DEBUG_SRCPOS metas ride the same
+    // walk (pc collected here; mapped to native offsets after the walk —
+    // the stencil layout is 1:1, so the mapping is exact).
+    std::vector<std::pair<uint32_t, uint32_t>> srcpos_pairs;
 
     {
         size_t pc = 0;
@@ -658,6 +662,10 @@ Result<BaselineCode> BaselineJit::compile(const BaselineJob& job) {
             // Generic variant first (profile-free M1); typed-only opcodes
             // fall back to their speculative stencil, whose in-template
             // canonical fallback keeps every input safe.
+            if (d.ins.opcode == ugb::Op::DEBUG_SRCPOS) {
+                srcpos_pairs.emplace_back(static_cast<uint32_t>(pc),
+                                          d.ins.meta);
+            }
             const uint16_t op_id = static_cast<uint16_t>(d.ins.opcode);
             d.stencil = stencils_.select(op_id, false);
             if (d.stencil == nullptr) d.stencil = stencils_.select(op_id, true);
@@ -934,6 +942,17 @@ Result<BaselineCode> BaselineJit::compile(const BaselineJob& job) {
     BaselineCode out;
     out.method_id = job.method_id;
     out.osr_entry_offset = kNoOsr;
+    // Batch-e metadata interchange: the real symbol + the exact
+    // (native offset, line) pairs (native_of is body-shifted absolute
+    // offsets at this point, ascending with pc — the map is sorted).
+    out.symbol_name = method.name;
+    for (const auto& [pc, line] : srcpos_pairs) {
+        const auto it = native_of.find(pc);
+        if (it != native_of.end()) {
+            out.line_map.emplace_back(static_cast<uint32_t>(it->second),
+                                      line);
+        }
+    }
     std::vector<std::pair<size_t, uint32_t>> osr_fixups;  // (rel32 off, pc)
     std::unordered_map<uint32_t, size_t> osr_stub_of;     // pc -> stub offset
     for (const Decoded& d : seq) {
@@ -1050,11 +1069,33 @@ Result<BaselineExecutable> publish_baseline(const BaselineCode& code,
     ex.gc_record = gc::gc_code_registry().register_code(
         ex.memory.data(), ex.memory.size(), gc::GcCodeRecord::Kind::J1,
         code.register_count, std::move(maps));
-    // Observability floor (docs/infrastructure/06-observability.md section
-    // 4): one CODE_LOAD + perf-map line per published range — best-effort,
-    // never fails the publish (the session stores the error).
-    infra::jit_session().record_code(ex.memory.data(), ex.memory.size(),
-                                     code.method_id, "j1");
+    // Observability (batch e, docs/infrastructure/06): the real symbol +
+    // exact line entries when the compile carried them, the synthetic
+    // fallback otherwise; the GDB JIT registration rides the same final
+    // bytes under an owning token (teardown unregisters). Publish stays
+    // best-effort — telemetry never rejects correct code.
+    std::string sym = code.symbol_name;
+    if (sym.empty()) {
+        sym = "vx_j1_m" + std::to_string(code.method_id);
+        infra::jit_session().record_code(ex.memory.data(), ex.memory.size(),
+                                         code.method_id, "j1");
+    } else {
+        std::vector<infra::JitDumpWriter::DebugEntry> dbg;
+        dbg.reserve(code.line_map.size());
+        const uint64_t base =
+            reinterpret_cast<uint64_t>(ex.memory.data());
+        for (const auto& [off, line] : code.line_map) {
+            dbg.push_back(
+                infra::JitDumpWriter::DebugEntry{base + off, line, 0, {}});
+        }
+        infra::jit_session().record_code(ex.memory.data(), ex.memory.size(),
+                                         sym, dbg);
+    }
+    infra::replay_recorder().record_event(
+        static_cast<uint32_t>(infra::ReplayKind::Publish), code.method_id,
+        1);
+    ex.gdb_token = infra::GdbJitInterface::register_code_owned(
+        ex.memory.data(), ex.memory.size(), sym.c_str());
     return ex;
 }
 

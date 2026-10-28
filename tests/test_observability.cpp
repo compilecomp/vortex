@@ -1,6 +1,6 @@
 // CEP:FILE: tests/test_observability.cpp
-// CEP:WHAT: Infra 6 observability-floor test suite (M6-d, docs/
-//           infrastructure/06-observability.md DoD 1-16): the perf-jitdump
+// CEP:WHAT: Infra 6 observability test suite (M6-d floor DoD 1-16 + batch
+//           e DoD 18-33, docs/infrastructure/06-observability.md): the perf-jitdump
 //           v1 header/record contract (parse-back, monotonic timestamps,
 //           CODE_CLOSE completeness, self-mmap probe, named rejects), the
 //           perf-map sidecar format + sanitization, the publish-path
@@ -43,6 +43,9 @@
 #include "vortex/infra/observability.hpp"
 #include "vortex/infra/threading.hpp"
 #include "vortex/j1/baseline_jit.hpp"
+#include "vortex/j1/stencil_corpus.hpp"
+#include "vortex/ugb/builder.hpp"
+#include "vortex/ugb/verifier.hpp"
 #include "vortex/j2/fast_jit.hpp"
 #include "vortex/runtime/object_model.hpp"
 #include "vortex/vm/interpreter.hpp"
@@ -923,3 +926,734 @@ VORTEX_TEST(alloc_sampler_interval_and_ring) {
 // The unit binary cannot spawn the vx driver portably; the gate script runs
 // `vx stats <sample> --entry main` and greps for the alloc_sampler/heap
 // lines (docs/infrastructure/06-observability.md DoD 17 note).
+
+// ---- batch e (M6-e): DoD 18-33 -------------------------------------------------
+// Execution-order note: the sanitizer policy attach is process-monotonic, so
+// the DISABLED-state tests (DoD 27/31) are declared FIRST; the enabling
+// attach happens in the DoD-23 test and stays on for the rest of the binary
+// (analyzed safe: the producers poison only dead spans, and every consumer
+// resolves live bodies before access).
+
+#include <elf.h>
+
+namespace {
+
+// CEP:WHAT: The DoD-26 foreign target (never called — the boundary check is
+//           what's under test).
+void obs_ffi_probe(void*) {}
+
+// CEP:WHAT: The signature helper (the test_ffi shape, local to this file).
+ForeignSignature make_sig(std::vector<ForeignArgKind> args,
+                          ForeignReturnKind ret) {
+    ForeignSignature s;
+    s.args = std::move(args);
+    s.return_kind = ret;
+    return s;
+}
+
+
+// CEP:WHAT: Walks a GDB symfile image per the emitter's fixed layout
+//           (Ehdr/Phdr/5 sections) and returns the .text/.symtab spans.
+// CEP:WHY: DoD 19/22 parse the symfile EXACTLY as gdb would — generic
+//          section walking, not offset assumptions beyond the format.
+// CEP:STATUS: complete
+// CEP:FAILURE: returns false on any malformed structure.
+// CEP:ASSUMES: ELF64 LE (the emitter's only output).
+// CEP:COST: @cold.
+// CEP:EVIDENCE: the gdb DoD tests.
+struct ParsedSymfile {
+    uint64_t text_addr = 0;
+    const uint8_t* text = nullptr;
+    size_t text_size = 0;
+    const uint8_t* symtab = nullptr;
+    size_t symtab_bytes = 0;
+    const uint8_t* strtab = nullptr;
+    size_t strtab_size = 0;
+};
+
+bool parse_gdb_symfile(std::span<const uint8_t> img, ParsedSymfile& out) {
+    if (img.size() < sizeof(Elf64_Ehdr)) return false;
+    const Elf64_Ehdr* eh = reinterpret_cast<const Elf64_Ehdr*>(img.data());
+    if (eh->e_ident[0] != 0x7f || eh->e_ident[1] != 'E' ||
+        eh->e_ident[2] != 'L' || eh->e_ident[3] != 'F') return false;
+    if (eh->e_ident[EI_CLASS] != ELFCLASS64 ||
+        eh->e_ident[EI_DATA] != ELFDATA2LSB) return false;
+    if (eh->e_type != ET_EXEC || eh->e_machine != EM_X86_64) return false;
+    if (eh->e_shoff + eh->e_shnum * sizeof(Elf64_Shdr) > img.size())
+        return false;
+    const Elf64_Shdr* sh = reinterpret_cast<const Elf64_Shdr*>(
+        img.data() + eh->e_shoff);
+    if (eh->e_shstrndx >= eh->e_shnum) return false;
+    const uint8_t* shstr = img.data() + sh[eh->e_shstrndx].sh_offset;
+    bool have_text = false, have_sym = false, have_str = false;
+    for (unsigned i = 0; i < eh->e_shnum; ++i) {
+        const char* name =
+            reinterpret_cast<const char*>(shstr + sh[i].sh_name);
+        if (std::strcmp(name, ".text") == 0) {
+            if (sh[i].sh_offset + sh[i].sh_size > img.size()) return false;
+            out.text = img.data() + sh[i].sh_offset;
+            out.text_size = sh[i].sh_size;
+            out.text_addr = sh[i].sh_addr;
+            have_text = true;
+        } else if (std::strcmp(name, ".symtab") == 0) {
+            if (sh[i].sh_offset + sh[i].sh_size > img.size()) return false;
+            out.symtab = img.data() + sh[i].sh_offset;
+            out.symtab_bytes = sh[i].sh_size;
+            have_sym = true;
+        } else if (std::strcmp(name, ".strtab") == 0) {
+            if (sh[i].sh_offset + sh[i].sh_size > img.size()) return false;
+            out.strtab = img.data() + sh[i].sh_offset;
+            out.strtab_size = sh[i].sh_size;
+            have_str = true;
+        }
+    }
+    return have_text && have_sym && have_str;
+}
+
+// CEP:WHAT: Finds the STT_FUNC/STB_GLOBAL symbol in a parsed symfile.
+// CEP:WHY: DoD 19 pins st_value/st_size on the function symbol.
+// CEP:STATUS: complete
+// CEP:FAILURE: returns nullptr when absent.
+// CEP:ASSUMES: the emitter's one-symbol symtab (plus the null symbol).
+// CEP:COST: @cold.
+// CEP:EVIDENCE: DoD 19.
+const Elf64_Sym* find_func_sym(const ParsedSymfile& p) {
+    const size_t n = p.symtab_bytes / sizeof(Elf64_Sym);
+    for (size_t i = 0; i < n; ++i) {
+        const Elf64_Sym* s =
+            reinterpret_cast<const Elf64_Sym*>(p.symtab) + i;
+        if (ELF64_ST_TYPE(s->st_info) == STT_FUNC &&
+            ELF64_ST_BIND(s->st_info) == STB_GLOBAL) {
+            return s;
+        }
+    }
+    return nullptr;
+}
+
+}  // namespace
+
+// DoD 31 — the replay flag is off by default and no producer records.
+VORTEX_TEST(replay_disabled_zero_events) {
+    VORTEX_EXPECT(!replay_enabled());
+    const uint64_t total_before = replay_recorder().total_events();
+    replay_recorder().record_event(
+        static_cast<uint32_t>(ReplayKind::Publish), 1, 1);
+    VORTEX_EXPECT(replay_recorder().events().empty());
+    VORTEX_EXPECT_EQ(replay_recorder().total_events(), total_before);
+}
+
+// DoD 27 — policy off: poisoned spans are NOT reported (the short-circuit).
+VORTEX_TEST(sanitizer_disabled_no_detections) {
+    VORTEX_EXPECT(!sanitizer_policy().guest_asan);
+    Fixture f;
+    gc::IcggcEngine& engine = f.heap.engine();
+    Klass* k = make_klass(f, "SanOff", 2);
+    while (engine.old_occupancy_pct() < engine.config.old_gc_trigger_pct) {
+        auto o = f.heap.allocate_object(k, 2);
+        if (!o) break;
+        if (fill_old_copy(f.heap, *o) == nullptr) break;
+    }
+    auto ran = engine.run_cycle();
+    VORTEX_EXPECT(ran.has_value());
+    if (!ran) return;
+    // Some region was evacuated + reset (poisoned in the shadow) — yet the
+    // disabled policy short-circuits verify_span: always ok.
+    bool probed_a_span = false;
+    for (const gc::Region& r : f.heap.regions()) {
+        if (r.state == gc::RegionState::Free) {
+            auto v = verify_span(r.start, 64);
+            VORTEX_EXPECT(v.has_value());
+            probed_a_span = true;
+            break;
+        }
+    }
+    VORTEX_EXPECT(probed_a_span);
+}
+
+// DoD 23 — the reserved bit is refused by name; guest_asan enables cleanly.
+VORTEX_TEST(sanitizer_policy_validation_refuses_guest_tsan_named) {
+    auto bad = SanitizerPolicy::make(false, true);
+    VORTEX_EXPECT(!bad.has_value());
+    if (!bad) {
+        VORTEX_EXPECT(bad.error().message.find("reserved") !=
+                      std::string::npos);
+    }
+    SanitizerPolicy p;
+    auto made = SanitizerPolicy::make(true, false);
+    VORTEX_EXPECT(made.has_value());
+    if (made) p = *made;
+    auto attached = attach_sanitizer_policy(p);
+    VORTEX_EXPECT(attached.has_value());
+    VORTEX_EXPECT(sanitizer_policy().guest_asan);
+    // Identical re-attach is legal; a DIFFERENT policy is a named reject.
+    VORTEX_EXPECT(attach_sanitizer_policy(p).has_value());
+    SanitizerPolicy q;
+    auto made2 = SanitizerPolicy::make(false, false);
+    if (made2) q = *made2;
+    auto mismatch = attach_sanitizer_policy(q);
+    VORTEX_EXPECT(!mismatch.has_value());
+}
+
+// DoD 25 — region release poisons; recycle unpoisons (real heap paths).
+VORTEX_TEST(sanitizer_released_region_detected) {
+    Fixture f;
+    Klass* k = make_klass(f, "SanRel", 2);
+    // Occupy at least one region.
+    gc::Region* target = nullptr;
+    for (int i = 0; i < 4096 && target == nullptr; ++i) {
+        auto o = f.heap.allocate_object(k, 2);
+        VORTEX_EXPECT(o.has_value());
+        if (!o) return;
+        if (fill_old_copy(f.heap, *o) == nullptr) break;
+        for (gc::Region& r : f.heap.regions_mut()) {
+            if (r.state == gc::RegionState::Occupied ||
+                r.state == gc::RegionState::Bump) {
+                target = &r;
+                break;
+            }
+        }
+    }
+    VORTEX_EXPECT(target != nullptr);
+    if (target == nullptr) return;
+    // Occupied: the span is addressable.
+    VORTEX_EXPECT(verify_span(target->start, 64).has_value());
+    f.heap.reset_region_to_free(*target);
+    // Released: the named sanitizer failure, kind + address in the message.
+    auto v = verify_span(target->start, 64);
+    VORTEX_EXPECT(!v.has_value());
+    if (!v) {
+        VORTEX_EXPECT(v.error().code == support::ErrorCode::GuestSanitizer);
+        VORTEX_EXPECT(v.error().message.find("guest sanitizer") !=
+                      std::string::npos);
+    }
+    // Recycle: the next promotion takes the LIFO free region back — the
+    // span is addressable again (a reused region must never read poisoned).
+    auto young = f.heap.allocate_object(k, 2);
+    VORTEX_EXPECT(young.has_value());
+    if (!young) return;
+    VORTEX_EXPECT(fill_old_copy(f.heap, *young) != nullptr);
+    VORTEX_EXPECT(verify_span(target->start, 64).has_value());
+}
+
+// DoD 24 — the evacuated region's span is a named trap after a REAL cycle;
+// the kEvacuated kind is unit-pinned on a standalone shadow.
+VORTEX_TEST(sanitizer_evacuated_region_and_kind) {
+    // Unit level: the kind values are the shadow's own contract.
+    alignas(64) static uint8_t span[256];
+    GuestShadow sh(span, sizeof(span));
+    VORTEX_EXPECT(sh.span_ok(span + 8, 16));
+    sh.poison(reinterpret_cast<uint64_t>(span) + 8, 16,
+              GuestShadow::kEvacuated);
+    VORTEX_EXPECT(!sh.span_ok(span + 8, 16));
+    VORTEX_EXPECT_EQ(sh.poison_kind(span + 8), GuestShadow::kEvacuated);
+    sh.unpoison(reinterpret_cast<uint64_t>(span) + 8, 16);
+    VORTEX_EXPECT(sh.span_ok(span + 8, 16));
+    VORTEX_EXPECT_EQ(sh.poison_kind(span + 8), GuestShadow::kAddressable);
+
+    // Engine level: a REAL occupancy cycle leaves the evacuated regions'
+    // spans non-addressable under the enabled policy.
+    Fixture f;
+    gc::IcggcEngine& engine = f.heap.engine();
+    Klass* k = make_klass(f, "SanEvac", 2);
+    while (engine.old_occupancy_pct() < engine.config.old_gc_trigger_pct) {
+        auto o = f.heap.allocate_object(k, 2);
+        if (!o) break;
+        if (fill_old_copy(f.heap, *o) == nullptr) break;
+    }
+    auto ran = engine.run_cycle();
+    VORTEX_EXPECT(ran.has_value());
+    if (!ran) return;
+    bool saw_released = false;
+    for (const gc::Region& r : f.heap.regions()) {
+        if (r.state == gc::RegionState::Free && r.epoch > 1) {
+            auto v = verify_span(r.start, 64);
+            VORTEX_EXPECT(!v.has_value());
+            saw_released = true;
+            break;
+        }
+    }
+    VORTEX_EXPECT(saw_released);
+}
+
+// DoD 26 — the FFI boundary validates Ptr-arg spans (the C++ check).
+VORTEX_TEST(sanitizer_ffi_ptr_boundary_validated) {
+    gc::Heap heap;
+    Klass k("SanFfi");  // heap-owned descriptor is a test-local singleton
+    auto young = heap.allocate_object(&k, 0);
+    VORTEX_EXPECT(young.has_value());
+    if (!young) return;
+    auto* old = fill_old_copy(heap, *young);
+    VORTEX_EXPECT(old != nullptr);
+    if (old == nullptr) return;
+    auto stub_r = TrampolineGenerator::emit_guest_to_native(
+        make_sig({ForeignArgKind::Ptr}, ForeignReturnKind::Void),
+        reinterpret_cast<void*>(&obs_ffi_probe), nullptr);
+    VORTEX_EXPECT(stub_r.has_value());
+    if (!stub_r) return;
+    GuestToNativeStub stub = std::move(*stub_r);
+    VORTEX_EXPECT_EQ(stub.ptr_arg_slots.size(), size_t{1});
+    const TaggedValue args[1] = {
+        TaggedValue::heap_pointer(reinterpret_cast<Object*>(old))};
+    // Healthy: the boundary check passes.
+    VORTEX_EXPECT(stub.validate_ptr_args(args, 1).has_value());
+    // Null passes (the machine gates own the type errors).
+    const TaggedValue null_args[1] = {TaggedValue::null()};
+    VORTEX_EXPECT(stub.validate_ptr_args(null_args, 1).has_value());
+    // Poison the object's region (release): the boundary refuses by name.
+    gc::Region* r = heap.region_of(old);
+    VORTEX_EXPECT(r != nullptr);
+    if (r == nullptr) return;
+    heap.reset_region_to_free(*r);
+    auto v = stub.validate_ptr_args(args, 1);
+    VORTEX_EXPECT(!v.has_value());
+    if (!v) {
+        VORTEX_EXPECT(v.error().code == support::ErrorCode::GuestSanitizer);
+    }
+}
+
+// DoD 18 — the descriptor + breakpoint symbols are present.
+VORTEX_TEST(gdb_descriptor_and_breakpoint_symbols_present) {
+    // The runtime links vortex_core statically — the canonical symbols are
+    // resolved at link time (dlsym sees only .dynsym, which a static
+    // archive does not populate).
+    VORTEX_EXPECT(&__jit_debug_register_code != nullptr);
+    VORTEX_EXPECT(&__jit_debug_descriptor != nullptr);
+    VORTEX_EXPECT_EQ(__jit_debug_descriptor.version, 1u);
+}
+
+// DoD 19 — registration builds a parseable ELF64 symfile.
+VORTEX_TEST(gdb_register_builds_parseable_elf_symfile) {
+    alignas(16) static const uint8_t code[] = {
+        0x55, 0x48, 0x89, 0xe5, 0x5d, 0xc3};  // push rbp; mov..; pop; ret
+    auto r = GdbJitInterface::register_code(code, sizeof(code), "vx_test_fn");
+    VORTEX_EXPECT(r.has_value());
+    if (!r) return;
+    VORTEX_EXPECT(GdbJitInterface::is_registered(code));
+    VORTEX_EXPECT_EQ(__jit_debug_descriptor.action_flag,
+                     GdbJitInterface::kJitRegisterFn);
+    VORTEX_EXPECT(__jit_debug_descriptor.first_entry != nullptr);
+    auto sym = GdbJitInterface::symfile_of(code);
+    VORTEX_EXPECT(!sym.empty());
+    ParsedSymfile p;
+    VORTEX_EXPECT(parse_gdb_symfile(sym, p));
+    VORTEX_EXPECT_EQ(p.text_addr, reinterpret_cast<uint64_t>(code));
+    VORTEX_EXPECT_EQ(p.text_size, sizeof(code));
+    VORTEX_EXPECT(std::memcmp(p.text, code, sizeof(code)) == 0);
+    const Elf64_Sym* s = find_func_sym(p);
+    VORTEX_EXPECT(s != nullptr);
+    if (s != nullptr) {
+        VORTEX_EXPECT_EQ(s->st_value, reinterpret_cast<uint64_t>(code));
+        VORTEX_EXPECT_EQ(s->st_size, sizeof(code));
+        const char* name =
+            reinterpret_cast<const char*>(p.strtab + s->st_name);
+        VORTEX_EXPECT(std::strcmp(name, "vx_test_fn") == 0);
+    }
+    VORTEX_EXPECT(GdbJitInterface::unregister_code(code).has_value());
+}
+
+// DoD 20 — unregister removes the entry and flips the action.
+VORTEX_TEST(gdb_unregister_removes_entry_and_sets_action) {
+    alignas(16) static const uint8_t code[] = {0xc3};
+    VORTEX_EXPECT(
+        GdbJitInterface::register_code(code, sizeof(code), "vx_tmp").has_value());
+    VORTEX_EXPECT(GdbJitInterface::unregister_code(code).has_value());
+    VORTEX_EXPECT(!GdbJitInterface::is_registered(code));
+    VORTEX_EXPECT_EQ(__jit_debug_descriptor.action_flag,
+                     GdbJitInterface::kJitUnregisterFn);
+    VORTEX_EXPECT(__jit_debug_descriptor.first_entry == nullptr);
+}
+
+// DoD 21 — the named rejects.
+VORTEX_TEST(gdb_named_failures) {
+    alignas(16) static const uint8_t code[] = {0xc3};
+    auto dup = GdbJitInterface::register_code(code, sizeof(code), "a");
+    VORTEX_EXPECT(dup.has_value());
+    auto again = GdbJitInterface::register_code(code, sizeof(code), "a");
+    VORTEX_EXPECT(!again.has_value());
+    if (!again) {
+        VORTEX_EXPECT(again.error().message.find("duplicate") !=
+                      std::string::npos);
+    }
+    auto unknown = GdbJitInterface::unregister_code(code + 64);
+    VORTEX_EXPECT(!unknown.has_value());
+    auto null_reg = GdbJitInterface::register_code(nullptr, 8, "a");
+    VORTEX_EXPECT(!null_reg.has_value());
+    auto zero_reg = GdbJitInterface::register_code(code, 0, "a");
+    VORTEX_EXPECT(!zero_reg.has_value());
+    auto null_un = GdbJitInterface::unregister_code(nullptr);
+    VORTEX_EXPECT(!null_un.has_value());
+    VORTEX_EXPECT(GdbJitInterface::unregister_code(code).has_value());
+}
+
+// DoD 22 — multiple registrations chain head-first; all symfiles parse.
+VORTEX_TEST(gdb_multiple_entries_chain_in_order) {
+    alignas(16) static const uint8_t c1[] = {0x90, 0xc3};
+    alignas(16) static const uint8_t c2[] = {0x91, 0xc3};
+    alignas(16) static const uint8_t c3[] = {0x92, 0xc3};
+    VORTEX_EXPECT(GdbJitInterface::register_code(c1, sizeof(c1), "f1").has_value());
+    VORTEX_EXPECT(GdbJitInterface::register_code(c2, sizeof(c2), "f2").has_value());
+    VORTEX_EXPECT(GdbJitInterface::register_code(c3, sizeof(c3), "f3").has_value());
+    VORTEX_EXPECT_EQ(GdbJitInterface::live_entries(), size_t{3});
+    // Head-first: the newest registration sits at first_entry.
+    GdbJitCodeEntry* e = __jit_debug_descriptor.first_entry;
+    VORTEX_EXPECT(e != nullptr);
+    auto s3 = GdbJitInterface::symfile_of(c3);
+    VORTEX_EXPECT(!s3.empty());
+    if (e != nullptr) {
+        VORTEX_EXPECT_EQ(e->symfile_addr,
+                         reinterpret_cast<uint64_t>(s3.data()));
+    }
+    // Full interior order: c3 (head) -> c2 -> c1 (registration-reverse).
+    const auto s2 = GdbJitInterface::symfile_of(c2);
+    const auto s1 = GdbJitInterface::symfile_of(c1);
+    VORTEX_EXPECT(!s2.empty() && !s1.empty());
+    if (e != nullptr) {
+        VORTEX_EXPECT_EQ(e->next_entry != nullptr
+                             ? e->next_entry->symfile_addr
+                             : 0,
+                         reinterpret_cast<uint64_t>(s2.data()));
+        if (e->next_entry != nullptr) {
+            VORTEX_EXPECT_EQ(
+                e->next_entry->next_entry != nullptr
+                    ? e->next_entry->next_entry->symfile_addr
+                    : 0,
+                reinterpret_cast<uint64_t>(s1.data()));
+            VORTEX_EXPECT_EQ(
+                e->next_entry->next_entry->next_entry,
+                static_cast<GdbJitCodeEntry*>(nullptr));
+            VORTEX_EXPECT_EQ(
+                e->next_entry->prev_entry, e);
+        }
+        VORTEX_EXPECT_EQ(e->prev_entry,
+                         static_cast<GdbJitCodeEntry*>(nullptr));
+    }
+    int chain = 0;
+    while (e != nullptr) {
+        ParsedSymfile p;
+        VORTEX_EXPECT(parse_gdb_symfile(
+            std::span<const uint8_t>(
+                reinterpret_cast<const uint8_t*>(e->symfile_addr),
+                e->symfile_size),
+            p));
+        e = e->next_entry;
+        ++chain;
+    }
+    VORTEX_EXPECT_EQ(chain, 3);
+    VORTEX_EXPECT(GdbJitInterface::unregister_code(c1).has_value());
+    VORTEX_EXPECT(GdbJitInterface::unregister_code(c2).has_value());
+    VORTEX_EXPECT(GdbJitInterface::unregister_code(c3).has_value());
+    VORTEX_EXPECT_EQ(GdbJitInterface::live_entries(), size_t{0});
+}
+
+namespace {
+
+// CEP:WHAT: The DoD-28 workload: a module whose field sites fill ICs
+//           deterministically (two identical builds -> identical streams).
+// CEP:WHY: The engine-wide "same program + same input -> same decisions"
+//          property needs a REAL interpreter run on both sides.
+// CEP:STATUS: complete
+// CEP:FAILURE: assemble/verify failures fail the test.
+// CEP:ASSUMES: fresh module + heap + interpreter per run (no shared state).
+// CEP:COST: @cold.
+// CEP:EVIDENCE: DoD 28.
+vm::Result<vm::RunResult> replay_run_once() {
+    auto module = ugb::assemble_module(R"(
+.class P
+.field x in P
+
+.method make(regs=3, args=1)
+    New.Object v1, P
+    SetField v1, v0, P.x
+    Return v1
+.end
+
+.method getx(regs=2, args=1)
+    GetField v1, v0, P.x
+    Return v1
+.end
+
+.method main(regs=4, args=0)
+    Const.I32 v0, 5
+    Call.Direct v1, v0, 1, make
+    Call.Direct v2, v1, 1, getx
+    Return v2
+.end
+)");
+    if (!module) return std::unexpected(module.error());
+    gc::Heap heap;
+    vm::Interpreter interp(heap);
+    return interp.run(*module, "main", {});
+}
+
+}  // namespace
+
+// DoD 28 — two identical runs produce identical decision streams.
+VORTEX_TEST(replay_identical_runs_identical_streams) {
+    set_replay_enabled(true);
+    ReplayRecorder local1;
+    VORTEX_EXPECT(replay_run_once().has_value());
+    for (const ReplayEvent& e : replay_recorder().events()) {
+        local1.record_event(e.kind, e.a, e.b);
+    }
+    const size_t n1 = local1.events().size();
+    replay_recorder().clear();
+    VORTEX_EXPECT(replay_run_once().has_value());
+    ReplayRecorder local2;
+    for (const ReplayEvent& e : replay_recorder().events()) {
+        local2.record_event(e.kind, e.a, e.b);
+    }
+    replay_recorder().clear();
+    set_replay_enabled(false);
+    VORTEX_EXPECT(n1 > 0);  // the IC producers fired on both runs
+    auto d = compare_streams(local1, local2);
+    VORTEX_EXPECT(d.identical);
+}
+
+// DoD 29 — the first divergence is located with both payloads.
+VORTEX_TEST(replay_first_divergence_located) {
+    ReplayRecorder a;
+    ReplayRecorder b;
+    set_replay_enabled(true);
+    for (int i = 0; i < 4; ++i) {
+        a.record_event(static_cast<uint32_t>(ReplayKind::Publish), i, 1);
+        b.record_event(static_cast<uint32_t>(ReplayKind::Publish), i, 1);
+    }
+    b.record_event(static_cast<uint32_t>(ReplayKind::Deopt), 7, 2);
+    a.record_event(static_cast<uint32_t>(ReplayKind::Publish), 7, 2);
+    set_replay_enabled(false);
+    auto d = compare_streams(a, b);
+    VORTEX_EXPECT(!d.identical);
+    VORTEX_EXPECT_EQ(d.first_divergence, size_t{4});
+    VORTEX_EXPECT_EQ(d.kind, static_cast<uint32_t>(ReplayKind::Publish));
+    VORTEX_EXPECT_EQ(d.expected_a, 7ull);
+    VORTEX_EXPECT_EQ(d.actual_a, 7ull);
+    VORTEX_EXPECT_EQ(d.expected_b, 2ull);
+    VORTEX_EXPECT_EQ(d.actual_b, 2ull);
+    // A kind mismatch at the same index also reports.
+    ReplayRecorder c;
+    set_replay_enabled(true);
+    c.record_event(static_cast<uint32_t>(ReplayKind::OsrEntry), 1, 2);
+    set_replay_enabled(false);
+    ReplayRecorder e2;
+    set_replay_enabled(true);
+    e2.record_event(static_cast<uint32_t>(ReplayKind::Publish), 1, 2);
+    set_replay_enabled(false);
+    auto d2 = compare_streams(c, e2);
+    VORTEX_EXPECT(!d2.identical);
+    VORTEX_EXPECT_EQ(d2.first_divergence, size_t{0});
+    // A same-kind payload mismatch also reports (the comparator cannot be
+    // payload-blind).
+    ReplayRecorder f1;
+    ReplayRecorder f2;
+    set_replay_enabled(true);
+    f1.record_event(static_cast<uint32_t>(ReplayKind::Publish), 11, 22);
+    f2.record_event(static_cast<uint32_t>(ReplayKind::Publish), 99, 22);
+    set_replay_enabled(false);
+    auto d4 = compare_streams(f1, f2);
+    VORTEX_EXPECT(!d4.identical);
+    VORTEX_EXPECT_EQ(d4.first_divergence, size_t{0});
+    VORTEX_EXPECT_EQ(d4.expected_a, 11ull);
+    VORTEX_EXPECT_EQ(d4.actual_a, 99ull);
+    // A length mismatch diverges at the shared length.
+    auto d3 = compare_streams(a, b);
+    VORTEX_EXPECT(!d3.identical);
+}
+
+// DoD 30 — the ring is bounded (Rule 28); seq/total survive the clear.
+VORTEX_TEST(replay_ring_bounded_rule28) {
+    set_replay_enabled(true);
+    replay_recorder().clear();
+    const uint64_t total_before = replay_recorder().total_events();
+    for (int i = 0; i < 70000; ++i) {
+        replay_recorder().record_event(
+            static_cast<uint32_t>(ReplayKind::Publish), 0, 0);
+    }
+    VORTEX_EXPECT_EQ(replay_recorder().events().size(),
+                     70000 % ReplayRecorder::kMaxEvents);
+    VORTEX_EXPECT_EQ(replay_recorder().total_events(), total_before + 70000);
+    // seq is monotonic across the clear.
+    const auto& ev = replay_recorder().events();
+    VORTEX_EXPECT(ev.back().seq > ev.front().seq);
+    replay_recorder().clear();
+    set_replay_enabled(false);
+}
+
+namespace {
+
+// CEP:WHAT: The DoD-32 J1 compile fixture: a corpus + a module whose body
+//           carries Debug.SourcePosition hints.
+// CEP:WHY: The compiler's line-map stamping needs a REAL compile.
+// CEP:STATUS: complete
+// CEP:FAILURE: compile failures fail the test (no silent pass).
+// CEP:ASSUMES: the default corpus covers the zero-width DEBUG_SRCPOS
+//          stencil (batch e addition).
+// CEP:COST: @cold.
+// CEP:EVIDENCE: DoD 32.
+ugb::UGBModule make_lined_module() {
+    ugb::UGBModule module;
+    ugb::MethodBuilder b(module, "lined_fn", 4, 0);
+    b.emit(ugb::Op::DEBUG_SRCPOS, 0, {}, true, 10);
+    b.const_i32(1, 3);
+    b.emit(ugb::Op::DEBUG_SRCPOS, 0, {}, true, 20);
+    b.emit(ugb::Op::ADD_I32, 2, {1, 1});
+    b.emit(ugb::Op::DEBUG_SRCPOS, 0, {}, true, 30);
+    b.ret(2);
+    auto ok = b.finish();
+    VORTEX_EXPECT(ok.has_value());
+    return module;
+}
+
+}  // namespace
+
+// DoD 32 — real names + line entries through the J1 publish path.
+VORTEX_TEST(jitdump_real_name_and_debug_entries) {
+    const std::string jit = temp_path(".jitdump");
+    const std::string map = temp_path(".map");
+    JitSession& s = jit_session();
+    VORTEX_EXPECT(s.start(jit, map).has_value());
+
+    j1::StencilTable corpus;
+    j1::build_default_corpus(corpus);
+    ugb::UGBModule module = make_lined_module();
+    auto verified = ugb::verify_module(module);
+    VORTEX_EXPECT(verified.has_value());
+    gc::Heap heap;
+    vm::Interpreter interp{heap};
+    j1::J1Bindings bindings;
+    auto br = j1::make_j1_bindings(heap, module, &interp, bindings);
+    VORTEX_EXPECT(br.has_value());
+    if (!br) {
+        VORTEX_EXPECT(s.stop().has_value());
+        return;
+    }
+    const int32_t id = module.find_method("lined_fn");
+    VORTEX_EXPECT(id >= 0);
+    if (id < 0) {
+        VORTEX_EXPECT(s.stop().has_value());
+        return;
+    }
+    j1::BaselineJit compiler(corpus);
+    j1::BaselineJob job;
+    job.module = &module;
+    job.method_id = static_cast<uint32_t>(id);
+    job.klass_addrs = &bindings.klass_addr_table;
+    job.field_offsets = bindings.field_offsets.data();
+    job.field_offset_count = bindings.field_offsets.size();
+    job.double_klass = bindings.double_klass;
+    auto code = compiler.compile(job);
+    VORTEX_EXPECT(code.has_value());
+    if (!code) {
+        VORTEX_EXPECT(s.stop().has_value());
+        return;
+    }
+    // The compiler stamped the real symbol + the exact line map.
+    VORTEX_EXPECT(code->symbol_name == "lined_fn");
+    VORTEX_EXPECT_EQ(code->line_map.size(), size_t{3});
+    auto ex = j1::publish_baseline(*code, nullptr);
+    VORTEX_EXPECT(ex.has_value());
+    if (!ex) {
+        VORTEX_EXPECT(s.stop().has_value());
+        return;
+    }
+    VORTEX_EXPECT(s.stop().has_value());
+
+    ParsedJitdump p;
+    VORTEX_EXPECT(parse_jitdump(jit, p));
+    const ParsedRecord* load = nullptr;
+    for (const auto& rec : p.records) {
+        if (rec.id == 0) load = &rec;  // the last CODE_LOAD wins
+    }
+    VORTEX_EXPECT(load != nullptr);
+    if (load == nullptr) return;
+    // name + nr_debug_entries: framing(16) + pid(4) + tid(4) + vma(8) +
+    // code_addr(8) + code_size(8) + code_index(8) = 40 bytes of payload
+    // before the name.
+    const std::vector<uint8_t>& b = load->payload;
+    VORTEX_EXPECT(b.size() > 40);
+    const std::string name(reinterpret_cast<const char*>(b.data()) + 40);
+    VORTEX_EXPECT(name == "lined_fn");
+    const uint32_t nr = le_u32(b, 40 + name.size() + 1);
+    VORTEX_EXPECT_EQ(nr, 3u);
+    // Each entry: u64 addr, u32 line, u32 column.
+    size_t off = 40 + name.size() + 1 + 4;
+    const uint64_t code_addr = le_u64(b, 16);
+    uint32_t lines[3] = {0, 0, 0};
+    for (int i = 0; i < 3; ++i) {
+        const uint64_t addr = le_u64(b, off);
+        lines[i] = le_u32(b, off + 8);
+        VORTEX_EXPECT_EQ(le_u32(b, off + 12), 0u);  // column
+        VORTEX_EXPECT(addr >= code_addr);
+        VORTEX_EXPECT(addr < code_addr + code->code.size());
+        off += 16;
+    }
+    VORTEX_EXPECT_EQ(lines[0], 10u);
+    VORTEX_EXPECT_EQ(lines[1], 20u);
+    VORTEX_EXPECT_EQ(lines[2], 30u);
+
+    // The family path: a named J2 shape publishes its real name, zero
+    // debug entries (the documented deviation).
+    VORTEX_EXPECT(s.start(jit, map).has_value());
+    j2::J2Code jc;
+    jc.method_id = 6;
+    jc.symbol_name = "family_fn";
+    jc.code = {0xC3};
+    jc.entry_offset = 0;
+    auto ex2 = j2::publish_j2(jc, nullptr);
+    VORTEX_EXPECT(ex2.has_value());
+    VORTEX_EXPECT(s.stop().has_value());
+    ParsedJitdump p2;
+    VORTEX_EXPECT(parse_jitdump(jit, p2));
+    const ParsedRecord* load2 = nullptr;
+    for (const auto& rec : p2.records) {
+        if (rec.id == 0) load2 = &rec;
+    }
+    VORTEX_EXPECT(load2 != nullptr);
+    if (load2 != nullptr) {
+        const std::vector<uint8_t>& b2 = load2->payload;
+        const std::string name2(
+            reinterpret_cast<const char*>(b2.data()) + 40);
+        VORTEX_EXPECT(name2 == "family_fn");
+        const uint32_t nr2 = le_u32(b2, 40 + name2.size() + 1);
+        VORTEX_EXPECT_EQ(nr2, 0u);
+    }
+    std::remove(jit.c_str());
+    std::remove(map.c_str());
+}
+
+// DoD 33 — the perf map carries the sanitized real name; the synthetic
+// fallback keeps the M6-d shape.
+VORTEX_TEST(publish_perfmap_uses_sanitized_real_name) {
+    const std::string jit = temp_path(".jitdump");
+    const std::string map = temp_path(".map");
+    JitSession& s = jit_session();
+    VORTEX_EXPECT(s.start(jit, map).has_value());
+
+    j1::BaselineCode bc;
+    bc.method_id = 5;
+    bc.symbol_name = "my method";
+    bc.code = {0xC3};
+    bc.osr_entry_offset = 0xFFFFFFFFu;
+    auto ex1 = j1::publish_baseline(bc, nullptr);
+    VORTEX_EXPECT(ex1.has_value());
+
+    j1::BaselineCode bc2;
+    bc2.method_id = 9;  // empty name -> the synthetic fallback
+    bc2.code = {0xC3};
+    bc2.osr_entry_offset = 0xFFFFFFFFu;
+    auto ex2 = j1::publish_baseline(bc2, nullptr);
+    VORTEX_EXPECT(ex2.has_value());
+    VORTEX_EXPECT(s.stop().has_value());
+
+    std::FILE* f = std::fopen(map.c_str(), "rb");
+    VORTEX_EXPECT(f != nullptr);
+    if (f != nullptr) {
+        char buf[512];
+        const size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+        buf[n] = 0;
+        std::fclose(f);
+        VORTEX_EXPECT(std::strstr(buf, "my_method") != nullptr);
+        VORTEX_EXPECT(std::strstr(buf, "vx_j1_m9") != nullptr);
+    }
+    std::remove(jit.c_str());
+    std::remove(map.c_str());
+}

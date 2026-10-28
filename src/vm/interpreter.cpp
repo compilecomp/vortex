@@ -9,6 +9,7 @@
 
 #include "vortex/support/cem.hpp"
 #include "vortex/support/log.hpp"
+#include "vortex/infra/observability.hpp"
 #include "vortex/infra/threading.hpp"
 #include "vortex/ugb/encoding.hpp"
 #include "vortex/ugb/verifier.hpp"
@@ -631,6 +632,22 @@ void Interpreter::record_bigram(Op first, Op second) {
 void Interpreter::record_transition(uint32_t method_id, uint32_t pc, Tier from,
                                     Tier to, TierTransitionRecord::Kind kind,
                                     const char* reason) {
+    // Batch-e deterministic replay: the transition decisions ride the
+    // engine's decision stream (OsrRequest -> OsrEntry; promote/fallback
+    // -> TierHandoff with the packed from|to payload).
+    if (infra::replay_enabled()) {
+        if (kind == TierTransitionRecord::Kind::OsrRequest) {
+            infra::replay_recorder().record_event(
+                static_cast<uint32_t>(infra::ReplayKind::OsrEntry),
+                method_id, pc);
+        } else {
+            infra::replay_recorder().record_event(
+                static_cast<uint32_t>(infra::ReplayKind::TierHandoff),
+                method_id,
+                static_cast<uint64_t>(static_cast<uint8_t>(from)) |
+                    (static_cast<uint64_t>(static_cast<uint8_t>(to)) << 32));
+        }
+    }
     // Transitions are rare events; a shifting buffer keeps the exposed span
     // in chronological order (a wrap-around ring would need reordering to
     // present, which the span API cannot do).
@@ -1590,6 +1607,18 @@ L_GET_FIELD: {
         IcSlot& ic = method.ics[idx];
         if (const ugb::IcEntry* e = ic.lookup(klass_id)) {
             stats_.ic_hits++;
+            // Batch-e managed sanitizers: the resolved field slot must be
+            // addressable (same span contract as the array ops).
+            if (infra::sanitizer_policy().guest_asan) {
+                if (auto span_r = infra::verify_span(
+                        &static_cast<Object*>(gc_resolve(o))->field(
+                            e->target),
+                        sizeof(TaggedValue));
+                    !span_r) {
+                    exit_result = std::unexpected(span_r.error());
+                    goto L_done;
+                }
+            }
             // Brooks resolution: field DATA moves with the body (docs/
             // gc-icggc.md 8.2) — the IC hit path is a data access too.
             R[ins.dst] = static_cast<Object*>(gc_resolve(o))->field(e->target);
@@ -1826,6 +1855,18 @@ L_ARRAY_GET: {
                         std::to_string(i) + " vs " +
                         std::to_string(a->length()) + ")");
     }
+    // Batch-e managed sanitizers: the element span must be addressable in
+    // the guest shadow (docs/infrastructure/06 — one relaxed policy load
+    // when disabled; the detection classes are the GC-corruption spans).
+    if (infra::sanitizer_policy().guest_asan) {
+        if (auto span_r = infra::verify_span(
+                &a->element(static_cast<uint32_t>(i)),
+                sizeof(TaggedValue));
+            !span_r) {
+            exit_result = std::unexpected(span_r.error());
+            goto L_done;
+        }
+    }
     R[ins.dst] = a->element(static_cast<uint32_t>(i));
     VORTEX_NEXT();
 }
@@ -1841,6 +1882,16 @@ L_ARRAY_SET: {
     const int64_t i = R[ins.s1].as_smi();
     if (i < 0 || i >= a->length()) {
         VORTEX_RT_ERROR("Array.Set: bounds check failed");
+    }
+    // Batch-e managed sanitizers: same span contract as Array.Get.
+    if (infra::sanitizer_policy().guest_asan) {
+        if (auto span_r = infra::verify_span(
+                &a->element(static_cast<uint32_t>(i)),
+                sizeof(TaggedValue));
+            !span_r) {
+            exit_result = std::unexpected(span_r.error());
+            goto L_done;
+        }
     }
     // The full write barrier (docs/gc-icggc.md 8.3): SATB leg + store +
     // card leg + remembered-set leg. The Brooks resolution inside the
@@ -2038,7 +2089,16 @@ deopt::EntryDecision Interpreter::speculation_verdict(
     if (gate == nullptr || gate->table == nullptr) {
         return deopt::EntryDecision::Enter;
     }
-    return gate->table->entry_check(gate->policy);
+    const deopt::EntryDecision d = gate->table->entry_check(gate->policy);
+    // Batch-e deterministic replay: a non-Enter verdict IS a deopt decision
+    // (the Rule-43 ladder's refusal consumed at this site).
+    if (infra::replay_enabled() &&
+        d != deopt::EntryDecision::Enter) {
+        infra::replay_recorder().record_event(
+            static_cast<uint32_t>(infra::ReplayKind::Deopt), method_id,
+            static_cast<uint64_t>(static_cast<uint8_t>(d)));
+    }
+    return d;
 }
 
 // @cold — name-resolution caches: first call per token, then an array index

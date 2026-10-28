@@ -5,9 +5,10 @@ tools. The M6-d batch lands the **observability floor** — the external
 performance review's R40 ("ship the observability floor early... enterprise
 adoption is gated more on this section than on any percentage"): the
 `perf-jitdump` writer with its `perf-<pid>.map` sidecar, the safepoint TTSP
-log, GC pause-ring cause labels, and the TLAB-refill allocation sampler. The
-GDB JIT interface, managed sanitizers, and deterministic replay remain
-contract-stubbed for batch e.
+log, GC pause-ring cause labels, and the TLAB-refill allocation sampler.
+Batch e completes the item: the GDB JIT interface, the managed sanitizers,
+deterministic replay, and the jitdump metadata interchange (real symbol
+names + source-line debug entries).
 
 ## Mechanisms
 
@@ -154,6 +155,143 @@ calls it):
   rate control, ring, and telemetry are the deliverable; attribution is the
   named upgrade, not a silent gap.
 
+## GDB JIT interface (normative)
+
+The canonical GDB JIT debug interface (gdb/jit.h ABI), implemented as the
+well-known client symbols the debugger discovers at attach time:
+
+- `struct __jit_debug_descriptor { uint32_t version; uint32_t action_flag;
+  struct jit_code_entry* relevant_entry; struct jit_code_entry*
+  first_entry; }` — version 1, zero-initialized at static-init time (gdb
+  reads it even when nothing is registered; the descriptor exists
+  unconditionally, zero hot-path cost).
+- `extern "C" void __jit_debug_register_code(void)` — a real, never-inlined,
+  never-eliminated empty function (`used` + `noinline`); the debugger sets
+  its breakpoint here.
+- `jit_code_entry { next_entry, prev_entry, symfile_addr, symfile_size }`
+  (the canonical doubly-linked gdb/jit.h shape) — one entry per registered
+  code blob, chained through `first_entry`; head insertion on register,
+  symmetric unlink on unregister. `relevant_entry` names the entry the
+  action consumed and dangles after an unregister BY CONTRACT (the
+  debugger consumes it at the breakpoint hit, never later).
+- Actions: `JIT_NOACTION = 0`, `JIT_REGISTER_FN = 1`,
+  `JIT_UNREGISTER_FN = 2`.
+
+**Symfile.** Each registered blob gets an in-memory ELF64 little-endian
+`ET_EXEC` image: ELF header (`e_machine = 62` EM_X86_64, `e_entry = 0`),
+one `PT_LOAD` (`PF_R|PF_X`) covering the image, and the sections
+`[NULL, .text, .symtab, .strtab, .shstrtab]`. `.text` holds a byte copy of
+the registered code (registration SNAPSHOTS the bytes — the live W^X
+mapping is never referenced afterward); `.symtab` carries one
+`STT_FUNC`/`STB_GLOBAL` symbol with `st_value = code_addr` (absolute) and
+`st_size = code_bytes`. Emission is deterministic (fixed section order,
+zero padding, no timestamps) — golden-pinnable.
+
+**Semantics.** `register_code(code, size, symbol)`: named failures for
+null/zero-size and a duplicate live base; otherwise build the symfile,
+link the entry at the head, set `action_flag = JIT_REGISTER_FN`, call the
+breakpoint function. `unregister_code(code)`: named failure for an unknown
+base; otherwise unlink, set `JIT_UNREGISTER_FN`, call the breakpoint
+function. One mutex serializes descriptor and chain mutation
+(@cold only — registration never runs in signal context). The publish
+path registers unconditionally after the bytes are final (one extra copy
+of published code, @cold — no feature flag); an RAII token on the
+executable unregisters at teardown, so the descriptor never outlives the
+code.
+
+## Managed sanitizers (normative)
+
+ASan-for-UGB: a guest-heap shadow memory that detects the GC-corruption
+classes — access into **evacuated-from** copies and **released**-region
+spans — at the boundaries guest code and foreign code actually touch.
+
+- `SanitizerPolicy` is the validated process config: `guest_asan`
+  supported (default false); `guest_tsan` is RESERVED — validation refuses
+  enabling it by name until the atomics capability pack ships (a named
+  refusal, never a silent ignore).
+- `GuestShadow` — a side structure over the guest heap span, 1 byte per 8
+  heap bytes (`kShadowShift = 3`), constructed exactly like the card table
+  (span-indexed, no per-object metadata). Values: `0` addressable,
+  `kShadowEvacuated` (evacuated-from old copy), `kShadowReleased`
+  (released/recycled-pending region span).
+- Producers (all @cold): the ICGGC engine poisons the evacuated-from span
+  during evacuation and the released region's span at region release; a
+  region recycle (cold path) unpoisons. The bump-allocated young space is
+  NEVER poisoned (per-alloc unpoison would be hot-path cost for no
+  detection class).
+- Consumers: T0's array load-store ops and the IC-hit field path consult
+  the shadow when the policy is enabled (the sites with clean named-error
+  paths in the interpreter loop); the FFI boundary validates Ptr-arg
+  spans (`GuestToNativeStub::validate_ptr_args` — the C++ boundary check
+  the machine-code type gates cannot do); the public `verify_span(addr,
+  bytes)` API is the check everything routes through. The cached-field
+  helpers' internal plumbing (`get/set_field_cached`) rides the R31
+  metadata batch (the same layout work) — the IC-hit path already covers
+  the hot field reads. Cost contract: policy DISABLED — one relaxed
+  global-bool load per checked op (default); policy ENABLED — one shadow
+  byte load + compare per checked op.
+- Violation shape: a NAMED trap — the interpreter raises the sanitizer
+  error carrying kind + violating address (adjacent to the Debug.Trap
+  semantics); `verify_span` returns the same named failure. Detection
+  never aborts the process and never corrupts: fail-fast into the trap
+  semantics, by name.
+
+## Deterministic replay (normative)
+
+The honest batch-e scope: the engine's **decision recorder** and the
+differential **first-divergence checker** — the property pinned is "same
+program + same input + same policy → same decision stream" (the J4
+determinism DoD, extended engine-wide). Exact re-execution scheduling is
+NOT this batch.
+
+- `ReplayEvent { uint64_t seq; uint32_t kind; uint64_t a; uint64_t b; }` —
+  documented payload packing per kind: TierHandoff (a = method_id,
+  b = from | to << 32), OsrEntry (a = method_id, b = bytecode pc),
+  IcTransition (a = from | to << 32, b = the entry's klass id — the
+  state machine carries no site identity; the stream shape is the
+  contract), GcCycleStart (a = cause), Deopt (a = method_id, b = cause),
+  Publish (a = method_id, b = tier ordinal), SanitizerTrap (a = violating
+  address low bits, b = kind).
+- Ring bounded at 65536 events with the Rule-28 clear-on-overflow
+  discipline; `seq` is monotonic and survives the clear (it counts
+  events, not slots).
+- Producers, all behind ONE runtime flag (`replay_enabled`, default
+  false — zero events, zero cost when off): the tiering driver's handoffs,
+  T0's IC state transitions, the GC engine's cycle starts, the RBPD
+  verdict consumption sites, the publish path, sanitizer traps.
+- `compare_streams(a, b)` walks both rings O(n) and reports
+  `{ identical, first_divergence, kind, expected (a,b), actual (a,b) }` —
+  the first divergence IS the diagnosis.
+
+## Real symbol names and jitdump debug entries (normative)
+
+The metadata interchange upgrade the M6-d floor reserved:
+
+- The J1/J2 compile results gain `symbol_name` (the input `UGBMethod`'s
+  name; may be empty); J1 additionally gains `line_map` — sorted
+  `(native offset, line)` pairs built by the compiler from the method's
+  `DEBUG_SRCPOS` metas (the stencil layout is 1:1 with the bytecode, so
+  the mapping is exact). The publish path passes both through.
+- **Family deviation (documented):** the J2/J3/J4 family publishes through
+  the J2 path with real symbol names but EMPTY line maps — the graph-
+  scheduled layout has no 1:1 pc→offset map, and fabricating one is worse
+  than shipping zero entries (Rule 120). Exact line entries for the family
+  ride the R31 emitted-poll batch's metadata work, which touches the same
+  layouts.
+- `record_code` gains the named+line overload: CODE_LOAD carries the real
+  (sanitized) name and `nr_debug_entries = line_map.size()`, each
+  `JIT_CODE_DEBUG_ENTRY` record `{ u64 code_addr = base + offset, u32
+  line, u32 column = 0 }` following the name. Methods without
+  `DEBUG_SRCPOS` ship zero entries — nothing is fabricated.
+- Synthetic fallback: an empty name publishes as `vx_<tier>_m<method_id>`
+  (the M6-d shape — existing constructions and tests stay valid). The
+  jitdump CODE_LOAD carries the RAW real name (the format is
+  NUL-terminated and tolerates spaces); the perf-map sidecar — whose
+  format is whitespace-delimited — carries the SANITIZED name (spaces and
+  newlines to `_`). Duplicate real names may produce duplicate map lines
+  (perf resolves by address range; the M6-d sanitizer precedent is
+  HotSpot's).
+
 ## Vortex API
 
 `include/vortex/infra/observability.hpp`:
@@ -170,8 +308,20 @@ calls it):
   singleton.
 - `PauseCause` (gc side, collector.hpp) — the pause-ring labels.
 - `TierEventSink` — unchanged (M0-real, consumed by `vx stats`).
-- `GdbJitInterface`, `SanitizerPolicy`, `ReplayRecorder` — unchanged
-  contract stubs (batch e).
+- `GdbJitInterface` — the canonical client interface: `register_code` /
+  `unregister_code` (named failures, mutex-serialized), the unconditional
+  `__jit_debug_descriptor` + `__jit_debug_register_code` symbols, and the
+  deterministic ELF64 symfile emitter.
+- `SanitizerPolicy` — validated process config (guest_asan supported,
+  guest_tsan a named refusal); `GuestShadow` — the span-indexed side
+  structure (1 byte per 8 heap bytes) with `verify_span(addr, bytes)` as
+  the one check everything routes through.
+- `ReplayRecorder` — the decision ring (`record_event` with the documented
+  kind packing, Rule-28 bounded, monotonic seq) + `compare_streams` (the
+  first-divergence report) + the `replay_enabled` runtime flag.
+- `record_code` — the new named+line overload (real symbols, JIT_CODE_DEBUG
+  _ENTRY records); the M6-d signature keeps compiling as the synthetic
+  fallback.
 
 `tools/vx`: `run` and `stats` gain `--jitdump[=PATH]` (start_default or the
 explicit path for the process lifetime; stopped at exit); `stats` prints the
@@ -226,17 +376,78 @@ the run — the telemetry a cold `vx stats` can reach without a GC engine.
     procedure runs `vx stats <sample> --entry main --jitdump=<tmp>` and
     asserts the heap / alloc_sampler / safepoints summary lines and the
     jitdump stop line appear.
+18. `gdb_descriptor_and_breakpoint_symbols_present` — the descriptor is
+    zero-initialized (version 1, no entries) and both canonical symbols
+    resolve at link time (the runtime links the core statically — a static
+    archive does not populate .dynsym, so the pin addresses the symbols
+    directly instead of dlsym).
+19. `gdb_register_builds_parseable_elf_symfile` — after register_code the
+    entry is linked at first_entry, action_flag = JIT_REGISTER_FN, the
+    symfile parses as ELF64/EM_X86_64/ET_EXEC, .symtab carries the
+    STT_FUNC symbol with st_value == code_addr and st_size == code_bytes,
+    and .text byte-matches the registered code.
+20. `gdb_unregister_removes_entry_and_sets_action` — after unregister the
+    chain is empty, action_flag = JIT_UNREGISTER_FN.
+21. `gdb_named_failures` — duplicate live registration, unregister of an
+    unknown base, null/zero-size: all named rejects.
+22. `gdb_multiple_entries_chain_in_order` — three registrations chain
+    head-first in registration-reverse order; all symfiles parse.
+23. `sanitizer_policy_validation_refuses_guest_tsan_named` — enabling
+    guest_tsan is a named validation refusal; guest_asan enables cleanly.
+24. `sanitizer_evacuated_copy_detected` — after a forced evacuation under
+    the policy, verify_span on the evacuated-from span is a named trap
+    carrying the kind; the same span reads clean before evacuation.
+25. `sanitizer_released_region_detected` — region release poisons the
+    span; verify_span reports it; recycle unpoisons.
+26. `sanitizer_ffi_ptr_boundary_validated` — a Ptr-arg span is routed
+    through verify_span at the boundary; a poisoned span is a named
+    boundary failure.
+27. `sanitizer_disabled_no_detections` — policy off: poisoned spans are
+    NOT reported (the check short-circuits on the global gate; zero
+    events, zero traps).
+28. `replay_identical_runs_identical_streams` — two identical single-
+    mutator runs with replay_enabled produce identical streams (the
+    engine-wide determinism property).
+29. `replay_first_divergence_located` — an injected difference between two
+    streams is reported at the right index with the right kind and both
+    payloads.
+30. `replay_ring_bounded_rule28` — overflow clears the ring; seq keeps
+    counting (Rule 28).
+31. `replay_disabled_zero_events` — with the flag off no producer records
+    anything (the cost contract).
+32. `jitdump_real_name_and_debug_entries` — a compiled method with a real
+    name and DEBUG_SRCPOS metas publishes CODE_LOAD with the raw real
+    name and parseable debug entries (addr = base + offset, line
+    matches); the J2-family path publishes its real name with
+    nr_debug_entries = 0 (the documented deviation).
+33. `publish_perfmap_uses_sanitized_real_name` — the perf-map line carries
+    the sanitized real name (spaces to underscore).
 
 ## Deviations and deferred
 
-- jitdump debug entries (UGB source-line mapping), the GDB JIT interface,
-  managed sanitizers, and deterministic replay: batch e.
+- jitdump debug entries, the GDB JIT interface, managed sanitizers,
+  deterministic replay, and real symbol names: **batch e, this batch —
+  all landed** (the sections above are normative).
+- Deterministic replay is the decision-record + first-divergence scope;
+  exact re-execution scheduling stays out (no consumer demanded it; the
+  differential checker is the deliverable with a named contract).
+- `guest_tsan` is a reserved, named-refused policy bit until the atomics
+  capability pack (post-M6) — enabling it never silently no-ops.
+- GDB symfiles are ET_EXEC images with absolute symbol addresses (the
+  reader-side contract gdb requires); they are not relocatable objects —
+  a linker-consumable ET_REL form stays out until a consumer asks.
+- The FFI boundary validates the RAW (unresolved) pointer base — what the
+  emitted stub actually passes — so a handle to an evacuated (Brooks-
+  resolvable) object is a NAMED boundary refusal, not transparently
+  resolved. The strict-refusal semantics are the documented contract;
+  a Brooks-resolving boundary form rides the call-out wiring batch.
+- `validate_ptr_args` has no production call site yet (the trampolines'
+  consumer contract is the driver-level entry); the wiring rides the
+  interop/J4 call-out batch, which owns the real call sites.
 - Safepoint-log events for preemptive (guard-page) suspensions: the
   emitted-poll batch (R31).
 - Allocation-site attribution in samples: the emitted-poll batch (R31) —
   `site_id` reserved at 0 until the unbiased stack walk exists.
-- Symbol names are synthetic (`vx_<tier>_m<id>`); real names ride the
-  metadata interchange upgrade (batch e).
 - `vx stats` prints the safepoint summary as the zero-valued numeric shape
   with an explanatory note — a cold driver run has no handshake manager,
   so no events can exist; the numbers become real under freeze_all and

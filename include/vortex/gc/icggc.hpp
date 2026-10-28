@@ -36,6 +36,10 @@
 #include "vortex/support/result.hpp"
 #include "vortex/support/tagged_value.hpp"
 
+namespace vortex::infra {
+class GuestShadow;  // the heap's sanitizer shadow (batch e, observability)
+}
+
 namespace vortex::gc {
 
 using support::Result;
@@ -525,6 +529,9 @@ public:
     /// granularity atomicity: a region is either fully forwarded or
     /// untouched between engine slices.
     Result<void> evacuate_region(Region& r);
+    /// Region surgery primitive (public: the unit tests drive the release
+    /// leg directly; the engine owns the orchestration).
+    void reset_region_to_free(Region& r);
 
     /// Reclaims a fully-dead region to the free list (Sweep).
     void reclaim_region(Region& r);
@@ -562,7 +569,6 @@ private:
     void init_header(HeapObject* obj, size_t bytes) noexcept;
     /// Sweep/reset shared tail: Free state, epoch bump, remset clear, card
     /// cleanup, free-list push (docs/gc-icggc.md 8.4).
-    void reset_region_to_free(Region& r);
 
     std::unique_ptr<uint8_t[]> buffer_;
     size_t young_bytes_;
@@ -579,6 +585,10 @@ private:
     std::vector<uint64_t> satb_;          // SATB log (old-value words)
     GcRuntimeState gc_state_;
     std::unique_ptr<IcggcEngine> engine_;
+    /// Batch-e managed sanitizers (docs/infrastructure/06): the guest-heap
+    /// shadow over the whole span; attached globally at construction,
+    /// detached at destruction (the heap outlives every guest execution).
+    std::unique_ptr<infra::GuestShadow> shadow_;
 };
 
 }  // namespace vortex::gc

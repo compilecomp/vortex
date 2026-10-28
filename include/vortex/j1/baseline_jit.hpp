@@ -56,6 +56,13 @@ struct BaselineCode {
     /// The method's vreg count — the GC stack walk's J1 frame geometry
     /// (docs/gc-icggc.md 8.6: vregs at [rbp + vreg_disp(rc, i)]).
     uint32_t register_count = 0;
+    /// Batch-e metadata interchange (docs/infrastructure/06): the method's
+    /// real name (empty in synthetic/test builds) and the sorted (native
+    /// offset, line) pairs from the method's DEBUG_SRCPOS metas — the
+    /// stencil layout is 1:1 with the bytecode (each hint occupies the
+    /// 5-byte fallthrough tail), so the mapping is exact.
+    std::string symbol_name;
+    std::vector<std::pair<uint32_t, uint32_t>> line_map;
 };
 
 /// Engine binding: the runtime state a J1-compiled method executes against.
@@ -85,6 +92,10 @@ struct BaselineExecutable {
     /// GC stack-walk record (docs/gc-icggc.md 8.6): the registry holds a
     /// weak reference; this shared_ptr keeps it alive with the code.
     std::shared_ptr<gc::GcCodeRecord> gc_record;
+    /// Batch-e GDB JIT interface: the owning registration token — its
+    /// destruction unregisters, so the debugger-visible descriptor never
+    /// outlives the code (null when registration was refused).
+    std::shared_ptr<void> gdb_token;
 };
 
 /// Builds the engine binding for `module` against `heap` (+ optional T0

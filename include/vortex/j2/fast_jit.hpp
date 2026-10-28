@@ -126,6 +126,11 @@ struct J2Code {
     std::vector<uint32_t> osr_pcs;
     std::vector<uint8_t> gc_maps;
     std::vector<uint8_t> deopt_records;
+    /// Batch-e metadata interchange (docs/infrastructure/06): the method's
+    /// real name (empty in synthetic/test builds). Line maps for the
+    /// graph-scheduled family ride the R31 metadata batch (the documented
+    /// deviation — no fabricated 1:1 mapping exists here).
+    std::string symbol_name;
     /// RBPD region table (docs/deopt-rbpd.md section 1): one region per
     /// deopt record — every trap site aligns with a region boundary (the
     /// hard invariant). Failure counters live here at runtime.
@@ -175,6 +180,9 @@ struct J2Executable {
     /// GC stack-walk record (docs/gc-icggc.md 8.6): the registry holds a
     /// weak reference; this shared_ptr keeps it alive with the code.
     std::shared_ptr<gc::GcCodeRecord> gc_record;
+    /// Batch-e GDB JIT interface: the owning registration token (see
+    /// BaselineExecutable) — teardown unregisters.
+    std::shared_ptr<void> gdb_token;
 };
 
 /// Deopt chain depth bound (the pipeline's inline_depth_cap + root,

@@ -22,6 +22,8 @@
 // src/gc/stack_scan.cpp.
 #include "vortex/gc/icggc.hpp"
 
+#include "vortex/infra/observability.hpp"
+
 #include <algorithm>
 #include <cstring>
 
@@ -70,6 +72,13 @@ Heap::Heap(size_t young_bytes, size_t old_bytes)
     tlab_.reset(buffer_.get(), std::min(young_bytes_, kYoungChunkBytes));
     card_table_ = CardTable(buffer_.get(), total_bytes());
 
+    // Batch-e managed sanitizers: the guest shadow over the whole span
+    // (attach/detach discipline — the heap outlives every guest execution;
+    // docs/infrastructure/06 managed sanitizers section).
+    shadow_ = std::make_unique<infra::GuestShadow>(buffer_.get(),
+                                                   total_bytes());
+    infra::attach_guest_shadow(shadow_.get());
+
     // Old space: carve regions at their fixed stride from the old base.
     regions_.resize(old_bytes_ / Region::kSize);
     for (size_t i = 0; i < regions_.size(); ++i) {
@@ -88,7 +97,13 @@ Heap::Heap(size_t young_bytes, size_t old_bytes)
     engine_ = std::make_unique<IcggcEngine>(*this);
 }
 
-Heap::~Heap() = default;
+Heap::~Heap() {
+    // Detach the shadow before the span dies (a later heap re-attaches its
+    // own — the raw global must never dangle).
+    if (infra::guest_shadow() == shadow_.get()) {
+        infra::attach_guest_shadow(nullptr);
+    }
+}
 
 // CEP:WHAT: Maps an address to its old-space region (nullptr outside old space).
 // CEP:WHY: barrier remset legs and the collector's region surgery key on it.
@@ -152,6 +167,9 @@ HeapObject* Heap::promote(size_t bytes) {
     Region& r = regions_[idx];
     r.state = RegionState::Bump;
     r.top = r.start;
+    // Batch-e sanitizers: the recycled span is addressable again (the
+    // release path poisoned it — a reused region must never read poisoned).
+    shadow_->unpoison(reinterpret_cast<uint64_t>(r.start), Region::kSize);
     ++r.epoch;  // reuse: stale remembered-set entries must not survive
     r.remset.clear();
     bump_region_ = idx;
@@ -191,6 +209,9 @@ HeapObject* Heap::allocate_humongous(size_t bytes) {
                              : RegionState::HumongousCont;
             ++r.epoch;
             r.remset.clear();
+            // Batch-e sanitizers: the carved run is addressable again.
+            shadow_->unpoison(reinterpret_cast<uint64_t>(r.start),
+                              Region::kSize);
         }
         // Remove the run's regions from the free list.
         free_regions_.erase(
@@ -768,6 +789,10 @@ Result<void> Heap::collect_young() {
 // CEP:EVIDENCE: the sweep/evacuation tests.
 void Heap::reset_region_to_free(Region& r) {
     r.state = RegionState::Free;
+    // Batch-e sanitizers: the dead/evacuated span joins the detection set
+    // (kReleased); the recycle paths unpoison at acquisition.
+    shadow_->poison(reinterpret_cast<uint64_t>(r.start), Region::kSize,
+                    infra::GuestShadow::kReleased);
     ++r.epoch;  // remembered-set entries logged under the old epoch prune
     r.remset.clear();
     r.live_bytes = 0;
@@ -820,6 +845,11 @@ Result<void> Heap::evacuate_region(Region& r) {
             n->header.pinned = 0;
             o->header.brooks = n;  // the frozen body forwards
             o->header.forwarded = 1;
+            // Batch-e sanitizers: the frozen body is the detection class —
+            // a guest access here is a stale reference (the live copy is
+            // the forwarded one). Kind carries the meaning.
+            shadow_->poison(reinterpret_cast<uint64_t>(o), o->header.size,
+                            infra::GuestShadow::kEvacuated);
             copied.push_back(n);
             engine_->stats_mut().evacuated_objects++;
             engine_->stats_mut().evacuated_bytes += o->header.size;

@@ -252,6 +252,14 @@ struct GuestToNativeStub {
         nullptr;
     TrampolineContext ctx{};
     uint32_t id = 0;  // FfiTrampolineRegistry id; 0 when moved-from/absent
+    /// Batch-e managed sanitizers: the argument indices whose kind is Ptr
+    /// (copied from the signature at generation). `validate_ptr_args` is
+    /// the C++ boundary check the machine-code type gates cannot do — a
+    /// Ptr arg's object base must be addressable in the guest shadow
+    /// before foreign code receives it (docs/infrastructure/06).
+    std::vector<uint8_t> ptr_arg_slots;
+    support::Result<void> validate_ptr_args(const TaggedValue* args,
+                                            size_t nargs) const noexcept;
 };
 
 /// A published native→guest callback stub. `fn_ptr` is the SysV entry handed

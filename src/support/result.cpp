@@ -19,6 +19,7 @@ const char* error_code_name(ErrorCode code) noexcept {
     case ErrorCode::InvalidState: return "InvalidState";
     case ErrorCode::SpeculationDisabled: return "SpeculationDisabled";
     case ErrorCode::ForeignBoundary: return "ForeignBoundary";
+    case ErrorCode::GuestSanitizer: return "GuestSanitizer";
     }
     return "?";
 }

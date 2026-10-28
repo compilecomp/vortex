@@ -401,9 +401,11 @@ GuestToNativeStub::GuestToNativeStub(GuestToNativeStub&& other) noexcept
     : memory(std::move(other.memory)),
       entry(other.entry),
       ctx(other.ctx),
-      id(other.id) {
+      id(other.id),
+      ptr_arg_slots(std::move(other.ptr_arg_slots)) {
     other.entry = nullptr;
     other.id = 0;
+    other.ptr_arg_slots.clear();
 }
 GuestToNativeStub& GuestToNativeStub::operator=(
     GuestToNativeStub&& other) noexcept {
@@ -413,8 +415,10 @@ GuestToNativeStub& GuestToNativeStub::operator=(
         entry = other.entry;
         ctx = other.ctx;
         id = other.id;
+        ptr_arg_slots = std::move(other.ptr_arg_slots);
         other.entry = nullptr;
         other.id = 0;
+        other.ptr_arg_slots.clear();
     }
     return *this;
 }
@@ -673,9 +677,43 @@ support::Result<GuestToNativeStub> TrampolineGenerator::emit_guest_to_native(
         reinterpret_cast<void*>(&vortex_ffi_type_error_slow)};
     stub.entry = reinterpret_cast<TaggedValue (*)(
         const TaggedValue*, TrampolineContext*)>(stub.memory.data());
+    // Batch-e managed sanitizers: record which slots are Ptr so the C++
+    // boundary validation knows where the shadow check applies.
+    for (size_t i = 0; i < sig.args.size(); ++i) {
+        if (sig.args[i] == ForeignArgKind::Ptr && i < 255) {
+            stub.ptr_arg_slots.push_back(static_cast<uint8_t>(i));
+        }
+    }
     stub.id = ffi_trampoline_registry().register_range(stub.memory.data(),
                                                        code_bytes);
     return stub;
+}
+
+// CEP:WHAT: validate_ptr_args — the call-out boundary's C++ span check:
+//           each Ptr slot holding a heap object must be addressable in the
+//           guest shadow (8 header bytes) before foreign code receives it.
+// CEP:WHY: docs/infrastructure/06 managed sanitizers — the FFI boundary is
+//          a named consumer; a stale (evacuated/released) base must be a
+//          NAMED failure, not foreign-side corruption.
+// CEP:CLASS: CEP-2
+// CEP:STATUS: complete
+// CEP:FAILURE: the named GuestSanitizer failure (kind + address).
+// CEP:ASSUMES: noexcept; non-heap/non-null Ptr args skip (the emitted
+//          stub's type gates own that named failure).
+// CEP:COST: @cold (call-out setup); disabled policy = one bool per slot.
+// CEP:EVIDENCE: tests/test_observability.cpp DoD 26.
+support::Result<void> GuestToNativeStub::validate_ptr_args(
+    const TaggedValue* args, size_t nargs) const noexcept {
+    if (!infra::sanitizer_policy().guest_asan) return support::ok();
+    for (const uint8_t slot : ptr_arg_slots) {
+        if (slot >= nargs) continue;
+        const TaggedValue& v = args[slot];
+        if (!v.is_heap_object()) continue;  // null/other: the stub gates it
+        if (auto r = infra::verify_span(v.as_heap_object(), 8); !r) {
+            return r;
+        }
+    }
+    return support::ok();
 }
 
 // ---------------------------------------------------------------------------

@@ -3,8 +3,9 @@
 //           writer (packed unaligned records, CLOCK_MONOTONIC timestamps,
 //           the PROT_EXEC self-mmap), the perf-map sidecar, the JitSession
 //           singleton facade with best-effort publish hooks, the safepoint
-//           TTSP ring, and the TLAB-refill allocation sampler; the batch-e
-//           contract stubs (GDB JIT interface, replay recorder).
+//           TTSP ring, and the TLAB-refill allocation sampler; batch e
+//           completes the item (GDB JIT interface + ELF64 symfiles, the
+//           guest-heap shadow, the replay ring + differ).
 // CEP:WHY: docs/infrastructure/06-observability.md (the R40 floor) — OS
 //          tools must attribute JIT frames and every performance item needs
 //          its measurement source; Rule 120 telemetry with Rule 28 bounds.
@@ -20,10 +21,11 @@
 //          driver thread with final code bytes.
 // CEP:COST: @cold everywhere except AllocSampler::on_refill (@warm,
 //          interval-gated) and the publish-path one-branch active() check.
-// CEP:EVIDENCE: tests/test_observability.cpp — the DoD 1-16 parse-backs,
+// CEP:EVIDENCE: tests/test_observability.cpp — the DoD 1-33 parse-backs,
 //          probe, ring bounds, and named-reject pins.
 #include "vortex/infra/observability.hpp"
 
+#include <elf.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -35,9 +37,12 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 namespace vortex::infra {
+
+using support::ok;
 
 namespace {
 
@@ -329,15 +334,12 @@ Result<void> JitDumpWriter::record_code_load(uint64_t vma, uint64_t code_addr,
                                              const std::string& name,
                                              std::span<const DebugEntry> debug) {
     if (auto r = require_open("record_code_load"); !r) return r;
-    if (!debug.empty()) {
-        return support::fail(support::ErrorCode::Unimplemented,
-                             "observability: jitdump debug entries are batch e "
-                             "(nr_debug_entries stays 0 in M6-d)");
-    }
     const uint64_t ts = mono_clock_ns();
     // size = framing(16) + pid/tid(8) + code fields(32) + name(+NUL) +
-    //        nr_debug_entries(4)
-    uint32_t size = 16 + 8 + 32 + 4 + static_cast<uint32_t>(name.size()) + 1;
+    //        nr_debug_entries(4) + entries(16 each: u64 addr, u32 line,
+    //        u32 column)
+    uint32_t size = 16 + 8 + 32 + 4 + static_cast<uint32_t>(name.size()) + 1 +
+                    static_cast<uint32_t>(debug.size()) * 16;
     std::vector<uint8_t> rec;
     rec.reserve(size);
     push_u32(rec, kJitCodeLoadId);
@@ -350,7 +352,12 @@ Result<void> JitDumpWriter::record_code_load(uint64_t vma, uint64_t code_addr,
     push_u64(rec, code_size);
     push_u64(rec, code_index);
     push_name(rec, name);
-    push_u32(rec, 0);  // nr_debug_entries (reserved; batch e)
+    push_u32(rec, static_cast<uint32_t>(debug.size()));
+    for (const DebugEntry& d : debug) {
+        push_u64(rec, d.addr);
+        push_u32(rec, d.line);
+        push_u32(rec, d.discriminant);
+    }
     return write_raw(rec.data(), rec.size());
 }
 
@@ -644,7 +651,8 @@ void JitSession::record_code(const void* code_base, size_t code_bytes,
             last_error_ = r.error().format();
             return;
         }
-        ++code_loads_;
+        ++code_loads_;  // COMPLETE publications only (both sides landed —
+        // the consumer-visible unit is the pair; Rule 120 honesty, DoD 10).
     } catch (const std::exception& e) {
         try {
             last_error_ = std::string("observability: record_code: ") + e.what();
@@ -807,47 +815,717 @@ AllocSampler& alloc_sampler() noexcept {
     return sampler;
 }
 
-// ---- batch-e contract stubs ----------------------------------------------------
+// ---- batch e: GDB JIT interface -------------------------------------------------
 
-// CEP:WHAT: The GDB JIT interface registration entry (contract stub).
-// CEP:WHY: docs/infrastructure/06 section 8 — the debugger leg of the
-//          observability item, deliberately not in the M6-d floor.
+// CEP:WHAT: The debugger-visible descriptor definition (version 1, empty
+//           chain) and the breakpoint target — the two symbols gdb/jit.h
+//           requires at the exact C-linkage spellings.
+// CEP:WHY: docs/infrastructure/06 GDB JIT interface section — the ABI IS
+//          the contract; the debugger reads these names at attach time.
 // CEP:CLASS: CEP-2
-// CEP:STATUS: stub
-// CEP:OWNER: M6 infra-6 batch e
-// CEP:TICKET: docs/roadmap.md M6 observability item (GDB JIT interface,
-//          managed sanitizers, deterministic replay)
-// CEP:FAILURE: named refusal on every call (the batch-e work replaces it).
-// CEP:ASSUMES: no caller in the M6-d floor depends on it.
-// CEP:COST: @cold. One named error return.
-// CEP:EVIDENCE: the roadmap bullet tracks the deferred mechanisms.
-Result<void> GdbJitInterface::register_code(const void* code,
-                                            size_t size,
+// CEP:STATUS: complete
+// CEP:FAILURE: none.
+// CEP:ASSUMES: Defined exactly once; static zero-init except version.
+// CEP:COST: @cold. Static storage + one ret.
+// CEP:EVIDENCE: tests/test_observability.cpp DoD 18.
+extern "C" __attribute__((used)) GdbJitDescriptor __jit_debug_descriptor = {
+    1, 0, nullptr, nullptr};
+
+extern "C" __attribute__((used, noinline)) void __jit_debug_register_code(
+    void) noexcept {
+    // Empty by contract: the breakpoint IS the effect (gdb/jit.h ABI).
+}
+
+namespace {
+
+// CEP:WHAT: One live GDB registration: the descriptor-list entry, its
+//           symfile image (the byte snapshot), and the registered base.
+// CEP:WHY: The registration owns the symfile the descriptor points at —
+//          the entry's addresses must outlive the registration.
+// CEP:STATUS: complete
+// CEP:FAILURE: none (owned state; moved only).
+// CEP:ASSUMES: Mutated only under GdbState::mutex.
+// CEP:COST: @cold.
+// CEP:EVIDENCE: DoD 19-22.
+struct GdbRegistration {
+    std::unique_ptr<GdbJitCodeEntry> entry;
+    std::vector<uint8_t> symfile;
+    uint64_t code_addr = 0;
+};
+
+// CEP:WHAT: The interface state: the live registrations + the mutex that
+//           serializes descriptor/chain mutation.
+// CEP:WHY: The descriptor is process-global debugger-visible state — one
+//          writer at a time (registration is @cold; never signal context).
+// CEP:STATUS: complete
+// CEP:FAILURE: none.
+// CEP:ASSUMES: Not a hot tree (@cold publish path — the CEM-26 s7 mutex
+//          ban scopes hot trees).
+// CEP:COST: @cold.
+// CEP:EVIDENCE: DoD 21 (serialized named rejects).
+struct GdbState {
+    std::mutex mutex;
+    std::vector<GdbRegistration> live;
+};
+
+GdbState& gdb_state() noexcept {
+    static GdbState state;
+    return state;
+}
+
+// CEP:WHAT: Builds the deterministic in-memory ELF64 ET_EXEC symfile:
+//           [Ehdr][Phdr PT_LOAD R+X][.text byte snapshot][.symtab: one
+//           STB_GLOBAL/STT_FUNC at the absolute code_addr][.strtab]
+//           [.shstrtab][5 section headers]. Fixed layout, zero padding,
+//           no timestamps — byte-identical for identical inputs.
+// CEP:WHY: gdb parses the symfile to name JIT frames; determinism makes
+//          the emitter golden-pinnable (the same discipline as the M6-a
+//          artifacts).
+// CEP:STATUS: complete
+// CEP:FAILURE: Throws std::bad_alloc on OOM (callers translate to the
+//          named OutOfMemory reject — nothing is mutated before the build
+//          completes).
+// CEP:ASSUMES: LP64; <elf.h> layout constants (the platform ABI).
+// CEP:COST: @cold. One image-sized allocation + copies.
+// CEP:EVIDENCE: DoD 19/22 (parse-back, multi-entry).
+std::vector<uint8_t> build_gdb_symfile(uint64_t code_addr,
+                                       const uint8_t* code, size_t size,
+                                       const char* symbol) {
+    // shstrtab name offsets (fixed string layout below).
+    constexpr size_t kNameText = 1;      // ".text"
+    constexpr size_t kNameSymtab = 7;    // ".symtab"
+    constexpr size_t kNameStrtab = 15;   // ".strtab"
+    constexpr size_t kNameShstrtab = 23; // ".shstrtab"
+    static const char kShstrtab[] =
+        "\0.text\0.symtab\0.strtab\0.shstrtab\0";
+    const size_t shstr_size = sizeof(kShstrtab);  // includes final NUL
+
+    const std::string sym = symbol != nullptr ? symbol : "";
+    const size_t str_size = 1 + sym.size() + 1;  // leading NUL + name + NUL
+
+    size_t off = sizeof(Elf64_Ehdr) + sizeof(Elf64_Phdr);
+    const size_t text_off = off;
+    off = text_off + size;
+    const size_t sym_off = (off + 7) & ~size_t(7);
+    off = sym_off + 2 * sizeof(Elf64_Sym);
+    const size_t str_off = off;
+    off = str_off + str_size;
+    const size_t shstr_off = off;
+    off = shstr_off + shstr_size;
+    const size_t sh_off = (off + 7) & ~size_t(7);
+    const size_t total = sh_off + 5 * sizeof(Elf64_Shdr);
+
+    std::vector<uint8_t> img(total, 0);
+    const auto put = [&](size_t at, const void* p, size_t n) {
+        std::memcpy(img.data() + at, p, n);
+    };
+
+    Elf64_Ehdr eh{};
+    eh.e_ident[0] = 0x7f;
+    eh.e_ident[1] = 'E';
+    eh.e_ident[2] = 'L';
+    eh.e_ident[3] = 'F';
+    eh.e_ident[EI_CLASS] = ELFCLASS64;
+    eh.e_ident[EI_DATA] = ELFDATA2LSB;
+    eh.e_ident[EI_VERSION] = EV_CURRENT;
+    eh.e_type = ET_EXEC;
+    eh.e_machine = EM_X86_64;
+    eh.e_version = EV_CURRENT;
+    eh.e_phoff = sizeof(Elf64_Ehdr);
+    eh.e_shoff = sh_off;
+    eh.e_ehsize = sizeof(Elf64_Ehdr);
+    eh.e_phentsize = sizeof(Elf64_Phdr);
+    eh.e_phnum = 1;
+    eh.e_shentsize = sizeof(Elf64_Shdr);
+    eh.e_shnum = 5;
+    eh.e_shstrndx = 4;
+    put(0, &eh, sizeof eh);
+
+    Elf64_Phdr ph{};
+    ph.p_type = PT_LOAD;
+    ph.p_flags = PF_R | PF_X;
+    ph.p_offset = 0;
+    ph.p_vaddr = 0;
+    ph.p_paddr = 0;
+    ph.p_filesz = total;
+    ph.p_memsz = total;
+    ph.p_align = 0x1000;
+    put(sizeof(Elf64_Ehdr), &ph, sizeof ph);
+
+    put(text_off, code, size);
+
+    Elf64_Sym syms[2]{};
+    syms[1].st_name = 1;  // ".strtab" byte 1 = the symbol name
+    syms[1].st_info = static_cast<uint8_t>((STB_GLOBAL << 4) | STT_FUNC);
+    syms[1].st_shndx = 1;  // .text
+    syms[1].st_value = code_addr;
+    syms[1].st_size = size;
+    put(sym_off, syms, sizeof syms);
+
+    img[str_off] = 0;
+    if (!sym.empty())
+        std::memcpy(img.data() + str_off + 1, sym.data(), sym.size());
+    img[str_off + 1 + sym.size()] = 0;
+
+    std::memcpy(img.data() + shstr_off, kShstrtab, shstr_size);
+
+    Elf64_Shdr sh[5]{};
+    sh[1].sh_name = static_cast<uint32_t>(kNameText);
+    sh[1].sh_type = SHT_PROGBITS;
+    sh[1].sh_flags = SHF_ALLOC | SHF_EXECINSTR;
+    sh[1].sh_addr = code_addr;
+    sh[1].sh_offset = text_off;
+    sh[1].sh_size = size;
+    sh[1].sh_addralign = 16;
+    sh[2].sh_name = static_cast<uint32_t>(kNameSymtab);
+    sh[2].sh_type = SHT_SYMTAB;
+    sh[2].sh_offset = sym_off;
+    sh[2].sh_size = 2 * sizeof(Elf64_Sym);
+    sh[2].sh_link = 3;  // .strtab
+    sh[2].sh_info = 1;  // one local (the null symbol)
+    sh[2].sh_entsize = sizeof(Elf64_Sym);
+    sh[2].sh_addralign = 8;
+    sh[3].sh_name = static_cast<uint32_t>(kNameStrtab);
+    sh[3].sh_type = SHT_STRTAB;
+    sh[3].sh_offset = str_off;
+    sh[3].sh_size = str_size;
+    sh[3].sh_addralign = 1;
+    sh[4].sh_name = static_cast<uint32_t>(kNameShstrtab);
+    sh[4].sh_type = SHT_STRTAB;
+    sh[4].sh_offset = shstr_off;
+    sh[4].sh_size = shstr_size;
+    sh[4].sh_addralign = 1;
+    put(sh_off, sh, sizeof sh);
+
+    return img;
+}
+
+}  // namespace
+
+// CEP:WHAT: register_code — validates, builds the symfile snapshot, links
+//           the entry at the descriptor chain head, signals via the
+//           breakpoint function. Named rejects: null/empty, duplicate live
+//           base, OOM (translated from bad_alloc — nothing mutated before
+//           the snapshot completes).
+// CEP:WHY: The interface's registration half (docs/infrastructure/06).
+// CEP:CLASS: CEP-1
+// CEP:STATUS: complete
+// CEP:FAILURE: the named rejects above; mutex-serialized.
+// CEP:ASSUMES: @cold (publish path); the bytes are final at registration.
+// CEP:COST: @cold. One memcpy + small allocations.
+// CEP:EVIDENCE: DoD 19/21/22.
+Result<void> GdbJitInterface::register_code(const void* code, size_t size,
                                             const char* symbol) {
-    (void)code;
-    (void)size;
-    (void)symbol;
-    return support::unimplemented("GDB JIT interface (batch e)");
+    if (code == nullptr || size == 0) {
+        return support::fail(support::ErrorCode::InvalidArgument,
+                             "gdb jit: null or empty code range");
+    }
+    auto& st = gdb_state();
+    std::lock_guard<std::mutex> lock(st.mutex);
+    const uint64_t base = reinterpret_cast<uint64_t>(code);
+    for (const auto& r : st.live) {
+        if (r.code_addr == base) {
+            return support::fail(support::ErrorCode::InvalidState,
+                                 "gdb jit: duplicate live registration");
+        }
+    }
+    st.live.emplace_back();
+    GdbRegistration& reg = st.live.back();
+    reg.code_addr = base;
+    try {
+        reg.symfile = build_gdb_symfile(
+            base, static_cast<const uint8_t*>(code), size, symbol);
+        reg.entry = std::make_unique<GdbJitCodeEntry>();
+    } catch (...) {
+        st.live.pop_back();  // nothing was linked into the descriptor
+        return support::fail(support::ErrorCode::OutOfMemory,
+                             "gdb jit: symfile allocation failed");
+    }
+    reg.entry->symfile_addr =
+        reinterpret_cast<uint64_t>(reg.symfile.data());
+    reg.entry->symfile_size = reg.symfile.size();
+    // Canonical doubly-linked head insertion (gdb/jit.h).
+    reg.entry->next_entry = __jit_debug_descriptor.first_entry;
+    reg.entry->prev_entry = nullptr;
+    if (reg.entry->next_entry != nullptr) {
+        reg.entry->next_entry->prev_entry = reg.entry.get();
+    }
+    __jit_debug_descriptor.first_entry = reg.entry.get();
+    __jit_debug_descriptor.relevant_entry = reg.entry.get();
+    __jit_debug_descriptor.action_flag = kJitRegisterFn;
+    __jit_debug_register_code();
+    return ok();
 }
 
-// CEP:WHAT: The GDB JIT interface unregistration entry (contract stub).
-// CEP:WHY: Paired with register_code under the same batch-e ticket.
-// CEP:CLASS: CEP-2
-// CEP:STATUS: stub
-// CEP:OWNER: M6 infra-6 batch e
-// CEP:TICKET: docs/roadmap.md M6 observability item (GDB JIT interface,
-//          managed sanitizers, deterministic replay)
-// CEP:FAILURE: named refusal on every call (the batch-e work replaces it).
-// CEP:ASSUMES: no caller in the M6-d floor depends on it.
-// CEP:COST: @cold. One named error return.
-// CEP:EVIDENCE: the roadmap bullet tracks the deferred mechanisms.
+// CEP:WHAT: unregister_code — finds the live base, unlinks the entry from
+//           the descriptor chain, signals JIT_UNREGISTER_FN, drops the
+//           registration (freeing the symfile snapshot).
+// CEP:WHY: The descriptor must never outlive the code (the RAII token on
+//          the executable owns the call).
+// CEP:CLASS: CEP-1
+// CEP:STATUS: complete
+// CEP:FAILURE: unknown base / null — named rejects; mutex-serialized.
+// CEP:ASSUMES: @cold (executable teardown).
+// CEP:COST: @cold. Chain walk + one vector erase.
+// CEP:EVIDENCE: DoD 20/21.
 Result<void> GdbJitInterface::unregister_code(const void* code) {
-    (void)code;
-    return support::unimplemented("GDB JIT interface (batch e)");
+    if (code == nullptr) {
+        return support::fail(support::ErrorCode::InvalidArgument,
+                             "gdb jit: null code range");
+    }
+    auto& st = gdb_state();
+    std::lock_guard<std::mutex> lock(st.mutex);
+    const uint64_t base = reinterpret_cast<uint64_t>(code);
+    auto it = st.live.begin();
+    for (; it != st.live.end(); ++it) {
+        if (it->code_addr == base) break;
+    }
+    if (it == st.live.end()) {
+        return support::fail(support::ErrorCode::InvalidState,
+                             "gdb jit: unregister of unknown base");
+    }
+    // Unlink from the doubly-linked chain (gdb/jit.h shape).
+    GdbJitCodeEntry* e = it->entry.get();
+    if (e->prev_entry != nullptr) {
+        e->prev_entry->next_entry = e->next_entry;
+    } else {
+        __jit_debug_descriptor.first_entry = e->next_entry;
+    }
+    if (e->next_entry != nullptr) {
+        e->next_entry->prev_entry = e->prev_entry;
+    }
+    // Canonical client behavior: relevant_entry names the removed entry
+    // and the action flag says why (gdb reads both at the breakpoint hit —
+    // the pointer is consumed by the debugger, never dereferenced later).
+    __jit_debug_descriptor.relevant_entry = e;
+    __jit_debug_descriptor.action_flag = kJitUnregisterFn;
+    __jit_debug_register_code();
+    st.live.erase(it);  // relevant_entry now dangles BY CONTRACT (do not
+    // "fix" the dangling pointer — canonical client behavior).
+    return ok();
 }
 
-void ReplayRecorder::record_event(uint32_t kind, uint64_t payload) {
-    log_.emplace_back(kind, payload);
+// CEP:WHAT: The owning-registration helper: register + return a token whose
+//           destruction unregisters. A named failure returns null — the
+//           publish path never fails for telemetry.
+// CEP:WHY: The publish sites hold the token on the executable; teardown
+//          order then guarantees the descriptor never outlives the code.
+// CEP:STATUS: complete
+// CEP:FAILURE: register_code's named rejects surface as a null token.
+// CEP:ASSUMES: The captured base stays the executable's identity (the W^X
+//          mapping lives exactly as long as the token).
+// CEP:COST: @cold.
+// CEP:EVIDENCE: the J1/J2 publish sites; DoD 19/20 (token round trip).
+std::shared_ptr<void> GdbJitInterface::register_code_owned(
+    const void* code, size_t size, const char* symbol) {
+    if (!register_code(code, size, symbol).has_value()) return nullptr;
+    return std::shared_ptr<void>(const_cast<void*>(code),
+                                 [code](void*) {
+                                     (void)unregister_code(code);
+                                 });
+}
+
+// CEP:WHAT: The test-observability reads (live count, membership, symfile
+//           span) — mutex-guarded scans over the small live set.
+// CEP:WHY: The DoD parse-backs need the descriptor state without poking
+//          raw globals from multiple threads.
+// CEP:STATUS: complete
+// CEP:FAILURE: none (unknown base -> empty span / false).
+// CEP:ASSUMES: @cold/test only.
+// CEP:COST: @cold.
+// CEP:EVIDENCE: DoD 19/20/22.
+size_t GdbJitInterface::live_entries() {
+    auto& st = gdb_state();
+    std::lock_guard<std::mutex> lock(st.mutex);
+    return st.live.size();
+}
+
+bool GdbJitInterface::is_registered(const void* code) {
+    if (code == nullptr) return false;
+    auto& st = gdb_state();
+    std::lock_guard<std::mutex> lock(st.mutex);
+    const uint64_t base = reinterpret_cast<uint64_t>(code);
+    for (const auto& r : st.live) {
+        if (r.code_addr == base) return true;
+    }
+    return false;
+}
+
+std::span<const uint8_t> GdbJitInterface::symfile_of(const void* code) {
+    auto& st = gdb_state();
+    std::lock_guard<std::mutex> lock(st.mutex);
+    const uint64_t base = reinterpret_cast<uint64_t>(code);
+    for (const auto& r : st.live) {
+        if (r.code_addr == base) return r.symfile;
+    }
+    return {};
+}
+
+// ---- batch e: managed sanitizers -------------------------------------------------
+
+// CEP:WHAT: The policy state (the installed config + the attach latch).
+// CEP:WHY: One validated process-wide config; the monotonic latch makes
+//          mid-run flips impossible (an untracked assumption change).
+// CEP:STATUS: complete
+// CEP:FAILURE: none (state, not logic).
+// CEP:ASSUMES: Function-local static init.
+// CEP:COST: one guard load per accessor read.
+// CEP:EVIDENCE: DoD 23/27.
+namespace {
+struct PolicyState {
+    SanitizerPolicy policy;
+    bool installed = false;
+};
+PolicyState& policy_state() noexcept {
+    static PolicyState state;
+    return state;
+}
+}  // namespace
+
+// CEP:WHAT: The policy constructor — the reserved guest_tsan bit is a
+//           named refusal (never a silent no-op, Rule 120).
+// CEP:WHY: docs/infrastructure/06 managed sanitizers section.
+// CEP:STATUS: complete
+// CEP:FAILURE: guest_tsan -> Unsupported (named).
+// CEP:ASSUMES: none.
+// CEP:COST: @cold.
+// CEP:EVIDENCE: DoD 23.
+Result<SanitizerPolicy> SanitizerPolicy::make(bool guest_asan,
+                                              bool guest_tsan) {
+    if (guest_tsan) {
+        return support::fail(support::ErrorCode::Unsupported,
+                             "sanitizer policy: guest_tsan is reserved "
+                             "until the atomics capability pack (post-M6)");
+    }
+    SanitizerPolicy p;
+    p.guest_asan = guest_asan;
+    return p;
+}
+
+// CEP:WHAT: attach_sanitizer_policy — validates via make(), installs once;
+//           a re-attach with a DIFFERENT policy is a named reject.
+// CEP:WHY: Flipping sanitizer state under live guest code would invalidate
+//          every recorded assumption (the attach is setup-time).
+// CEP:CLASS: CEP-2
+// CEP:STATUS: complete
+// CEP:FAILURE: the reserved-bit refusal; the mismatch reject.
+// CEP:ASSUMES: Called before guest code runs.
+// CEP:COST: @cold.
+// CEP:EVIDENCE: DoD 23/24 (the enabling attach).
+Result<void> attach_sanitizer_policy(const SanitizerPolicy& policy) {
+    // Validation is the gate (a hand-built policy cannot smuggle the
+    // reserved bit past make()'s named refusal).
+    auto validated = SanitizerPolicy::make(policy.guest_asan,
+                                           policy.guest_tsan);
+    if (!validated) return std::unexpected(validated.error());
+    PolicyState& st = policy_state();
+    if (st.installed &&
+        (st.policy.guest_asan != validated->guest_asan ||
+         st.policy.guest_tsan != validated->guest_tsan)) {
+        return support::fail(support::ErrorCode::InvalidState,
+                             "sanitizer policy: re-attach with a different "
+                             "policy is refused");
+    }
+    st.policy = *validated;
+    st.installed = true;
+    return ok();
+}
+
+// CEP:WHAT: The policy accessor.
+// CEP:WHY: The consumers' one-branch gate.
+// CEP:STATUS: complete
+// CEP:FAILURE: none.
+// CEP:ASSUMES: Function-local static init.
+// CEP:COST: one guard load.
+// CEP:EVIDENCE: the T0/FFI consumer sites; DoD 27.
+SanitizerPolicy& sanitizer_policy() noexcept { return policy_state().policy; }
+
+// CEP:WHAT: GuestShadow — 1 byte per 8 heap bytes over the heap span
+//           (the card table's construction shape); poison/unpoison fill
+//           the covered granule range; span_ok checks first+last granules
+//           (the standard partial-granule shape).
+// CEP:WHY: The GC-corruption detection classes: evacuated-from copies and
+//          released-region spans.
+// CEP:CLASS: CEP-1
+// CEP:STATUS: complete
+// CEP:FAILURE: none — producers are stores; detection is verify_span.
+// CEP:ASSUMES: The heap span is fixed at construction; producers are
+//          @cold; spans outside the heap are not the shadow's authority
+//          (span_ok passes them — foreign buffers stay legal). A span that
+//          STARTS in-heap but extends past the end is also passed (the
+//          out-of-heap tail is not ours to bless or damn); the FFI/interp
+//          callers never construct such spans with live lengths.
+// CEP:COST: @cold producers (granule-range fill); span_ok is O(1).
+// CEP:EVIDENCE: DoD 24/25/27.
+GuestShadow::GuestShadow(const void* heap_base, size_t heap_bytes)
+    : base_ptr_(heap_base),
+      base_(reinterpret_cast<uint64_t>(heap_base)),
+      heap_bytes_(heap_bytes),
+      shadow_((heap_bytes >> kShadowShift) + 1, kAddressable) {}
+
+void GuestShadow::poison(uint64_t addr, size_t bytes, uint8_t value) noexcept {
+    if (bytes == 0 || addr < base_) return;
+    size_t lo = (addr - base_) >> kShadowShift;
+    size_t hi = (addr - base_ + bytes - 1) >> kShadowShift;
+    if (lo >= shadow_.size()) return;
+    if (hi >= shadow_.size()) hi = shadow_.size() - 1;
+    for (size_t i = lo; i <= hi; ++i) shadow_[i] = value;
+}
+
+void GuestShadow::unpoison(uint64_t addr, size_t bytes) noexcept {
+    poison(addr, bytes, kAddressable);
+}
+
+bool GuestShadow::span_ok(const void* addr, size_t bytes) const noexcept {
+    if (addr == nullptr || bytes == 0) return true;
+    const uint64_t a = reinterpret_cast<uint64_t>(addr);
+    if (a < base_ || a - base_ + bytes > heap_bytes_) return true;
+    const size_t lo = (a - base_) >> kShadowShift;
+    const size_t hi = (a - base_ + bytes - 1) >> kShadowShift;
+    return shadow_[lo] == kAddressable && shadow_[hi] == kAddressable;
+}
+
+uint8_t GuestShadow::poison_kind(const void* addr) const noexcept {
+    if (addr == nullptr) return kAddressable;
+    const uint64_t a = reinterpret_cast<uint64_t>(addr);
+    if (a < base_ || a - base_ >= heap_bytes_) return kAddressable;
+    return shadow_[(a - base_) >> kShadowShift];
+}
+
+namespace {
+GuestShadow* g_guest_shadow = nullptr;  // the Heap attaches; it outlives
+}  // namespace
+
+// CEP:WHAT: The shadow attach/accessors (raw, no ownership — the heap
+//           outlives every guest execution and detaches at destruction).
+// CEP:WHY: verify_span routes through the CURRENT heap's shadow (the
+//          gc_code_registry accessor discipline).
+// CEP:STATUS: complete
+// CEP:FAILURE: none.
+// CEP:ASSUMES: One live engine heap at a time (Rule 83 world).
+// CEP:COST: one guard load.
+// CEP:EVIDENCE: the Heap producers; DoD 24-26.
+GuestShadow* guest_shadow() noexcept { return g_guest_shadow; }
+
+void attach_guest_shadow(GuestShadow* shadow) noexcept {
+    g_guest_shadow = shadow;
+}
+
+// CEP:WHAT: verify_span — the ONE check every consumer routes through.
+//           Disabled policy or no shadow: always ok (the cost contract).
+//           A poisoned span: the named GuestSanitizer failure carrying the
+//           address, a SanitizerTrap replay event, and NO abort.
+// CEP:WHY: One named failure shape for T0 ops, the FFI boundary, and the
+//          tests (docs/infrastructure/06 managed sanitizers section).
+// CEP:CLASS: CEP-1
+// CEP:STATUS: complete
+// CEP:FAILURE: GuestSanitizer (named, kind+address in the message).
+// CEP:ASSUMES: noexcept — the diagnostic build is allocation-wrapped and
+//          degrades to a static message on OOM.
+// CEP:COST: disabled — one relaxed bool load; enabled — O(1) granule pair.
+// CEP:EVIDENCE: DoD 24-27.
+Result<void> verify_span(const void* addr, size_t bytes) noexcept {
+    if (!sanitizer_policy().guest_asan) return ok();
+    GuestShadow* sh = guest_shadow();
+    if (sh == nullptr || sh->span_ok(addr, bytes)) return ok();
+    const uint8_t kind = sh->poison_kind(addr);
+    replay_recorder().record_event(
+        static_cast<uint32_t>(ReplayKind::SanitizerTrap),
+        reinterpret_cast<uint64_t>(addr) & 0xFFFFFFFFull,
+        static_cast<uint64_t>(kind));
+    // noexcept discipline: every allocation-bearing step (the message
+    // build, the Diagnostic's string) lives inside the guard; the OOM
+    // fallback is an SSO-bound literal that cannot allocate.
+    try {
+        char msg[112];
+        const int n = ::snprintf(msg, sizeof(msg),
+                                 "guest sanitizer: poisoned span (kind=%u) "
+                                 "at 0x%llx",
+                                 static_cast<unsigned>(kind),
+                                 static_cast<unsigned long long>(
+                                     reinterpret_cast<uint64_t>(addr)));
+        if (n > 0) {
+            return support::fail(support::ErrorCode::GuestSanitizer,
+                                 std::string(msg, static_cast<size_t>(n)));
+        }
+    } catch (...) {
+    }
+    return support::fail(support::ErrorCode::GuestSanitizer,
+                         std::string("sanitizer"));
+}
+
+// ---- batch e: deterministic replay ----------------------------------------------
+
+namespace {
+// CEP:WHAT: The flag's storage (shared by the accessor pair).
+// CEP:STATUS: complete
+// CEP:FAILURE: none.
+// CEP:ASSUMES: Flipped before the run under test.
+// CEP:COST: one relaxed bool load.
+// CEP:EVIDENCE: DoD 31.
+bool& replay_flag() noexcept {
+    static bool flag = false;
+    return flag;
+}
+}  // namespace
+
+// CEP:WHAT: The replay flag (the ONE switch every producer reads).
+// CEP:WHY: The zero-cost-off contract stays auditable through one bool.
+// CEP:STATUS: complete
+// CEP:FAILURE: none.
+// CEP:ASSUMES: Flipped before the run under test.
+// CEP:COST: one relaxed bool load.
+// CEP:EVIDENCE: DoD 31.
+bool replay_enabled() noexcept { return replay_flag(); }
+
+void set_replay_enabled(bool enabled) noexcept { replay_flag() = enabled; }
+
+// CEP:WHAT: record_event — no-op under a disabled flag; under the flag:
+//           monotonic seq, ring push, Rule-28 clear-on-overflow with the
+//           seq/total surviving the clear.
+// CEP:WHY: The decision stream the differential checker compares.
+// CEP:CLASS: CEP-1
+// CEP:STATUS: complete
+// CEP:FAILURE: none.
+// CEP:ASSUMES: Single producer per site (the driver/mutator discipline).
+// CEP:COST: disabled — one bool load; enabled — one push.
+// CEP:EVIDENCE: DoD 28-31.
+void ReplayRecorder::record_event(uint32_t kind, uint64_t a,
+                                  uint64_t b) noexcept {
+    if (!replay_enabled()) return;
+    if (events_.size() >= kMaxEvents) events_.clear();
+    try {
+        events_.push_back(ReplayEvent{seq_ + 1, kind, a, b});
+    } catch (...) {
+        // Degradation: the event is dropped and NOT counted (Rule 120 —
+        // counters never claim an event that was never stored).
+        return;
+    }
+    ++seq_;
+    ++total_events_;
+}
+
+// CEP:WHAT: Clears the ring (tests + the differential harness between
+//           runs); seq/total survive by design.
+// CEP:WHY: The harness reuses the process singleton across runs.
+// CEP:STATUS: complete
+// CEP:FAILURE: none.
+// CEP:ASSUMES: Called between runs (not concurrent with producers).
+// CEP:COST: @cold. O(1) vector clear.
+// CEP:EVIDENCE: DoD 28/30.
+void ReplayRecorder::clear() noexcept { events_.clear(); }
+
+// CEP:WHAT: The process recorder singleton.
+// CEP:WHY: Tiering/T0/GC/RBPD/publish/sanitizer producers share one stream.
+// CEP:STATUS: complete
+// CEP:FAILURE: none.
+// CEP:ASSUMES: Function-local static init.
+// CEP:COST: one guard load.
+// CEP:EVIDENCE: the producer sites.
+ReplayRecorder& replay_recorder() noexcept {
+    static ReplayRecorder recorder;
+    return recorder;
+}
+
+// CEP:WHAT: compare_streams — the O(n) first-divergence walk: kind or
+//           payload mismatch stops the scan and reports both sides; a
+//           length mismatch diverges at the shared length.
+// CEP:WHY: The differential harness's output — the first divergence IS
+//          the diagnosis.
+// CEP:STATUS: complete
+// CEP:FAILURE: none (pure comparison).
+// CEP:ASSUMES: none.
+// CEP:COST: @cold. O(n).
+// CEP:EVIDENCE: DoD 28/29.
+ReplayDivergence compare_streams(const ReplayRecorder& expected,
+                                 const ReplayRecorder& actual) noexcept {
+    ReplayDivergence d;
+    const auto& ev = expected.events();
+    const auto& av = actual.events();
+    const size_t n = ev.size() < av.size() ? ev.size() : av.size();
+    for (size_t i = 0; i < n; ++i) {
+        if (ev[i].kind != av[i].kind || ev[i].a != av[i].a ||
+            ev[i].b != av[i].b) {
+            d.identical = false;
+            d.first_divergence = i;
+            d.kind = ev[i].kind;
+            d.expected_a = ev[i].a;
+            d.expected_b = ev[i].b;
+            d.actual_a = av[i].a;
+            d.actual_b = av[i].b;
+            return d;
+        }
+    }
+    if (ev.size() != av.size()) {
+        d.identical = false;
+        d.first_divergence = n;
+        if (n < ev.size()) {
+            d.kind = ev[n].kind;
+            d.expected_a = ev[n].a;
+            d.expected_b = ev[n].b;
+        } else {
+            d.kind = av[n].kind;
+            d.actual_a = av[n].a;
+            d.actual_b = av[n].b;
+        }
+    }
+    return d;
+}
+
+// ---- batch e: the named+line record_code overload ------------------------------
+
+// CEP:WHAT: The named+line publish hook: the real (jitdump-raw) symbol and
+//           the source-line debug entries through to CODE_LOAD; the perf
+//           map gets the sanitized name. Empty name -> the synthetic form
+//           is the CALLER's choice (overload 1) — this overload requires
+//           a name.
+// CEP:WHY: The metadata interchange upgrade (docs/infrastructure/06 —
+//          real symbol names and jitdump debug entries).
+// CEP:CLASS: CEP-1
+// CEP:STATUS: complete
+// CEP:FAILURE: never fails the caller (last_error() stores the degradation).
+// CEP:ASSUMES: Driver thread; final code bytes (publish discipline).
+// CEP:COST: @cold. One active() branch when idle.
+// CEP:EVIDENCE: DoD 32/33.
+void JitSession::record_code(const void* code_base, size_t code_bytes,
+                             const std::string& name,
+                             std::span<const JitDumpWriter::DebugEntry>
+                                 debug) noexcept {
+    if (!active_) return;
+    try {
+        const uint64_t base = reinterpret_cast<uint64_t>(code_base);
+        if (auto r = jitdump_.record_code_load(base, base, code_bytes,
+                                               code_index_, name, debug);
+            !r) {
+            last_error_ = r.error().format();
+            return;
+        }
+        ++code_index_;
+        std::string sanitized;
+        sanitized.reserve(name.size());
+        for (const char c : name) {
+            sanitized.push_back(
+                (c == ' ' || c == '\n') ? '_' : c);
+        }
+        if (auto r = perf_map_.record(base, code_bytes, sanitized); !r) {
+            last_error_ = r.error().format();
+            return;
+        }
+        ++code_loads_;  // COMPLETE publications only (see the overload above)
+    } catch (const std::exception& e) {
+        try {
+            last_error_ = std::string("observability: record_code: ") +
+                          e.what();
+        } catch (...) {
+            last_error_.clear();
+        }
+    } catch (...) {
+        try {
+            last_error_ = "observability: record_code unknown failure";
+        } catch (...) {
+            last_error_.clear();
+        }
+    }
 }
 
 }  // namespace vortex::infra

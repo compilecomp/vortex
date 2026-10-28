@@ -36,6 +36,10 @@ enum class ErrorCode : uint8_t {
     // Rule-132 boundary: a C++ exception escaping a foreign call was
     // translated at the FFI boundary (docs/infrastructure/05-ffi.md).
     ForeignBoundary,
+    // M6-e addition (appended: ordinals above are serialized — never reorder).
+    // Managed-sanitizer detection: an access routed through verify_span hit
+    // a poisoned guest span (docs/infrastructure/06-observability.md).
+    GuestSanitizer,
 };
 
 const char* error_code_name(ErrorCode code) noexcept;

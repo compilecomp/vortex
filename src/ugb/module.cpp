@@ -1,5 +1,7 @@
 #include "vortex/ugb/module.hpp"
 
+#include "vortex/infra/observability.hpp"
+
 #include <cstring>
 
 namespace vortex::ugb {
@@ -127,6 +129,7 @@ const IcEntry* IcSlot::lookup(uint32_t klass_id) const noexcept {
 //         poly->mega demotion is one store
 // WRITES: up to 8 bytes (entry) + 1 (state) on the slot's line
 void IcSlot::record_hit(uint32_t klass_id, uint32_t target) noexcept {
+    const uint8_t from = static_cast<uint8_t>(state);
     switch (state) {
     case IcState::Uninitialized:
         state = IcState::Monomorphic;
@@ -150,7 +153,19 @@ void IcSlot::record_hit(uint32_t klass_id, uint32_t target) noexcept {
         }
         break;
     case IcState::Megamorphic:
-        break;
+        return;
+    }
+    // Batch-e deterministic replay: the state machine's transitions ride
+    // the engine's decision stream (a = from | to<<32, b = the entry's
+    // klass id — the machine has no site identity; the packing is
+    // normative in docs/infrastructure/06). The Mega case above now
+    // returns before this line (terminal — no transition to record).
+    if (infra::replay_enabled()) {
+        infra::replay_recorder().record_event(
+            static_cast<uint32_t>(infra::ReplayKind::IcTransition),
+            static_cast<uint64_t>(from) |
+                (static_cast<uint64_t>(static_cast<uint8_t>(state)) << 32),
+            klass_id);
     }
 }
 

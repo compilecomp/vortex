@@ -27,6 +27,7 @@
 #include <cstring>
 
 #include "vortex/infra/ffi.hpp"
+#include "vortex/infra/observability.hpp"
 #include "vortex/support/log.hpp"
 
 namespace vortex::gc {
@@ -362,6 +363,13 @@ support::Result<void> IcggcEngine::maybe_start_cycle() {
     // the adaptive-initiation batch's reserved label
     // (docs/infrastructure/06-observability.md section 6).
     cycle_cause_ = PauseCause::OccupancyTrigger;
+    // Batch-e deterministic replay: the cycle start rides the engine's
+    // decision stream (a = the cycle cause value).
+    if (infra::replay_enabled()) {
+        infra::replay_recorder().record_event(
+            static_cast<uint32_t>(infra::ReplayKind::GcCycleStart),
+            static_cast<uint64_t>(static_cast<uint8_t>(cycle_cause_)), 0);
+    }
     Impl& im = *impl_;
     {
         PauseTimer pause(stats_, PauseKind::InitialMark, cycle_cause_);

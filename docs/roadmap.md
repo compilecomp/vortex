@@ -384,7 +384,7 @@ Findings:
       contract is the driver-level entry; tier call-sites ship with the
       interop/J4 batches), PinningRegion integration into the stub arg
       path (Ptr args are handles-or-pins by discipline today).
-- [ ] Observability (M6): jitdump, GDB JIT interface, managed sanitizers,
+- [x] Observability (M6): jitdump, GDB JIT interface, managed sanitizers,
       deterministic replay. **Batch d (M6-d) is the observability floor**
       (the external performance review's R40 — the item that makes every
       other performance item measurable): the perf-jitdump v1 writer
@@ -396,8 +396,29 @@ Findings:
       manager's freezes and single-thread handshakes), GC pause-ring
       cause labels, and the TLAB-refill allocation sampler (JEP-331
       shape: interval-driven, zero hot-path cost; site attribution is
-      the emitted-poll batch's stack-walk upgrade). GDB JIT interface,
-      managed sanitizers, and deterministic replay stay for batch e.
+      the emitted-poll batch's stack-walk upgrade). **Batch e (M6-e)
+      completes the item**: the GDB JIT interface (the canonical
+      `__jit_debug_descriptor` + `__jit_debug_register_code` ABI with
+      deterministic in-memory ELF64 symfiles — registration snapshots the
+      bytes, an RAII token on the executable unregisters at teardown, so
+      the debugger-visible chain never outlives the code); the managed
+      sanitizers (a guest-heap shadow, 1 byte per 8 heap bytes, poisoned
+      on evacuation and region release and unpoisoned at recycle —
+      `verify_span` is the one named check routed through the T0 array
+      ops, the IC-hit field path, and the FFI Ptr boundary; the
+      `guest_tsan` bit is a reserved named refusal until the atomics
+      capability pack); deterministic replay (the decision ring —
+      tiering handoffs, OSR entries, IC state transitions, GC cycle
+      starts, RBPD verdicts, publishes, sanitizer traps, all behind one
+      flag — plus the O(n) first-divergence differential checker that
+      pins "same program + same input + same policy → same decision
+      stream" engine-wide); and the jitdump metadata interchange (real
+      method symbols through both publish paths — the J2/J3/J4 family's
+      line maps ride R31, the documented no-fabrication deviation — and
+      exact J1 source-line debug entries built from the DEBUG_SRCPOS
+      metas, which required the new 5-byte-fallthrough J1 stencil).
+      276 tests green on Release and ASan/UBSan. Spec: docs/infrastructure/06-
+      observability.md (DoD 1-33).
 - [ ] CPU dispatch (M7): multi-versioning stubs, hardware extension lowering
       (the performance review's R21 vector/memory capability pack rides the
       post-M6 ISA work this milestone feeds)

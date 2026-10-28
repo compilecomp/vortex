@@ -1,12 +1,12 @@
 // Infra 6 — Observability, Debugging & Tooling
 // (docs/infrastructure/06-observability.md).
 //
-// M6-d ships the observability floor: the perf-jitdump v1 writer + the
-// perf-<pid>.map sidecar behind the JitSession singleton, the safepoint
-// TTSP log fed by the handshake manager, and the TLAB-refill allocation
-// sampler. TierEventSink is the M0-real stream consumed by `vx stats`.
-// The GDB JIT interface, managed sanitizers, and deterministic replay
-// remain contract stubs (batch e).
+// M6-d shipped the observability floor (jitdump/perf-map, TTSP log,
+// sampler); batch e completes the item: the GDB JIT interface (canonical
+// descriptor + breakpoint + deterministic ELF64 symfiles), the managed
+// sanitizers (guest-heap shadow + verify_span + validated policy), and
+// deterministic replay (the decision ring + first-divergence checker).
+// TierEventSink is the M0-real stream consumed by `vx stats`.
 // CEP:FILE: include/vortex/infra/observability.hpp
 // CEP:WHAT: The observability floor — jitdump/perf-map code telemetry,
 //           safepoint TTSP rings, allocation sampling — plus the M0
@@ -16,8 +16,8 @@
 //          needs its measurement source; Rule 120 telemetry.
 // CEP:CLASS: CEP-2
 // CEP:STATUS: complete (JitDumpWriter/PerfMap/JitSession/SafepointLog/
-//          AllocSampler/TierEventSink); GdbJitInterface/SanitizerPolicy/
-//          ReplayRecorder are contract stubs (batch e).
+//          AllocSampler/TierEventSink + the batch-e GdbJitInterface/
+//          SanitizerPolicy+GuestShadow/ReplayRecorder).
 // CEP:FAILURE: Writer/session API surfaces return named Result failures
 //          (uncreatable paths, double-open, use-after-stop). The PASSIVE
 //          hooks (JitSession::record_code, SafepointLog::record,
@@ -31,11 +31,12 @@
 // CEP:COST: @cold everywhere except AllocSampler::on_refill (@warm —
 //          interval-gated ring push) and the publish-path one-branch
 //          active() check.
-// CEP:EVIDENCE: tests/test_observability.cpp — the 17-item DoD list in
+// CEP:EVIDENCE: tests/test_observability.cpp — the 33-item DoD list in
 //          docs/infrastructure/06-observability.md.
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <string>
 #include <utility>
@@ -107,18 +108,21 @@ private:
 // CEP:STATUS: complete
 // CEP:FAILURE: open on an uncreatable path, record/close on a closed writer,
 //          open while open — named Result failures; byte-level write errors
-//          surface as named I/O failures (never silent truncation).
+//          surface as named I/O failures (never silent truncation). The
+//          debug-entry form serializes nr_debug_entries + the 16-byte
+//          entries (batch e; the M6-d refusal is retired).
 // CEP:ASSUMES: One writer per process (JitSession enforces); the caller
 //          passes code ranges that are live for the process lifetime of the
 //          record (publish-path discipline — the bytes are final).
 // CEP:COST: @cold. One write() syscall per record; one mmap/munmap per open/
 //          close.
-// CEP:EVIDENCE: tests/test_observability.cpp DoD 1-7 (parse-back, timestamps,
-//          self-mmap probe, named rejects).
+// CEP:EVIDENCE: tests/test_observability.cpp DoD 1-7, 32 (parse-back,
+//          timestamps, self-mmap probe, named rejects, line entries).
 class JitDumpWriter {
 public:
-    /// One source-line debug entry (format RESERVED by the v1 spec; M6-d
-    /// writes nr_debug_entries = 0 — real entries are batch e's DWARF work).
+    /// One source-line debug entry (the v1 spec's reserved format: u64
+    /// addr, u32 line, u32 column — serialized by record_code_load; the
+    /// name field is unused by the line-entry form).
     struct DebugEntry {
         uint64_t addr = 0;
         uint32_t line = 0;
@@ -229,10 +233,16 @@ public:
     /// after process exit).
     Result<void> stop();
     /// The publish hook: one synthetic symbol per code range,
-    /// "vx_<tier>_m<method_id>" (real names are the batch-e metadata
-    /// upgrade). Never fails the caller.
+    /// "vx_<tier>_m<method_id>" (the empty-name fallback shape). Never
+    /// fails the caller.
     void record_code(const void* code_base, size_t code_bytes,
                      uint32_t method_id, const char* tier) noexcept;
+    /// The named+line publish hook (batch e metadata interchange): the
+    /// real method symbol and its source-line entries. An empty name
+    /// falls back to the synthetic form. Never fails the caller.
+    void record_code(const void* code_base, size_t code_bytes,
+                     const std::string& name,
+                     std::span<const JitDumpWriter::DebugEntry> debug) noexcept;
     bool active() const noexcept { return active_; }
     /// The stored best-effort failure ("" when none).
     const std::string& last_error() const noexcept { return last_error_; }
@@ -385,34 +395,322 @@ private:
 // CEP:EVIDENCE: consumed by Heap::refill_tlab; DoD 16/17.
 AllocSampler& alloc_sampler() noexcept;
 
-// ---- batch-e contract stubs ----------------------------------------------------
+// ---- batch e: GDB JIT interface -------------------------------------------------
 
-/// GDB JIT Interface: dynamic DWARF registration for native debuggers.
-/// Contract stub (batch e).
+/// The canonical gdb client entry (gdb/jit.h ABI — the exact field order
+/// the debugger reads: next/prev links first, then the symfile pointer/size).
+// CEP:WHAT: One registered code blob's descriptor-list entry.
+// CEP:WHY: docs/infrastructure/06 GDB JIT interface section — the ABI gdb
+//          discovers at attach time; layout IS the contract (gdb/jit.h's
+//          jit_code_entry: next_entry, prev_entry, symfile_addr,
+//          symfile_size).
+// CEP:CLASS: CEP-2
+// CEP:STATUS: complete
+// CEP:FAILURE: none (a plain struct).
+// CEP:ASSUMES: LP64 (u64 symfile_addr); mutated only under the interface's
+//          mutex.
+// CEP:COST: @cold. Plain struct.
+// CEP:EVIDENCE: tests/test_observability.cpp DoD 19-22.
+struct GdbJitCodeEntry {
+    GdbJitCodeEntry* next_entry = nullptr;  // the head-side link
+    GdbJitCodeEntry* prev_entry = nullptr;  // the tail-side link
+    uint64_t symfile_addr = 0;
+    uint64_t symfile_size = 0;
+};
+
+/// The canonical gdb descriptor + its debugger-visible variable (gdb/jit.h
+/// ABI). Raw fields, static zero-init except `version = 1` (set by the
+/// definition); C linkage so the symbol name is unmangled.
+// CEP:WHAT: The descriptor gdb reads (version + action + entry chain).
+// CEP:WHY: The interface's second half — the breakpoint function signals
+//          "descriptor changed", the descriptor carries the state.
+// CEP:CLASS: CEP-2
+// CEP:STATUS: complete
+// CEP:FAILURE: none.
+// CEP:ASSUMES: Defined exactly once (src/infra/observability.cpp).
+// CEP:COST: @cold. Static storage.
+// CEP:EVIDENCE: tests/test_observability.cpp DoD 18.
+extern "C" {
+struct GdbJitDescriptor {
+    uint32_t version;         // 1 (the definition initializes it)
+    uint32_t action_flag;     // kJitNoAction / Register / Unregister
+    GdbJitCodeEntry* relevant_entry;  // legacy, zeroed
+    GdbJitCodeEntry* first_entry;     // the chain head
+};
+extern GdbJitDescriptor __jit_debug_descriptor;
+}
+
+// CEP:WHAT: The debugger's breakpoint target: gdb sets its breakpoint here
+//           and reads __jit_debug_descriptor when it hits.
+// CEP:WHY: The interface's signaling half (gdb/jit.h ABI).
+// CEP:CLASS: CEP-2
+// CEP:STATUS: complete
+// CEP:FAILURE: none (an empty function — the breakpoint IS the effect).
+// CEP:ASSUMES: defined once, never inlined, never eliminated (used+noinline).
+// CEP:COST: @cold. One ret.
+// CEP:EVIDENCE: tests/test_observability.cpp DoD 18 (dlsym resolves it).
+extern "C" void __jit_debug_register_code(void) noexcept;
+
+// CEP:WHAT: The GDB JIT interface client: registers/unregisters code blobs
+//           with deterministic in-memory ELF64 symfiles through the
+//           canonical descriptor + breakpoint pair.
+// CEP:WHY: docs/infrastructure/06 GDB JIT interface section — native
+//          debuggers must name JIT frames (the debugger leg of the
+//          observability item).
+// CEP:CLASS: CEP-1
+// CEP:STATUS: complete
+// CEP:FAILURE: register — null/zero-size, duplicate live base, OOM;
+//          unregister — unknown base; all named Result rejects. The mutex
+//          serializes descriptor/chain mutation.
+// CEP:ASSUMES: @cold only (publish path + teardown; never signal context);
+//          registration snapshots the bytes (the live W^X mapping is never
+//          referenced afterward).
+// CEP:COST: @cold. One memcpy + small vector build per registration.
+// CEP:EVIDENCE: tests/test_observability.cpp DoD 18-22.
 class GdbJitInterface {
 public:
-    static Result<void> register_code(const void* code,
-                                      size_t size,
+    // Action flags (gdb/jit.h ABI).
+    static constexpr uint32_t kJitNoAction = 0;
+    static constexpr uint32_t kJitRegisterFn = 1;
+    static constexpr uint32_t kJitUnregisterFn = 2;
+
+    static Result<void> register_code(const void* code, size_t size,
                                       const char* symbol);
     static Result<void> unregister_code(const void* code);
+    /// Registers and returns an owning token whose destruction
+    /// unregisters; a named failure returns null (the publish path never
+    /// fails for telemetry).
+    static std::shared_ptr<void> register_code_owned(const void* code,
+                                                     size_t size,
+                                                     const char* symbol);
+
+    // Observability for tests/tooling (mutex-guarded reads).
+    static size_t live_entries();
+    static bool is_registered(const void* code);
+    /// The symfile bytes of a live registration (tests parse the ELF back).
+    static std::span<const uint8_t> symfile_of(const void* code);
 };
 
-/// Managed sanitizer switches (ASan-for-UGB / TSan-for-UGB instrumentation
-/// applied by J2/J3). Contract stub (batch e).
+// ---- batch e: managed sanitizers -------------------------------------------------
+
+// CEP:WHAT: The managed-sanitizer process config: guest_asan (the guest-
+//           heap shadow) is supported; guest_tsan is RESERVED — validation
+//           refuses it by name until the atomics capability pack ships.
+// CEP:WHY: docs/infrastructure/06 managed sanitizers section — a reserved
+//          bit must never silently no-op (Rule 120).
+// CEP:CLASS: CEP-2
+// CEP:STATUS: complete
+// CEP:FAILURE: make() refuses guest_tsan by name (named Result reject).
+// CEP:ASSUMES: Installed once via attach_sanitizer_policy (the single
+//          mutator's setup, before guest code runs).
+// CEP:COST: @cold. Two bools.
+// CEP:EVIDENCE: tests/test_observability.cpp DoD 23.
 struct SanitizerPolicy {
-    bool guest_asan = false;  // shadow-memory checks for guest buffers
-    bool guest_tsan = false;  // instrumentation of guest atomics/fields
+    bool guest_asan = false;  // shadow-memory checks for guest spans
+    bool guest_tsan = false;  // RESERVED (refused by make())
+
+    /// The only sanctioned construction: validation is the gate.
+    static Result<SanitizerPolicy> make(bool guest_asan, bool guest_tsan);
 };
 
-/// Deterministic replay recorder: thread scheduling, IC updates, OSR
-/// transitions -> exact time-travel replay. Contract stub (batch e).
-class ReplayRecorder {
+/// Validates + installs the process policy (once; a second attach with a
+/// DIFFERENT policy is a named reject — flipping sanitizer state under live
+/// code is an untracked assumption change).
+// CEP:WHAT: The policy attach point.
+// CEP:WHY: One validated process-wide config; consumers read one bool.
+// CEP:CLASS: CEP-2
+// CEP:STATUS: complete
+// CEP:FAILURE: reserved-bit refusal (via make); re-attach mismatch reject.
+// CEP:ASSUMES: Called before guest code runs (driver/test setup).
+// CEP:COST: @cold.
+// CEP:EVIDENCE: tests/test_observability.cpp DoD 23/27.
+Result<void> attach_sanitizer_policy(const SanitizerPolicy& policy);
+
+/// The installed policy (default: everything off).
+// CEP:WHAT: The policy accessor.
+// CEP:WHY: The consumers' one-branch gate reads this.
+// CEP:STATUS: complete
+// CEP:FAILURE: none.
+// CEP:ASSUMES: Function-local static init.
+// CEP:COST: @warm — one guard load per read (the disabled-path cost
+//          contract in the spec).
+// CEP:EVIDENCE: the T0/FFI consumer sites.
+SanitizerPolicy& sanitizer_policy() noexcept;
+
+// CEP:WHAT: The guest-heap shadow: 1 byte per 8 heap bytes over the heap
+//           span (constructed exactly like the card table); marks
+//           evacuated-from copies and released-region spans.
+// CEP:WHY: docs/infrastructure/06 managed sanitizers section — the GC-
+//          corruption detection classes (stale references into evacuated
+//          copies / released regions) at the boundaries guest + foreign
+//          code actually touch.
+// CEP:CLASS: CEP-1
+// CEP:STATUS: complete
+// CEP:FAILURE: none — poisoning is a store; detection is verify_span's
+//          named failure.
+// CEP:ASSUMES: One heap's span per shadow; producers are @cold (GC phases,
+//          region release); young bump space is NEVER poisoned.
+// CEP:COST: @cold producers (span fill); the check is verify_span.
+// CEP:EVIDENCE: tests/test_observability.cpp DoD 24/25/27.
+class GuestShadow {
 public:
-    void record_event(uint32_t kind, uint64_t payload);
-    size_t event_count() const noexcept { return log_.size(); }
+    static constexpr uint8_t kShadowShift = 3;  // 1 shadow byte per 8
+    static constexpr uint8_t kAddressable = 0;
+    static constexpr uint8_t kEvacuated = 0xE1;
+    static constexpr uint8_t kReleased = 0xE2;
+
+    GuestShadow(const void* heap_base, size_t heap_bytes);
+
+    void poison(uint64_t addr, size_t bytes, uint8_t value) noexcept;
+    void unpoison(uint64_t addr, size_t bytes) noexcept;
+    /// The shadow byte governing `addr` (0 outside the heap) — the
+    /// SanitizerTrap replay event's kind value.
+    uint8_t poison_kind(const void* addr) const noexcept;
+    /// First+last granule check (the standard partial-granule shape).
+    bool span_ok(const void* addr, size_t bytes) const noexcept;
+    const void* heap_base() const noexcept { return base_ptr_; }
+    size_t heap_bytes() const noexcept { return heap_bytes_; }
 
 private:
-    std::vector<std::pair<uint32_t, uint64_t>> log_;
+    const void* base_ptr_ = nullptr;
+    uint64_t base_ = 0;
+    size_t heap_bytes_ = 0;
+    std::vector<uint8_t> shadow_;
 };
+
+/// The attached shadow (the Heap installs its instance; raw, no ownership —
+/// the heap outlives every guest execution). Null until a heap attaches.
+// CEP:WHAT: The shadow accessor + attach point.
+// CEP:WHY: verify_span routes through the CURRENT heap's shadow; the raw
+//          pointer matches gc_code_registry's accessor discipline.
+// CEP:STATUS: complete
+// CEP:FAILURE: none.
+// CEP:ASSUMES: Single heap live per engine instance (Rule 83 world); the
+//          Heap detaches at destruction.
+// CEP:COST: @cold attach; the accessor is one guard load.
+// CEP:EVIDENCE: the Heap poison producers + verify_span.
+GuestShadow* guest_shadow() noexcept;
+void attach_guest_shadow(GuestShadow* shadow) noexcept;
+
+/// The ONE check everything routes through (T0 ops, the FFI boundary,
+/// tests). Policy-disabled or no shadow: always ok (the cost contract).
+// CEP:WHAT: The sanitizer span check.
+// CEP:WHY: One named failure shape for every consumer (kind + address in
+//          the diagnostic).
+// CEP:CLASS: CEP-1
+// CEP:STATUS: complete
+// CEP:FAILURE: named GuestSanitizer failure carrying the violating kind
+//          + address; NEVER aborts the process.
+// CEP:ASSUMES: @warm when enabled (one shadow byte load per span); one
+//          relaxed bool load when disabled.
+// CEP:COST: disabled — one bool load; enabled — first+last granule load.
+// CEP:EVIDENCE: tests/test_observability.cpp DoD 24-27.
+Result<void> verify_span(const void* addr, size_t bytes) noexcept;
+
+// ---- batch e: deterministic replay -------------------------------------------------
+
+/// The recorded decision kinds (the payload packing per kind is normative
+/// in docs/infrastructure/06 — deterministic replay section).
+enum class ReplayKind : uint32_t {
+    TierHandoff = 0,  // a = method_id, b = from | (to << 32)
+    OsrEntry,         // a = method_id, b = bytecode pc
+    IcTransition,     // a = from | (to << 32), b = the entry's klass id
+    GcCycleStart,     // a = cause
+    Deopt,            // a = method_id, b = cause
+    Publish,          // a = method_id, b = tier ordinal
+    SanitizerTrap,    // a = address low bits, b = kind value
+};
+
+// CEP:WHAT: One recorded engine decision (seq monotonic, kind + payload).
+// CEP:WHY: The differential checker compares decision streams; the seq
+//          survives ring clears (Rule 28 + Rule 120).
+// CEP:STATUS: complete
+// CEP:FAILURE: none (a plain record).
+// CEP:ASSUMES: Single-producer sites (the driver/mutator threads per site).
+// CEP:COST: @cold. Plain struct.
+// CEP:EVIDENCE: tests/test_observability.cpp DoD 28-31.
+struct ReplayEvent {
+    uint64_t seq = 0;
+    uint32_t kind = 0;  // ReplayKind value
+    uint64_t a = 0;
+    uint64_t b = 0;
+};
+
+// CEP:WHAT: The decision ring (bounded 65536, Rule-28 clear-on-overflow,
+//           monotonic seq) + the global enable flag + the first-divergence
+//           comparator.
+// CEP:WHY: docs/infrastructure/06 deterministic replay section — the
+//          engine-wide determinism property ("same program + same input +
+//          same policy -> same decision stream") needs the stream and the
+//          differ; exact re-execution scheduling is NOT the scope.
+// CEP:CLASS: CEP-1
+// CEP:STATUS: complete
+// CEP:FAILURE: none — record under a disabled flag is a no-op (the cost
+//          contract); overflow is the documented clear.
+// CEP:ASSUMES: Producers check replay_enabled() (the one flag) — off means
+//          zero events, zero cost.
+// CEP:COST: disabled — one relaxed bool load per producer site; enabled —
+//          one ring push per decision.
+// CEP:EVIDENCE: tests/test_observability.cpp DoD 28-31.
+class ReplayRecorder {
+public:
+    static constexpr size_t kMaxEvents = 65536;
+
+    /// No-op unless the replay flag is on (the producers' contract).
+    void record_event(uint32_t kind, uint64_t a, uint64_t b) noexcept;
+    std::span<const ReplayEvent> events() const noexcept { return events_; }
+    /// Every event ever recorded (survives ring clears) — Rule 120 honesty.
+    uint64_t total_events() const noexcept { return total_events_; }
+    void clear() noexcept;
+
+private:
+    std::vector<ReplayEvent> events_;
+    uint64_t total_events_ = 0;
+    uint64_t seq_ = 0;
+};
+
+// CEP:WHAT: The replay flag accessors — the ONE switch every producer site
+//           reads.
+// CEP:WHY: One flag keeps the zero-cost-off contract auditable.
+// CEP:STATUS: complete
+// CEP:FAILURE: none.
+// CEP:ASSUMES: Flipped before the run under test (mid-run flips only add
+//          events on one side — the differential harness controls runs).
+// CEP:COST: one relaxed bool load per read.
+// CEP:EVIDENCE: DoD 31.
+bool replay_enabled() noexcept;
+void set_replay_enabled(bool enabled) noexcept;
+
+/// The process singleton (the producers' shared ring).
+// CEP:WHAT: The recorder accessor.
+// CEP:WHY: Tiering/T0/GC/RBPD/publish/sanitizer producers share one stream.
+// CEP:STATUS: complete
+// CEP:FAILURE: none.
+// CEP:ASSUMES: Function-local static init.
+// CEP:COST: one guard load after first init.
+// CEP:EVIDENCE: the producer sites.
+ReplayRecorder& replay_recorder() noexcept;
+
+// CEP:WHAT: The first-divergence report: identical flag, the diverging
+//           index, and both sides' payloads there.
+// CEP:WHY: The differential harness's output — the first divergence IS the
+//          diagnosis.
+// CEP:STATUS: complete
+// CEP:FAILURE: none (a pure comparison).
+// CEP:ASSUMES: O(n) walk over both rings.
+// CEP:COST: @cold.
+// CEP:EVIDENCE: DoD 29.
+struct ReplayDivergence {
+    bool identical = true;
+    size_t first_divergence = 0;
+    uint32_t kind = 0;
+    uint64_t expected_a = 0;
+    uint64_t expected_b = 0;
+    uint64_t actual_a = 0;
+    uint64_t actual_b = 0;
+};
+
+ReplayDivergence compare_streams(const ReplayRecorder& expected,
+                                 const ReplayRecorder& actual) noexcept;
 
 }  // namespace vortex::infra

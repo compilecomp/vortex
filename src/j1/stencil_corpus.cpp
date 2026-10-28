@@ -1319,6 +1319,24 @@ Stencil t_check_class() {
     return b.finish();
 }
 
+// CEP:WHAT: The Debug.SourcePosition stencil: a 5-byte fallthrough jmp
+//           (the corpus convention's BT_Next tail) — no other bytes.
+// CEP:WHY: The source-position hint is metadata — the line rides the
+//          instruction's meta into the compile result's line map (batch e
+//          jitdump debug entries, docs/infrastructure/06); T0 treats the
+//          opcode as a NOP and the jmp is a no-op at execution.
+// CEP:STATUS: complete
+// CEP:FAILURE: none (a bodyless BT_Next tail).
+// CEP:ASSUMES: The jmp-rel32 tail's target patches to the next stencil's
+//          base (the standard bodyless-tail convention).
+// CEP:COST: @cold (corpus build). Five bytes per site at compile.
+// CEP:EVIDENCE: tests/test_observability.cpp DoD 32 (line entries parse).
+Stencil t_debug_srcpos() {
+    TemplateBuilder b(static_cast<uint16_t>(ugb::Op::DEBUG_SRCPOS), false);
+    b.tail(BT_Next);
+    return b.finish();
+}
+
 Stencil t_safepoint_poll() {
     TemplateBuilder b(static_cast<uint16_t>(ugb::Op::SAFEPOINT_POLL), false);
     b.asm_.mov_reg_mem(kB, Mem{kCtx, Reg::RSP, 0, 0x40});  // safepoint_word
@@ -1442,6 +1460,7 @@ size_t build_default_corpus(StencilTable& table) {
     reg(t_check_null(false));
     reg(t_check_class());
     reg(t_safepoint_poll());
+    reg(t_debug_srcpos());
 
     return n;
 }
